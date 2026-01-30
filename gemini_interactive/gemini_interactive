@@ -1,0 +1,609 @@
+#!/usr/bin/env python
+
+import argparse
+import os
+import sys
+import json
+import subprocess
+import mimetypes
+import readline
+import glob
+import time
+import re
+from datetime import datetime
+from google import genai
+from google.genai import types
+
+
+# ANSI Colors for CLI
+class Colors:
+    HEADER = "\033[95m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    ENDC = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    MAGENTA = "\033[35m"
+
+
+# Configuration
+HISTORY_DIR = os.path.expanduser("~/.gemini_chats/")
+DEFAULT_SESSION_NAME = "default"
+
+if not os.path.exists(HISTORY_DIR):
+    os.makedirs(HISTORY_DIR)
+
+
+# --- Autocomplete Logic ---
+class SimpleCompleter:
+    def __init__(self):
+        self.commands = [
+            "/file",
+            "/f",
+            "/add",
+            "/clearfiles",
+            "/cf",
+            "/clear",
+            "/c",
+            "/view",
+            "/v",
+            "/model",
+            "/system",
+            "/sys",
+            "/thinking",
+            "/quit",
+            "/exit",
+            "/q",
+            "/help",
+            "/h",
+            "/list",
+            "/ls",
+            "/load",
+            "/open",
+            "/new",
+            "/delete",
+            "/rm",
+        ]
+
+    def complete(self, text, state):
+        buffer = readline.get_line_buffer()
+
+        # 1. Command Completion
+        if buffer.startswith("/") and " " not in buffer:
+            options = [c + " " for c in self.commands if c.startswith(text)]
+            if state < len(options):
+                return options[state]
+            return None
+
+        # 2. File Completion
+        parts = buffer.split(" ", 1)
+        if len(parts) > 0 and parts[0] in ["/file", "/f", "/add"]:
+            return self.path_complete(text, state)
+
+        # 3. Session Completion (for load/delete)
+        if len(parts) > 0 and parts[0] in ["/load", "/open", "/delete", "/rm"]:
+            return self.session_complete(text, state)
+
+        return None
+
+    def path_complete(self, text, state):
+        path = os.path.expanduser(text)
+        pattern = path + "*"
+        matches = glob.glob(pattern)
+        formatted_matches = []
+        for m in matches:
+            if os.path.isdir(m):
+                formatted_matches.append(m + os.sep)
+            else:
+                formatted_matches.append(m)
+
+        if state < len(formatted_matches):
+            return formatted_matches[state]
+        return None
+
+    def session_complete(self, text, state):
+        files = glob.glob(os.path.join(HISTORY_DIR, "*.json"))
+        sessions = [os.path.basename(f).replace(".json", "") for f in files]
+        matches = [s for s in sessions if s.startswith(text)]
+        if state < len(matches):
+            return matches[state]
+        return None
+
+
+# --- Session Management ---
+
+class SessionManager:
+    def __init__(self):
+        self.current_session_name = DEFAULT_SESSION_NAME
+        self.history = []
+        self._load_session(DEFAULT_SESSION_NAME)
+
+    def _get_filepath(self, name):
+        return os.path.join(HISTORY_DIR, f"{name}.json")
+
+    def _load_session(self, name):
+        filepath = self._get_filepath(name)
+        self.current_session_name = name
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r") as f:
+                    self.history = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                self.history = []
+        else:
+            self.history = []
+
+    def save_history(self):
+        filepath = self._get_filepath(self.current_session_name)
+        try:
+            with open(filepath, "w") as f:
+                json.dump(self.history, f, indent=2)
+        except IOError as e:
+            print(
+                f"{Colors.RED}Warning: Could not save chat history: {e}{Colors.ENDC}",
+                file=sys.stderr,
+            )
+
+    def switch_session(self, name):
+        self.save_history()  # Save current before switching
+        self._load_session(name)
+        print(f"{Colors.GREEN}Switched to session: '{name}'{Colors.ENDC}")
+        self.view_history()
+
+    def new_session(self, name=None):
+        self.save_history() # Save the previous session first
+        if not name:
+            name = f"chat_{int(time.time())}"
+        self.current_session_name = name
+        self.history = []
+        self.save_history() # Create the file for the new session immediately
+        print(f"{Colors.GREEN}Started new session: '{name}'{Colors.ENDC}")
+
+    def list_sessions(self):
+        # Ensure current session file exists before listing
+        if not os.path.exists(self._get_filepath(self.current_session_name)):
+            self.save_history()
+
+        files = glob.glob(os.path.join(HISTORY_DIR, "*.json"))
+        print(f"\n{Colors.HEADER}=== Available Conversations ==={Colors.ENDC}")
+        for f in files:
+            name = os.path.basename(f).replace(".json", "")
+            indicator = "*" if name == self.current_session_name else " "
+            # Get file mod time
+            mod_time = datetime.fromtimestamp(os.path.getmtime(f)).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            print(
+                f" {Colors.CYAN}{indicator} {name:<20} {Colors.DIM}({mod_time}){Colors.ENDC}"
+            )
+        print("")
+
+    def delete_session(self, name):
+        if name == self.current_session_name:
+            print(f"{Colors.RED}Cannot delete active session.{Colors.ENDC}")
+            return
+
+        filepath = self._get_filepath(name)
+        if os.path.exists(filepath):
+            os.remove(filepath)
+            print(f"{Colors.YELLOW}Deleted session: '{name}'{Colors.ENDC}")
+        else:
+            print(f"{Colors.RED}Session '{name}' not found.{Colors.ENDC}")
+
+    def clear_current_history(self):
+        self.history = []
+        self.save_history()
+        print(f"{Colors.GREEN}Current chat history cleared.{Colors.ENDC}")
+
+    def view_history(self):
+        if not self.history:
+            print(f"{Colors.YELLOW}No history in this session.{Colors.ENDC}")
+            return
+
+        print(
+            f"\n{Colors.HEADER}=== Conversation History ({self.current_session_name}) ==={Colors.ENDC}\n"
+        )
+        for turn in self.history:
+            role = "User" if turn["role"] == "user" else "Gemini"
+            color = Colors.BLUE if role == "User" else Colors.GREEN
+
+            print(f"{color}{Colors.BOLD}{role}:{Colors.ENDC}")
+
+            for part in turn.get("parts", []):
+                if "text" in part:
+                    render_response(part["text"])
+                elif "file_data" in part:
+                    mime = part["file_data"].get("mime_type", "file")
+                    print(f"{Colors.DIM}[Attached File: {mime}]{Colors.ENDC}")
+            print("\n" + "-" * 40 + "\n")
+
+# --- Smart Rendering Logic ---
+
+
+def print_markdown_text(text):
+    """Renders text using glow if available, otherwise plain print."""
+    if not text.strip():
+        return
+    try:
+        process = subprocess.Popen(
+            ["glow", "-w", "100", "-"], stdin=subprocess.PIPE, text=True
+        )
+        process.communicate(input=text)
+    except (FileNotFoundError, IOError):
+        print(text)
+
+
+def print_raw_code(language, code):
+    """Prints code raw for easy copying."""
+    lang_display = language if language else "text"
+    print(
+        f"{Colors.CYAN}{Colors.DIM}┌──{lang_display}──────────────────────────────────────────────────────────{Colors.ENDC}"
+    )
+    print(code.rstrip())
+    print(
+        f"{Colors.CYAN}{Colors.DIM}└───────────────────────────────────────────────────────────────────{Colors.ENDC}"
+    )
+
+
+def render_response(text):
+    """
+    Splits the response into Markdown text and Code blocks.
+    Text goes to Glow. Code gets printed Raw.
+    """
+
+    parts = re.split(r"(```(?:[\w\+\-\.]+)?\s*\n.*?```)", text, flags=re.DOTALL)
+
+    for part in parts:
+        if part.startswith("```"):
+            lines = part.split("\n")
+            language = lines[0].strip("`").strip()
+            code_content = "\n".join(lines[1:-1])
+            print_raw_code(language, code_content)
+        else:
+            print_markdown_text(part)
+
+
+def get_safe_mime_type(file_path):
+    mime_type, _ = mimetypes.guess_type(file_path)
+    try:
+        if (
+            mime_type.startswith("image/")
+            or mime_type.startswith("audio/")
+            or mime_type.startswith("video/")
+            or mime_type == "application/pdf"
+        ):
+            return mime_type
+    except Exception:
+        return "text/plain"
+
+    return "text/plain"
+
+
+def upload_file(client, file_path):
+    file_path = file_path.strip("'\"")
+    file_path = os.path.expanduser(file_path)
+
+    if not os.path.exists(file_path):
+        print(f"{Colors.RED}Error: File '{file_path}' not found.{Colors.ENDC}")
+        return None
+
+    safe_mime = get_safe_mime_type(file_path)
+    print(f"{Colors.BLUE}Uploading {file_path} as {safe_mime}...{Colors.ENDC}")
+
+    try:
+        file_ref = client.files.upload(
+            file=file_path, config=types.UploadFileConfig(mime_type=safe_mime)
+        )
+        print(f"{Colors.GREEN}Upload complete.{Colors.ENDC}")
+        return file_ref
+    except Exception as e:
+        print(f"{Colors.RED}Upload failed: {e}{Colors.ENDC}")
+        return None
+
+
+# --- Multi-line Input Logic ---
+def get_multiline_input(prompt_text):
+    """
+    Reads input. If line ends with '\', continues reading.
+    Also allows empty lines in between.
+    """
+    lines = []
+    try:
+        first_line = input(prompt_text)
+
+        # Check if user wants to enter multiline mode immediately or ended with \
+        if first_line.endswith("\\"):
+            lines.append(first_line[:-1])  # remove the backslash
+            while True:
+                line = input(f"{Colors.YELLOW}... {Colors.ENDC}")
+                if line.endswith("\\"):
+                    lines.append(line[:-1])
+                else:
+                    lines.append(line)
+                    break
+            return "\n".join(lines)
+        else:
+            return first_line
+    except EOFError:
+        raise EOFError
+
+
+class Session:
+    def __init__(self, client, model, thinking, system_instruction, session_manager):
+        self.client = client
+        self.model = model
+        self.thinking = thinking
+        self.system_instruction = system_instruction
+        self.session_manager = session_manager
+        self.staged_files = []
+
+    def add_file(self, file_path):
+        uploaded = upload_file(self.client, file_path)
+        if uploaded:
+            self.staged_files.append(
+                {
+                    "file_data": {
+                        "mime_type": uploaded.mime_type,
+                        "file_uri": uploaded.uri,
+                    },
+                    "display_name": os.path.basename(file_path),
+                    "full_path": file_path,
+                }
+            )
+
+    def clear_files(self):
+        self.staged_files = []
+        print(f"{Colors.GREEN}Staged files cleared.{Colors.ENDC}")
+
+    def send_message(self, text):
+        parts = []
+        parts.extend([{"file_data": f["file_data"]} for f in self.staged_files])
+
+        if text:
+            parts.append({"text": text})
+
+        if not parts:
+            return
+
+        chat_history = self.session_manager.history
+        new_user_message = {"role": "user", "parts": parts}
+        contents_payload = chat_history + [new_user_message]
+
+        t_config = (
+            types.ThinkingConfig(thinking_level="high")
+            if self.thinking
+            else types.ThinkingConfig(thinking_level="low")
+        )
+
+        gen_config = types.GenerateContentConfig(
+            thinking_config=t_config, system_instruction=self.system_instruction
+        )
+
+        print(f"{Colors.BLUE}Generating response ({self.model})...{Colors.ENDC}")
+
+        try:
+            response = self.client.models.generate_content(
+                model=self.model, contents=contents_payload, config=gen_config
+            )
+
+            ai_text = response.text
+            print("\n" + "-" * 40 + "\n")
+            render_response(ai_text)
+            print("\n" + "-" * 40 + "\n")
+
+            # Update History in Session Manager
+            self.session_manager.history.append(new_user_message)
+            self.session_manager.history.append(
+                {"role": "model", "parts": [{"text": ai_text}]}
+            )
+            self.session_manager.save_history()
+
+            self.staged_files = []
+
+        except Exception as e:
+            print(f"{Colors.RED}API Error: {e}{Colors.ENDC}")
+
+
+def print_help():
+    print(
+        f"""                                                                                            
+  {Colors.HEADER}Conversation Commands:{Colors.ENDC}                                              
+      {Colors.BOLD}/list{Colors.ENDC}            List conversations (alias: /ls)                      
+      {Colors.BOLD}/new [name]{Colors.ENDC}      Start a new conversation                             
+      {Colors.BOLD}/load {Colors.ENDC}           Load a conversation (alias: /open)                         
+      {Colors.BOLD}/delete {Colors.ENDC}         Delete a conversation (alias: /rm)                         
+      {Colors.BOLD}/clear{Colors.ENDC}           Clear current history (alias: /c)                    
+      {Colors.BOLD}/view{Colors.ENDC}            View current history (alias: /v)                     
+                                                                                                  
+  {Colors.HEADER}Interaction Commands:{Colors.ENDC}                                           
+      {Colors.BOLD}/file <path>{Colors.ENDC}     Attach a file (alias: /f, /add)                  
+      {Colors.BOLD}/clearfiles{Colors.ENDC}      Clear attached files (alias: /cf)                
+      {Colors.BOLD}/system <txt>{Colors.ENDC}    Set system prompt (alias: /sys)                  
+      {Colors.BOLD}/model <name>{Colors.ENDC}    Change model                                     
+      {Colors.BOLD}/thinking{Colors.ENDC}        Toggle thinking mode                             
+      {Colors.BOLD}/quit{Colors.ENDC}            Exit (alias: /q)                                 
+                                                                                                  
+      {Colors.DIM}Tip: End a line with '\\' to continue typing on the next line.{Colors.ENDC}     
+    """
+    )
+
+
+def print_splash(session_model, session_thinking, session_sys):
+    print(
+        f"""{Colors.CYAN}                                                                         
+   ______               _       _ 
+  / ____/___   ____ _  (_)___  (_)
+ / / __ / _ \ / __ ` \/ // __ \/ / 
+/ /_/ //  __// / / / / // / / / /  
+\____/ \___//_/ /_/_/_//_/ /_/_/                                                                                         
+  {Colors.MAGENTA}Interactive CLI{Colors.ENDC}                                                    
+  """
+    )
+    print(f"{Colors.DIM}System: {session_sys}{Colors.ENDC}")
+    print(
+        f"Model: {Colors.GREEN}{session_model}{Colors.ENDC} | Thinking: {Colors.GREEN}{session_thinking}{Colors.ENDC}"
+    )
+    print(
+        f"{Colors.YELLOW}Type '/help' for commands.{Colors.ENDC}"
+    )
+    print("-" * 60)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Interactive Google Gemini CLI")
+    parser.add_argument(
+        "--model", default="gemini-3-pro-preview", help="Default model"
+    )
+    parser.add_argument(
+        "--thinking", action="store_true", help="Start with thinking mode enabled"
+    )
+    parser.add_argument(
+        "--system",
+        type=str,
+        default="""You are a helpful assistant, answer all questions succinctly,when                                                                                            
+  providing code changes only provide new code, don't regenerate whole files unless specifically  
+  asked. code should be provided in ``` code blocks along with the language being used in the     
+  standard format.""",
+        help="Initial system instruction",
+    )
+    args = parser.parse_args()
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        print(
+            f"{Colors.RED}Error: GOOGLE_API_KEY not set.{Colors.ENDC}", file=sys.stderr
+        )
+        sys.exit(1)
+
+    client = genai.Client(api_key=api_key)
+    session_manager = SessionManager()
+    session = Session(client, args.model, args.thinking, args.system, session_manager)
+
+    # --- Readline autocomplete --- #
+    completer = SimpleCompleter()
+    readline.set_completer_delims(" \t\n")
+    readline.set_completer(completer.complete)
+    readline.parse_and_bind("tab: complete")
+    if sys.platform == "darwin":
+        readline.parse_and_bind("bind ^I rl_complete")
+
+    sys_status = "SET" if session.system_instruction else "NONE"
+    print_splash(session.model, session.thinking, sys_status)
+
+    while True:
+        try:
+            # Construct prompt string showing attached files
+            prompt_str = f"{Colors.BLUE}[{session.session_manager.current_session_name}] >>> {Colors.ENDC}"
+            if session.staged_files:
+                files_str = ", ".join([f["display_name"] for f in session.staged_files])
+                prompt_str = (
+                    f"{Colors.YELLOW}[Files: {files_str}]{Colors.ENDC}\n" + prompt_str
+                )
+
+            # Use custom multiline input function
+            user_input = get_multiline_input(prompt_str).strip()
+
+            if not user_input:
+                continue
+
+            # Handle Commands
+            if user_input.startswith("/"):
+                parts = user_input.split(" ", 1)
+                cmd = parts[0].lower()
+                arg = parts[1] if len(parts) > 1 else ""
+
+                if cmd in ["/quit", "/exit", "/q"]:
+                    print("Goodbye!")
+                    break
+
+                elif cmd in ["/help", "/h"]:
+                    print_help()
+
+                elif cmd in ["/clear", "/c"]:
+                    session.session_manager.clear_current_history()
+                    session.staged_files = []
+
+                elif cmd in ["/view", "/v"]:
+                    session.session_manager.view_history()
+
+                # --- File Management ---
+                elif cmd in ["/file", "/f", "/add"]:
+                    if arg:
+                        session.add_file(arg.strip("'\""))
+                    else:
+                        print(f"{Colors.RED}Usage: /file <path_to_file>{Colors.ENDC}")
+
+                elif cmd in ["/clearfiles", "/cf"]:
+                    session.clear_files()
+
+                # --- Session Management ---
+                elif cmd in ["/list", "/ls"]:
+                    session.session_manager.list_sessions()
+
+                elif cmd in ["/new"]:
+                    name = arg.strip() if arg else None
+                    session.session_manager.new_session(name)
+                    session.staged_files = []
+
+                elif cmd in ["/load", "/open"]:
+                    if arg:
+                        session.session_manager.switch_session(arg.strip())
+                        session.staged_files = []
+                    else:
+                        print(f"{Colors.RED}Usage: /load <session_name>{Colors.ENDC}")
+
+                elif cmd in ["/delete", "/rm"]:
+                    if arg:
+                        session.session_manager.delete_session(arg.strip())
+                    else:
+                        print(f"{Colors.RED}Usage: /delete <session_name>{Colors.ENDC}")
+
+                # --- Config ---
+                elif cmd in ["/system", "/sys"]:
+                    if arg:
+                        session.system_instruction = arg
+                        print(f"{Colors.GREEN}System prompt updated.{Colors.ENDC}")
+                    else:
+                        curr = (
+                            session.system_instruction
+                            if session.system_instruction
+                            else "None"
+                        )
+                        print(
+                            f"{Colors.BLUE}Current System Prompt:{Colors.ENDC}\n{curr}"
+                        )
+
+                elif cmd == "/model":
+                    if arg:
+                        session.model = arg
+                        print(
+                            f"Model changed to: {Colors.GREEN}{session.model}{Colors.ENDC}"
+                        )
+                    else:
+                        print(f"Current model: {session.model}")
+
+                elif cmd == "/thinking":
+                    session.thinking = not session.thinking
+                    state = "ON" if session.thinking else "OFF"
+                    print(f"Thinking mode: {Colors.GREEN}{state}{Colors.ENDC}")
+
+                else:
+                    print(f"{Colors.RED}Unknown command: {cmd}{Colors.ENDC}")
+
+                continue
+
+            # Handle Chat
+            session.send_message(user_input)
+
+        except KeyboardInterrupt:
+            print("\n(Interrupted. Type /quit to exit)")
+        except EOFError:
+            print("\nGoodbye!")
+            break
+
+
+if __name__ == "__main__":
+    main()
