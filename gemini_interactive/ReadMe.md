@@ -8,6 +8,7 @@ all from your terminal.
 
 - **Persistent Sessions**: Chat history is saved automatically (`~/.gemini_chats/`). You can  
   switch between conversations, list them, or delete them.
+- **Chat Summarisation**: Long chain conversations are summarised intermittently to reduce token usage whilst still maintaining long context.
 - **Smart Formatting**:
   - Markdown rendering (via `glow` if installed).
   - Raw code block output for easy copying.
