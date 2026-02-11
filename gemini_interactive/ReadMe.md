@@ -84,8 +84,8 @@ python gemini_cli.py
 | `/view` | `/v` | View full history of current chat |
 | `/clear` | `/c` | Clear history of current chat |
 | `/system [txt]` | `/sys` | Update system prompt |
-| `/tokens` | View token usage (estimates) |
-| `/summary` | View current summarisation of conversation |
+| `/tokens` | | View token usage (estimates) |
+| `/summary` | | View current summarisation of conversation |
 | `/thinking` | | Toggle thinking mode on/off |
 | `/quit` | `/q` | Exit the application |
 
