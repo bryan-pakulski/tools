@@ -118,7 +118,9 @@ class SimpleCompleter:
 class SessionManager:
     def __init__(self):
         self.current_session_name = DEFAULT_SESSION_NAME
-        self.history = []
+        self.history = []  # THE FULL ARCHIVE
+        self.summary = ""  # The accumulated summary text
+        self.summary_anchor = 0  # Index in history covered by the summary
         self._load_session(DEFAULT_SESSION_NAME)
 
     def _get_filepath(self, name):
@@ -127,25 +129,40 @@ class SessionManager:
     def _load_session(self, name):
         filepath = self._get_filepath(name)
         self.current_session_name = name
+        
+        # Defaults
+        self.history = []
+        self.summary = ""
+        self.summary_anchor = 0
+
         if os.path.exists(filepath):
             try:
                 with open(filepath, "r") as f:
-                    self.history = json.load(f)
+                    data = json.load(f)
+
+                # Handle new vs old format
+                if isinstance(data, list):
+                    self.history = data # Legacy migration
+                elif isinstance(data, dict):
+                    self.history = data.get("history", [])
+                    self.summary = data.get("summary", "")
+                    self.summary_anchor = data.get("summary_anchor", 0)
+
             except (json.JSONDecodeError, IOError):
                 self.history = []
-        else:
-            self.history = []
 
     def save_history(self):
         filepath = self._get_filepath(self.current_session_name)
         try:
+            data = {
+                "history": self.history,
+                "summary": self.summary,
+                "summary_anchor": self.summary_anchor
+            }
             with open(filepath, "w") as f:
-                json.dump(self.history, f, indent=2)
+                json.dump(data, f, indent=2)
         except IOError as e:
-            print(
-                f"{Colors.RED}Warning: Could not save chat history: {e}{Colors.ENDC}",
-                file=sys.stderr,
-            )
+            print(f"{Colors.RED}Warning: Could not save chat history: {e}{Colors.ENDC}", file=sys.stderr) 
 
     def switch_session(self, name):
         self.save_history()  # Save current before switching
@@ -195,6 +212,8 @@ class SessionManager:
 
     def clear_current_history(self):
         self.history = []
+        self.summary = ""
+ 
         self.save_history()
         print(f"{Colors.GREEN}Current chat history cleared.{Colors.ENDC}")
 
@@ -332,6 +351,7 @@ def get_multiline_input(prompt_text):
 
 
 class Session:
+
     def __init__(self, client, model, thinking, system_instruction, session_manager):
         self.client = client
         self.model = model
@@ -339,6 +359,10 @@ class Session:
         self.system_instruction = system_instruction
         self.session_manager = session_manager
         self.staged_files = []
+        
+        # Configuration for Optimization
+        self.rolling_window_size = 10  # Keep last 10 messages raw
+        self.summary_trigger_threshold = 20 # Summarize when unsummarized count > 20
 
     def add_file(self, file_path):
         uploaded = upload_file(self.client, file_path)
@@ -358,28 +382,115 @@ class Session:
         self.staged_files = []
         print(f"{Colors.GREEN}Staged files cleared.{Colors.ENDC}")
 
+    def _update_summary(self):
+        """
+        Checks if history needs summarization and updates the internal summary state.
+        """
+        history = self.session_manager.history
+        anchor = self.session_manager.summary_anchor
+        total_len = len(history)
+        
+        # Calculate how many turns are currently "raw" (unsummarized)
+        unsummarized_count = total_len - anchor
+        
+        # Only run if we have enough new data to warrant a summary call
+        if unsummarized_count > self.summary_trigger_threshold:
+            
+            # We want to keep the last N messages raw (rolling window)
+            end_index = total_len - self.rolling_window_size
+            
+            if end_index <= anchor:
+                return
+
+            print(f"\n{Colors.MAGENTA}{Colors.BOLD}⚡ Optimization Triggered ⚡{Colors.ENDC}")
+            print(f"{Colors.DIM}   Compressing history turns {anchor} to {end_index}...{Colors.ENDC}")
+
+            # --- BETTER TEXT EXTRACTION ---
+            chunk_to_summarize = history[anchor:end_index]
+            text_block = ""
+            for turn in chunk_to_summarize:
+                role = turn["role"]
+                parts_text = []
+                for p in turn.get("parts", []):
+                    if "text" in p:
+                        parts_text.append(p["text"])
+                    elif "file_data" in p:
+                        parts_text.append(f"[File: {p['file_data'].get('mime_type', 'unknown')}]")
+                
+                content_str = " ".join(parts_text)
+                text_block += f"{role.upper()}: {content_str}\n"
+
+            current_summary = self.session_manager.summary if self.session_manager.summary else "No previous summary."
+            
+            # --- STRICTER PROMPT ---
+            prompt = (
+                f"You are a conversation archivist. Your goal is to maintain a concise running summary of a conversation.\n\n"
+                f"1. Read the CURRENT SUMMARY (if any).\n"
+                f"2. Read the NEW INTERACTIONS.\n"
+                f"3. Output a single, updated summary paragraph that combines both. \n"
+                f"4. Do NOT output a conversational response. Do NOT output the transcript. ONLY output the summary text.\n"
+                f"5. Focus on: User preferences, code requirements, specific technical decisions, and the current goal.\n\n"
+                f"=== CURRENT SUMMARY ===\n{current_summary}\n\n"
+                f"=== NEW INTERACTIONS ===\n{text_block}\n\n"
+                f"=== UPDATED SUMMARY ==="
+            )
+
+            try:
+                # We use a standard generation config without 'thinking' to keep it direct
+                gen_config = types.GenerateContentConfig(
+                    temperature=0.0  # Low temp for factual summary
+                )
+
+                resp = self.client.models.generate_content(
+                    model=self.model, 
+                    contents=prompt,
+                    config=gen_config
+                )
+                
+                new_summary = resp.text.strip()
+                
+                # Basic validation: If summary is empty or too short, don't update
+                if len(new_summary) > 10:
+                    self.session_manager.summary = new_summary
+                    self.session_manager.summary_anchor = end_index
+                    self.session_manager.save_history()
+                    print(f"{Colors.MAGENTA}   ✓ Context compressed. History Anchor moved to index {end_index}.{Colors.ENDC}")
+                    print(f"{Colors.DIM}   Summary preview: {new_summary[:60]}...{Colors.ENDC}\n")
+                else:
+                    print(f"{Colors.RED}   ⚠ Summarization failed: Model returned empty response.{Colors.ENDC}\n")
+                
+            except Exception as e:
+                print(f"{Colors.RED}   ⚠ Summarization failed: {e}{Colors.ENDC}\n")
+
     def send_message(self, text):
         parts = []
         parts.extend([{"file_data": f["file_data"]} for f in self.staged_files])
+        if text: parts.append({"text": text})
+        if not parts: return
 
-        if text:
-            parts.append({"text": text})
-
-        if not parts:
-            return
-
-        chat_history = self.session_manager.history
+        # 1. Archive User Message
         new_user_message = {"role": "user", "parts": parts}
-        contents_payload = chat_history + [new_user_message]
+        self.session_manager.history.append(new_user_message)
+        self.session_manager.save_history()
 
-        t_config = (
-            types.ThinkingConfig(thinking_level="high")
-            if self.thinking
-            else types.ThinkingConfig(thinking_level="low")
-        )
+        # 2. Optimization Check
+        self._update_summary()
 
+        # 3. Build Context Payload
+        active_system_prompt = self.system_instruction
+        if self.session_manager.summary:
+            active_system_prompt += (
+                f"\n\n[PREVIOUS CONVERSATION SUMMARY]:\n{self.session_manager.summary}\n"
+                f"(Use this summary for context, but do not repeat it.)"
+            )
+
+        start_index = self.session_manager.summary_anchor
+        recent_history = self.session_manager.history[start_index:]
+        contents_payload = recent_history + [new_user_message]        
+
+        t_config = types.ThinkingConfig(thinking_level="high") if self.thinking else types.ThinkingConfig(thinking_level="low")
         gen_config = types.GenerateContentConfig(
-            thinking_config=t_config, system_instruction=self.system_instruction
+            thinking_config=t_config, system_instruction=active_system_prompt
         )
 
         print(f"{Colors.BLUE}Generating response ({self.model})...{Colors.ENDC}")
@@ -394,18 +505,24 @@ class Session:
             render_response(ai_text)
             print("\n" + "-" * 40 + "\n")
 
-            # Update History in Session Manager
-            self.session_manager.history.append(new_user_message)
+            # --- TOKEN USAGE DISPLAY ---
+            if response.usage_metadata:
+                u = response.usage_metadata
+                print(f"{Colors.DIM}Tokens: Input {u.prompt_token_count} | Output {u.candidates_token_count} | Total {u.total_token_count}{Colors.ENDC}")
+            # ---------------------------
+
+            # 4. Archive Model Response
             self.session_manager.history.append(
                 {"role": "model", "parts": [{"text": ai_text}]}
             )
             self.session_manager.save_history()
-
             self.staged_files = []
 
         except Exception as e:
+            if self.session_manager.history and self.session_manager.history[-1] == new_user_message:
+                 self.session_manager.history.pop()
+            self.session_manager.save_history()
             print(f"{Colors.RED}API Error: {e}{Colors.ENDC}")
-
 
 def print_help():
     print(
@@ -423,6 +540,8 @@ def print_help():
       {Colors.BOLD}/clearfiles{Colors.ENDC}      Clear attached files (alias: /cf)                
       {Colors.BOLD}/system <txt>{Colors.ENDC}    Set system prompt (alias: /sys)                  
       {Colors.BOLD}/model <name>{Colors.ENDC}    Change model                                     
+      {Colors.BOLD}/tokens{Colors.ENDC}          View token usage (estimates)
+      {Colors.BOLD}/summary{Colors.ENDC}         View current summary
       {Colors.BOLD}/thinking{Colors.ENDC}        Toggle thinking mode                             
       {Colors.BOLD}/quit{Colors.ENDC}            Exit (alias: /q)                                 
                                                                                                   
@@ -584,6 +703,22 @@ def main():
                         )
                     else:
                         print(f"Current model: {session.model}")
+                elif cmd == "/summary":
+                    print(f"summary: ")
+                    print(session.session_manager.summary)
+                elif cmd == "/tokens":
+                    # Calculate estimated tokens for current context
+                    # (This is an approximation based on list length, not actual tokenizer)
+                    hist_len = len(session.session_manager.history)
+                    anchor = session.session_manager.summary_anchor
+                    summary_len = len(session.session_manager.summary.split())
+                    
+                    print(f"{Colors.HEADER}--- Context Stats ---{Colors.ENDC}")
+                    print(f"Total History Turns: {hist_len}")
+                    print(f"Summarized Turns:    {anchor}")
+                    print(f"Active Turns (Window): {hist_len - anchor}")
+                    print(f"Summary Length:      ~{summary_len} words")
+                    print(f"{Colors.DIM}(Actual token count is displayed after generation){Colors.ENDC}")
 
                 elif cmd == "/thinking":
                     session.thinking = not session.thinking
