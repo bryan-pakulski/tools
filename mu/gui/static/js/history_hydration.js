@@ -26,7 +26,12 @@
 
             // Normal end-of-turn grouping passes the current slot (or omits the
             // second argument). Preserve the original fast path unchanged.
-            if (previousTurns === slot.turns) {
+            // Hydration invariant: when previousTurns !== slot.turns the caller
+            // is grouping a stale pre-hydration array and we must re-group the
+            // freshly rebuilt slot.turns below instead.
+            if (previousTurns !== slot.turns) {
+                // fall through to the rebuild path below
+            } else if (previousTurns === slot.turns) {
                 return coreGroup(slot, previousTurns);
             }
 

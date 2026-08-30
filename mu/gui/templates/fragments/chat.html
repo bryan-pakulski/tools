@@ -1,6 +1,16 @@
 <div class="chat-history" @scroll="$store.chat.onScroll($event)">
+    <div class="chat-history-loading"
+         x-cloak
+         :class="{ compact: $store.chat.turns.length > 0 }"
+         x-show="$store.chat.historyLoading"
+         role="status" aria-live="polite">
+        <span class="ui-loading-spinner" aria-hidden="true"></span>
+        <span x-text="$store.chat.turns.length ? 'Refreshing conversation…' : 'Loading conversation history…'"></span>
+    </div>
     <template x-for="t in $store.chat.turns" :key="t.id">
-        <div class="turn-wrap">
+        <div class="turn-wrap"
+             :data-turn-id="t.id"
+             :data-history-index="t.historyIndex ?? null">
 
             <!-- user / assistant message bubbles -->
             <template x-if="t.role === 'user' || t.role === 'assistant'">
@@ -10,7 +20,11 @@
                     + (t.leaving ? ' interim-leaving' : '')"
                      x-show="t.role === 'user' || !!t.text">
                     <div class="role" x-text="t.role"></div>
-                    <div class="body" x-html="t.html"></div>
+                    <!-- Round-47 F13: streaming turns render the plain-text
+                         mirror (x-text, no markdown parse); the full
+                         markdown render happens once at assistant_end. -->
+                    <div class="body" x-show="t.streaming && t.rawText" x-text="t.rawText"></div>
+                    <div class="body" x-show="!(t.streaming && t.rawText)" x-html="t.html"></div>
                     <div class="message-attachments" x-show="t.attachments && t.attachments.length">
                         <template x-for="item in (t.attachments || [])" :key="item.attachment_id">
                             <a class="message-attachment"
@@ -94,7 +108,9 @@
                          x-show="t.open"
                          x-transition.opacity.duration.180ms>
                         <template x-for="ct in t.childTurns" :key="ct.id">
-                            <div class="turn-wrap">
+                            <div class="turn-wrap"
+                                 :data-turn-id="ct.id"
+                                 :data-history-index="ct.historyIndex ?? null">
                                 <template x-if="ct.role === 'assistant'">
                                     <div class="msg assistant collapsed-child">
                                         <div class="role">assistant</div>
@@ -312,7 +328,11 @@
             <template x-if="t.role === 'error'">
                 <div class="msg error">
                     <div class="role" x-text="t.role"></div>
-                    <div class="body" x-html="t.html"></div>
+                    <!-- Round-47 F13: streaming turns render the plain-text
+                         mirror (x-text, no markdown parse); the full
+                         markdown render happens once at assistant_end. -->
+                    <div class="body" x-show="t.streaming && t.rawText" x-text="t.rawText"></div>
+                    <div class="body" x-show="!(t.streaming && t.rawText)" x-html="t.html"></div>
                 </div>
             </template>
 
@@ -320,7 +340,11 @@
             <template x-if="t.role === 'info'">
                 <div class="msg info">
                     <div class="role" x-text="t.role"></div>
-                    <div class="body" x-html="t.html"></div>
+                    <!-- Round-47 F13: streaming turns render the plain-text
+                         mirror (x-text, no markdown parse); the full
+                         markdown render happens once at assistant_end. -->
+                    <div class="body" x-show="t.streaming && t.rawText" x-text="t.rawText"></div>
+                    <div class="body" x-show="!(t.streaming && t.rawText)" x-html="t.html"></div>
                 </div>
             </template>
 
@@ -477,6 +501,41 @@
         <p>Type below to start. <code>/help</code> lists commands.</p>
     </div>
 </div>
+<nav class="conversation-stage-rail"
+     x-cloak
+     x-show="$store.chat.stages.length > 1
+        || $store.chat.current().hasMoreTurns"
+     aria-label="Conversation stages">
+    <div class="conversation-stage-list">
+        <template x-if="$store.chat.current().hasMoreTurns">
+            <button type="button"
+                    class="conversation-stage-marker conversation-stage-more"
+                    :disabled="$store.chat.current().olderLoading"
+                    :aria-busy="$store.chat.current().olderLoading"
+                    aria-label="History continues above — load older messages"
+                    title="History continues above"
+                    @click="$store.chat.loadOlder(null, { navigate: true })">
+                <span class="ui-loading-spinner tiny"
+                      x-show="$store.chat.current().olderLoading"
+                      aria-hidden="true"></span>
+                <span class="conversation-stage-chevron up"
+                      x-show="!$store.chat.current().olderLoading"
+                      aria-hidden="true"></span>
+            </button>
+        </template>
+        <template x-for="(stage, index) in $store.chat.stages" :key="stage.id">
+            <button type="button"
+                    class="conversation-stage-marker conversation-stage-link"
+                    :class="{ active: stage.id === $store.chat.activeStageId }"
+                    :aria-current="stage.id === $store.chat.activeStageId ? 'step' : null"
+                    @click="$store.chat.jumpToStage(stage.id)"
+                    :title="stage.text"
+                    :aria-label="`Jump to prompt ${index + 1}: ${stage.text}`">
+                <span class="conversation-stage-dot"></span>
+            </button>
+        </template>
+    </div>
+</nav>
 <div class="composer" x-data="{ get cc() { return $store.cmdComplete }, modeOpen: false, settingsOpen: false }"
      @click.outside="modeOpen = false; settingsOpen = false"
      @keydown.escape.window="modeOpen = false; settingsOpen = false">
@@ -520,7 +579,7 @@
                     aria-haspopup="true" :aria-expanded="settingsOpen">
                 <span class="dots">···</span>
             </button>
-            <div class="composer-settings-popout" x-show="settingsOpen"
+            <div class="composer-settings-popout settings-side-modal" x-show="settingsOpen"
                  x-transition.opacity.duration.150ms
                  x-init="$store.inspector.loadVariables()">
                 <div class="settings-header">
@@ -681,7 +740,7 @@
         <button type="button" class="icon-btn attach-btn"
                 @click="$store.mode.setView('artifacts'); $store.layout.panelOpen = true; modeOpen = false; settingsOpen = false; $store.attachments.load($store.chat.currentName)"
                 :class="{ active: $store.attachments.selectedIds().length > 0 }"
-                title="Open model artifacts and file uploads"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6.1 8.9 4.55-4.55a2.25 2.25 0 1 1 3.18 3.18l-5.73 5.73a3.5 3.5 0 1 1-4.95-4.95l5.38-5.38"/></svg></button>
+                title="Attach a file"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6.1 8.9 4.55-4.55a2.25 2.25 0 1 1 3.18 3.18l-5.73 5.73a3.5 3.5 0 1 1-4.95-4.95l5.38-5.38"/></svg></button>
         <!-- STT mic button (only when stt_enabled) -->
         <button type="button" class="icon-btn mic-btn"
                 x-show="$store.stt.enabled"

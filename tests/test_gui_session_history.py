@@ -108,6 +108,67 @@ def test_newer_live_history_wins_over_older_saved_snapshot(tmp_path, monkeypatch
     assert payload["turns"][-2]["parts"][0]["text"] == "new live prompt"
 
 
+def test_authoritative_history_forwards_bidirectional_window_parameters(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(config, "HISTORY_DIR", str(tmp_path))
+    name = "paged-live-session"
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "parts": [{"type": "text", "text": f"turn {index}"}],
+        }
+        for index in range(8)
+    ]
+    request = _request_with_live_history(name, history)
+
+    forward = asyncio.run(
+        get_authoritative_history(
+            request,
+            session_name=name,
+            limit_turns=2,
+            artifact_limit=None,
+            before_index=None,
+            after_index=3,
+        )
+    )
+
+    assert [turn["index"] for turn in forward["turns"]] == [3, 4]
+    assert forward["window_end"] == 5
+    assert forward["total_turns"] == 8
+
+
+def test_authoritative_history_pages_begin_at_user_checkpoints(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(config, "HISTORY_DIR", str(tmp_path))
+    name = "checkpoint-session"
+    history = [
+        {
+            "role": "user" if index in {0, 4, 8, 12, 16, 20} else "assistant",
+            "parts": [{"type": "text", "text": f"turn {index}"}],
+        }
+        for index in range(24)
+    ]
+    request = _request_with_live_history(name, history)
+
+    payload = asyncio.run(
+        get_authoritative_history(
+            request,
+            session_name=name,
+            limit_turns=20,
+            artifact_limit=None,
+            before_index=None,
+            checkpoint_count=5,
+        )
+    )
+
+    assert payload["start_index"] == 4
+    assert [
+        turn["index"] for turn in payload["turns"] if turn["role"] == "user"
+    ] == [4, 8, 12, 16, 20]
+
+
 def test_web_reload_groups_newly_hydrated_transcript_not_old_browser_slot():
     """Regression for refresh rendering an empty conversation.
 
@@ -126,3 +187,53 @@ def test_web_reload_groups_newly_hydrated_transcript_not_old_browser_slot():
     assert "const result = coreGroup(slot, slot.turns);" in guard
     assert "openByGroup" in guard
     assert "openByUser" in guard
+
+
+def test_watcher_publishes_session_deleted_when_document_removed():
+    """Round-27 F5: when the watched session.json vanishes, the watcher
+    publishes session_deleted once and drops the tracker (no repeats)."""
+    import asyncio
+    import threading
+
+    from mu.gui.watcher import SessionWatcher
+
+    class _Bus:
+        def __init__(self):
+            self.events = []
+
+        async def publish(self, event):
+            self.events.append(event)
+
+    class _SM:
+        @staticmethod
+        def _get_filepath(name):
+            return "/nonexistent/session.json"
+
+    class _Session:
+        session_manager = _SM()
+
+    class _State:
+        def __init__(self, bus):
+            self.bus = bus
+
+        def session_busy_for(self, name):
+            return threading.Event()
+
+    class _App:
+        def __init__(self, bus):
+            self.state = _State(bus)
+
+    bus = _Bus()
+    watcher = SessionWatcher.__new__(SessionWatcher)
+    watcher._app = _App(bus)
+    watcher._interval = 1.0
+    watcher._tracks = {"gone": object()}
+
+    asyncio.run(watcher._tick_one("gone", _Session()))
+    kinds = [e["kind"] for e in bus.events]
+    assert kinds == ["session_deleted"]
+    assert "gone" not in watcher._tracks
+
+    # Second tick: no duplicate event.
+    asyncio.run(watcher._tick_one("gone", _Session()))
+    assert len(bus.events) == 1

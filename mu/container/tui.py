@@ -680,10 +680,12 @@ def send_tui_container_message(session: Any, text: str) -> dict[str, Any]:
         )
         rendered = format_container_load_error(failure)
         if session.ui:
-            session.ui.show_error(rendered)
+            # UI surfaces get the concise raw error; the long resolution
+            # narrative is for the plain console path only.
+            session.ui.show_error(str(exc))
         else:
             console.print(f"[red]{rendered}[/red]")
-        return {"status": "error", "error": failure.get("message"), "failure": failure}
+        return {"status": "error", "error": str(exc), "failure": failure}
     assistant_text = str(response.get("assistant_text") or "")
     if assistant_text and session.ui:
         session.ui.render_message("assistant", assistant_text, session.provider.model_name)

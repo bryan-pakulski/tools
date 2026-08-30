@@ -509,6 +509,9 @@ class InputHandler:
             "/goal": NestedCompleter.from_nested_dict(
                 {"set": None, "clear": None, "show": None, "help": None}
             ),
+            "/profile": NestedCompleter.from_nested_dict(
+                {"save": None, "use": None, "show": None, "delete": None}
+            ),
             # /bash takes a free-form shell command — no useful completion list.
             "/bash": None,
             "/sh": None,
@@ -522,6 +525,17 @@ class InputHandler:
             "/t": teach_completer,
             # diagnostics
             "/stats": NestedCompleter.from_nested_dict({"clear": None}),
+            "/costs": None,
+            "/pricing": None,
+            "/trace": None,
+            "/jobtrace": None,
+            "/jobdiag": None,
+            "/job-diagnostics": None,
+            "/job-analysis": None,
+            "/jobs": None,
+            "/job": None,
+            # memory quick-write
+            "/remember": None,
             # skills
             "/skills": _SkillNameCompleter(),
             # docs

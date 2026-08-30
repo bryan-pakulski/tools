@@ -95,6 +95,10 @@ class DiffProposal:
     decision_reason: str = ""
     created_at: float = field(default_factory=time.time)
     decided_at: float | None = None
+    # Set when the approved diff is actually applied via review-mode
+    # apply_diff; a proposal may only be applied once.
+    applied_at: float | None = None
+    applied_file: str = ""
 
 
 @dataclass
@@ -738,7 +742,25 @@ def update_task_content(
             if action_points is not None:
                 task.action_points = action_points
             if exit_criteria is not None:
-                task.exit_criteria = exit_criteria
+                # Round-30 F1: an empty list would strip all exit
+                # criteria, after which the completion gate's
+                # `missing = [c for c in expected ...]` is vacuously
+                # empty and the task can be marked completed with zero
+                # evidence. The create path requires non-empty
+                # criteria; the update path must uphold the same
+                # invariant. Empty list = refuse.
+                cleaned = [
+                    str(item).strip()
+                    for item in (exit_criteria or [])
+                    if str(item).strip()
+                ]
+                if not cleaned:
+                    raise ValueError(
+                        "exit_criteria cannot be emptied — a task must "
+                        "always carry at least one verifiable exit "
+                        "criterion"
+                    )
+                task.exit_criteria = cleaned
             if notes is not None:
                 task.notes = notes
             break
@@ -873,6 +895,32 @@ def decide_diff_proposal(
             "decision": proposal.status,
             "reason": proposal.decision_reason,
         },
+        actor=actor,
+    )
+    return save_feature_plan("", plan), proposal
+
+
+def mark_proposal_applied(
+    metadata_path: str,
+    *,
+    proposal_id: str,
+    applied_file: str,
+    actor: str = "agent",
+) -> tuple[FeaturePlan, DiffProposal]:
+    """Mark an approved proposal as applied (single-use enforcement)."""
+    plan = load_feature_plan(metadata_path)
+    proposal = next((item for item in plan.diff_proposals if item.id == proposal_id), None)
+    if proposal is None:
+        raise ValueError(f"Proposal {proposal_id} not found")
+    if proposal.applied_at is not None:
+        raise ValueError(f"Proposal {proposal_id} was already applied")
+    proposal.applied_at = time.time()
+    proposal.applied_file = applied_file
+    plan.add_event(
+        kind="diff_applied",
+        entity="task",
+        entity_id=proposal.task_id,
+        payload={"proposal_id": proposal.id, "file": applied_file},
         actor=actor,
     )
     return save_feature_plan("", plan), proposal

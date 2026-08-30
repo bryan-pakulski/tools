@@ -20,6 +20,7 @@
     </script>
     <link rel="stylesheet" href="/static/css/app.css">
     <link rel="stylesheet" href="/static/css/trace.css">
+    <link rel="stylesheet" href="/static/css/floating_popouts.css">
     <!-- trace.js MUST load before alpine.min.js: this build calls
          Alpine.start() via a microtask queued at the end of the alpine
          script, which runs before the next defer script. If alpine loads
@@ -27,6 +28,7 @@
          and the component silently fails to initialize (empty run picker).
          base.html does the same thing with app.js (non-defer, first). -->
     <script src="/static/js/trace.js" defer></script>
+    <script src="/static/js/floating_popouts.js" defer></script>
     <script src="/static/vendor/alpine.min.js" defer></script>
 </head>
 <body class="trace-body" x-data="traceApp()" x-init="init()" @keydown.escape.window="infoOpen=null">
@@ -61,7 +63,7 @@
         <span x-text="session ? ('No runs recorded for session “' + session + '” yet.') : 'No trace runs found.'"></span>
     </div>
     <div class="trace-empty" x-show="!loading && !session && runs.length > 0 && !runId">Select a run above to visualize it.</div>
-    <div class="trace-empty" x-show="loading">Loading…</div>
+    <div class="trace-empty ui-loading-region" x-show="loading">Loading trace data…</div>
     <div class="trace-empty" x-show="!loading && runId && !summary">No data for this run.</div>
 
     <main class="trace-main" x-show="!loading && summary" style="display:none;">
@@ -119,6 +121,29 @@
                 <div class="trace-card"><div class="tc-label">tool calls</div><div class="tc-val" x-text="summary.tool_calls"></div></div>
                 <div class="trace-card"><div class="tc-label">context delivered / discarded</div><div class="tc-val"><span x-text="(summary.context_artifact_counts || {}).delivered || 0"></span> / <span x-text="(summary.context_artifact_counts || {}).discarded || 0"></span></div></div>
                 <div class="trace-card"><div class="tc-label">subagent iters</div><div class="tc-val" x-text="summary.subagent_iters"></div></div>
+            </div>
+        </section>
+
+        <!-- 1b. Harness suspects digest -->
+        <section class="trace-section" x-show="suspectsList().length">
+            <h2 class="trace-h2">Harness suspects <span class="trace-sub">ranked signals actually observed in this run</span>
+                <button class="trace-info-btn" @click.stop="toggleInfo('suspects')" :class="{open: infoOpen==='suspects'}" title="What this panel shows">ⓘ</button>
+                <div class="trace-info-popout" x-show="infoOpen==='suspects'" x-transition.opacity.duration.120ms @click.outside="infoOpen=null">
+                    <div class="tip-title">Harness suspects</div>
+                    <p><b>Shows:</b> the same ranked suspect digest the trace tools return — harness pathologies detected in the run data, most severe first, each with a suggested next drill-down.</p>
+                    <p><b>Why:</b> answers "where do I start?" without cross-referencing every panel. Clean runs show nothing here.</p>
+                    <p><b>Read:</b> severity badge (high = act now, medium = inspect, low = informational); the pointer names the panel or tool call that has the evidence.</p>
+                </div>
+            </h2>
+            <div class="trace-suspects">
+                <template x-for="s in suspectsList()" :key="s.suspect">
+                    <div class="trace-suspect" :class="'trace-suspect--' + s.severity" @click="suspectJump(s)">
+                        <span class="ts-sev" x-text="s.severity"></span>
+                        <span class="ts-name" x-text="s.suspect"></span>
+                        <span class="ts-detail" x-text="s.detail"></span>
+                        <span class="ts-next mono" x-text="s.next"></span>
+                    </div>
+                </template>
             </div>
         </section>
 

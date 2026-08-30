@@ -94,25 +94,30 @@ async function request<T>(
     });
 
     if (!response.ok) {
+      // Response bodies are single-consumption streams: read once as text,
+      // then parse guarded. (json() failure followed by text() always failed.)
       let errorBody: unknown;
       let errorMsg = `HTTP ${response.status}`;
       try {
-        errorBody = await response.json();
-        if (errorBody && typeof errorBody === 'object' && 'detail' in errorBody) {
-          const structuredDetail = (errorBody as Record<string, unknown>).detail;
-          if (typeof structuredDetail === 'string') {
-            errorMsg = structuredDetail;
-          } else if (structuredDetail && typeof structuredDetail === 'object') {
-            const record = structuredDetail as Record<string, unknown>;
-            errorMsg = String(record.message || record.title || errorMsg);
+        const raw = await response.text();
+        if (raw) {
+          try {
+            errorBody = JSON.parse(raw);
+          } catch {
+            errorBody = raw;
+          }
+          if (errorBody && typeof errorBody === 'object' && 'detail' in errorBody) {
+            const structuredDetail = (errorBody as Record<string, unknown>).detail;
+            if (typeof structuredDetail === 'string') {
+              errorMsg = structuredDetail;
+            } else if (structuredDetail && typeof structuredDetail === 'object') {
+              const record = structuredDetail as Record<string, unknown>;
+              errorMsg = String(record.message || record.title || errorMsg);
+            }
           }
         }
       } catch {
-        try {
-          errorBody = await response.text();
-        } catch {
-          // ignore
-        }
+        // Body unreadable (stream consumed or aborted) — status-only error.
       }
       throw new ApiError(response.status, errorMsg, errorBody);
     }
@@ -155,10 +160,13 @@ export const api = {
   },
 };
 
-export async function checkHealth(targetBaseUrl?: string): Promise<boolean> {
+export async function checkHealth(
+  targetBaseUrl?: string,
+  opts?: { timeoutMs?: number },
+): Promise<boolean> {
   const url = (targetBaseUrl || useConnectionStore.getState().baseUrl) + '/healthz';
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5_000);
+  const timeout = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 5_000);
   try {
     const resp = await fetch(url, { method: 'GET', signal: controller.signal });
     return resp.ok;

@@ -45,6 +45,9 @@ class _FeatureSessionManagerStub:
     def save_history(self):
         self.saved = True
 
+    def save_history_turn(self, folder_context_obj=None):
+        self.save_history()
+
     def get_feature_state(self):
         return self.feature_state or self.record
 

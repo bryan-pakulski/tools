@@ -12,9 +12,11 @@ class FakeManager:
         self.token_counts = {"total_cost": 1.0}
         self.saved = 0
         self.ui = None
+        self.revision = 0
 
-    def save_history(self, folder_context):
+    def save_history(self, folder_context, expected_revision=None):
         self.saved += 1
+        self.revision += 1
 
 
 class FakeSession:

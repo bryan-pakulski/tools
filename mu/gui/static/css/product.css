@@ -83,6 +83,8 @@ html[data-theme="light"] {
 html { background: var(--bg); }
 html, body { overscroll-behavior: none; }
 body {
+    margin: 0;
+    padding: 0 !important;
     background: var(--bg);
     color: var(--text);
     font: 14px/1.55 var(--sans);
@@ -478,9 +480,140 @@ input:focus, textarea:focus, select:focus {
     flex: 1;
     overflow-y: auto;
     padding: 38px max(24px, calc((100% - 860px) / 2)) 150px;
+    padding-right: max(50px, calc((100% - 860px) / 2));
     scroll-padding-bottom: 180px;
     scrollbar-width: thin;
     scrollbar-color: var(--border-strong) transparent;
+    scrollbar-gutter: stable;
+    overflow-anchor: none;
+}
+.product-app .chat-history {
+    padding-right: max(50px, calc((100% - 900px) / 2)) !important;
+}
+.ui-loading-spinner {
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
+    border: 2px solid var(--border-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: ui-loading-spin .72s linear infinite;
+}
+@keyframes ui-loading-spin { to { transform: rotate(360deg); } }
+.chat-history-loading {
+    position: absolute;
+    z-index: 30;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: fit-content;
+    max-width: calc(100% - 24px);
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 10px 13px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--bg) 90%, transparent);
+    color: var(--text-dim);
+    box-shadow: 0 10px 30px rgba(0,0,0,.12);
+    backdrop-filter: blur(12px);
+    font: 11px/1.2 var(--sans);
+}
+.chat-history-loading.compact { margin: 0; }
+.conversation-stage-rail {
+    position: absolute;
+    z-index: 24;
+    top: 12px;
+    right: 3px;
+    bottom: 142px;
+    width: 30px;
+    pointer-events: none;
+}
+.conversation-stage-list {
+    max-height: 100%;
+    overflow-y: auto;
+    padding: 7px 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    border: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
+    border-radius: 15px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    box-shadow: 0 8px 28px rgba(0,0,0,.12);
+    backdrop-filter: blur(10px);
+    scrollbar-width: none;
+    pointer-events: auto;
+}
+.conversation-stage-list::-webkit-scrollbar { display: none; }
+.conversation-stage-marker {
+    position: relative;
+    width: 28px;
+    height: 24px;
+    min-height: 24px;
+    flex: 0 0 24px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 12px;
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+}
+.conversation-stage-marker:disabled { cursor: default; }
+.conversation-stage-marker:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+.conversation-stage-link {
+    color: var(--text-dim);
+}
+.conversation-stage-link:hover .conversation-stage-dot { transform: scale(1.45); }
+.conversation-stage-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--border-strong);
+    transition: width .14s ease, height .14s ease, transform .14s ease, background .14s ease;
+}
+.conversation-stage-link.active {
+    color: var(--accent);
+}
+.conversation-stage-link.active .conversation-stage-dot {
+    width: 9px;
+    height: 9px;
+    background: var(--accent);
+}
+.conversation-stage-more::before {
+    content: "";
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+}
+.conversation-stage-more:hover:not(:disabled)::before { border-color: var(--accent); }
+.conversation-stage-chevron {
+    width: 7px;
+    height: 7px;
+    border-right: 1.5px solid var(--accent);
+    border-bottom: 1.5px solid var(--accent);
+}
+.conversation-stage-chevron.up { transform: translateY(2px) rotate(225deg); }
+.ui-loading-spinner.tiny {
+    width: 11px;
+    height: 11px;
+    border-width: 1.5px;
+}
+@media (prefers-reduced-motion: reduce) {
+    .ui-loading-spinner { animation-duration: 1.5s; }
+    .conversation-stage-dot { transition: none; }
+}
+@media (max-width: 900px) {
+    .conversation-stage-rail { right: 3px; }
 }
 .turn-wrap { width: 100%; }
 .msg {

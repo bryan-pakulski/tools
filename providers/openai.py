@@ -25,6 +25,25 @@ from .base import (
 _REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
 
 
+def _sanitize_stream_error(exc: BaseException, *, cap: int = 300) -> str:
+    """Bound and scrub an SDK exception message before it reaches a
+    StreamEvent. SDK exceptions can embed upstream response bodies, request
+    URLs, and prompt fragments; events are displayed/logged/traced, so the
+    text is secret-redacted and length-capped. The exception class name is
+    always preserved so callers can still distinguish error categories."""
+    try:
+        from mu.security.secret_paths import redact_secrets
+
+        text, _ = redact_secrets(str(exc))
+    except Exception:
+        text = str(exc)
+    text = " ".join(text.split())
+    if len(text) > cap:
+        text = text[: cap - 3].rstrip() + "..."
+    return f"{type(exc).__name__}: {text}"
+
+
+
 def _is_reasoning_model(name: str) -> bool:
     n = (name or "").lower()
     return any(n.startswith(p) for p in _REASONING_MODEL_PREFIXES)
@@ -195,13 +214,16 @@ class OpenAIProvider(LLMProvider):
 
         # ------------------------------------------------------ stream events
 
-        chunk_iter = self._client.chat.completions.create(**payload)
-
         # Track partial tool calls. OpenAI uses per-index identifiers in deltas.
         partial_calls: Dict[int, Dict[str, Any]] = {}
         seen_ids: set = set()
+        chunk_iter = None
 
         try:
+            # Create the stream inside the try so connection / auth /
+            # timeout failures take the same StreamEvent(error) path as
+            # iteration failures.
+            chunk_iter = self._client.chat.completions.create(**payload)
             for chunk in chunk_iter:
                 # Usage chunk (only present when stream_options.include_usage)
                 if getattr(chunk, "usage", None) is not None:
@@ -298,8 +320,17 @@ class OpenAIProvider(LLMProvider):
                     partial_calls.clear()
                     seen_ids.clear()
         except Exception as exc:
-            yield StreamEvent(kind="error", text=str(exc))
+            yield StreamEvent(kind="error", text=_sanitize_stream_error(exc))
             raise
+        finally:
+            # Close the underlying HTTP stream when iteration is abandoned
+            # (error raised mid-stream, caller breaks early, or success).
+            closer = getattr(chunk_iter, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
 
         yield StreamEvent(kind="done")
 

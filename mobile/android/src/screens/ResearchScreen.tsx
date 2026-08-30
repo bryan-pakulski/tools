@@ -1,8 +1,9 @@
 import React, { useCallback, useState } from 'react';
-import { Linking, Pressable, RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
+import { Pressable, RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import { useTheme } from '../theme/ThemeContext';
+import { openExternalUrl } from '../api/urlSafety';
 import { Badge, Card, EmptyState, ErrorState, ModeWorkspaceHeader, Skeleton, Text, useModeWorkspaceView } from '../components';
 import { researchApi, ResearchState } from '../api/research';
 import { spacing } from '../theme/tokens';
@@ -84,7 +85,7 @@ export function ResearchScreen() {
                     <View style={{ height: 3, marginTop: spacing.sm, borderRadius: 2, overflow: 'hidden', backgroundColor: colors.bgHover }}>
                       <View style={{ height: '100%', width: `${credibility}%`, backgroundColor: colors.accent }} />
                     </View>
-                    <Text variant="xs" numberOfLines={expanded ? undefined : 1} style={{ color: colors.accent, marginTop: 7 }} onPress={() => Linking.openURL(source.url)}>{source.url}</Text>
+                    <Text variant="xs" numberOfLines={expanded ? undefined : 1} style={{ color: colors.accent, marginTop: 7 }} onPress={() => void openExternalUrl(source.url)}>{source.url}</Text>
                     {expanded && (
                       <View style={{ marginTop: spacing.sm, paddingTop: spacing.sm, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.border }}>
                         {!!source.authors.length && <MetaRow label="Authors" value={source.authors.join(', ')} />}

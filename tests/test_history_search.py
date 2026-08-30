@@ -567,6 +567,18 @@ def test_gui_endpoint_returns_400_on_empty_query():
 
 
 def test_existing_session_tests_still_import():
-    """Verify that the existing test modules still import cleanly."""
-    import tests.test_session  # noqa: F401
-    import tests.test_mu_session_history  # noqa: F401
+    """Verify that the existing test modules still import cleanly.
+
+    The tests directory has no __init__.py (pytest rootdir-based collection),
+    so sibling test modules are imported by file path via importlib.
+    """
+    import importlib.util
+    import pathlib
+
+    tests_dir = pathlib.Path(__file__).resolve().parent
+    for name in ("test_session.py", "test_mu_session_history.py"):
+        path = tests_dir / name
+        assert path.is_file(), f"expected test module missing: {name}"
+        spec = importlib.util.spec_from_file_location(name[:-3], path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)

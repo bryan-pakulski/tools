@@ -1,3 +1,5 @@
+from collections import deque
+
 from mu.session.session import Session
 from utils.config import DEFAULT_VARIABLES
 
@@ -8,6 +10,12 @@ def test_tool_sequence_repetition_detection():
         "read_file:aaa -> list_dir:bbb",
         "read_file:aaa -> list_dir:bbb",
     ]
+    assert Session._is_repeated_tool_sequence(history, repeat_threshold=3) is True
+
+
+def test_tool_sequence_repetition_detection_accepts_deque():
+    history = deque(["read_file:aaa"] * 3, maxlen=12)
+
     assert Session._is_repeated_tool_sequence(history, repeat_threshold=3) is True
 
 

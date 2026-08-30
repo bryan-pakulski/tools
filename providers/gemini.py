@@ -7,6 +7,7 @@
 # fallback locations on the chunk part (Part.thought_signature,
 # function_call.id, function_call.thought_signature), hex-encode bytes for
 # JSON-safe storage, and decode back on the next turn.
+import logging
 import os
 import json
 from typing import Iterator, List, Optional
@@ -26,13 +27,54 @@ from .base import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_stream_error(exc: BaseException, *, cap: int = 300) -> str:
+    """Bound and scrub a provider exception message before it reaches a
+    StreamEvent or log line. Provider exceptions can embed upstream response
+    bodies, request URLs, and prompt fragments; text is secret-redacted and
+    length-capped. The exception class name is always preserved."""
+    try:
+        from mu.security.secret_paths import redact_secrets
+
+        text, _ = redact_secrets(str(exc))
+    except Exception:
+        text = str(exc)
+    text = " ".join(text.split())
+    if len(text) > cap:
+        text = text[: cap - 3].rstrip() + "..."
+    return f"{type(exc).__name__}: {text}"
+
+
 class GeminiProvider(LLMProvider):
-    def __init__(self, model_name: str = "", api_key: Optional[str] = None):
+    # Harness-controlled HTTP timeout (seconds). The SDK default may change
+    # between versions and can otherwise occupy an agent worker indefinitely.
+    DEFAULT_TIMEOUT_SECONDS = 300.0
+
+    def __init__(
+        self,
+        model_name: str = "",
+        api_key: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ):
         super().__init__(model_name)
         self.name = "gemini"
         if not api_key:
             api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        self.client = genai.Client(api_key=api_key)
+        try:
+            env_timeout = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "") or 0)
+        except ValueError:
+            env_timeout = 0.0
+        self.timeout_seconds = float(
+            timeout_seconds
+            or env_timeout
+            or self.DEFAULT_TIMEOUT_SECONDS
+        )
+        http_options = types.HttpOptions(timeout=self.timeout_seconds * 1000)
+        self.client = genai.Client(
+            api_key=api_key, http_options=http_options
+        )
 
     def get_available_models(self) -> List[str]:
         try:
@@ -44,7 +86,10 @@ class GeminiProvider(LLMProvider):
                     discovered.append(name.split("/")[-1])
             return discovered
         except Exception as e:
-            print(f"Warning: Failed to fetch available models from Gemini API: {e}")
+            logger.warning(
+                "Failed to fetch available models from Gemini API: %s",
+                _sanitize_stream_error(e),
+            )
             return []
 
     # ------------------------------------------------------- message conversion
@@ -104,14 +149,12 @@ class GeminiProvider(LLMProvider):
                         name=part.tool_name,
                         response={"result": str(tool_result)},
                     )
+                    # Thought signatures belong to MODEL-produced parts only.
+                    # A function_response is a user-side replay of tool
+                    # output; attaching a signature here corrupts the
+                    # transcript. The signature stays on the preceding
+                    # function_call part (handled above).
                     resp_part = types.Part(function_response=fresp)
-                    if part.thought_signature:
-                        try:
-                            resp_part.thought_signature = bytes.fromhex(
-                                part.thought_signature
-                            )
-                        except (ValueError, TypeError):
-                            resp_part.thought_signature = part.thought_signature.encode()
                     gemini_parts.append(resp_part)
 
             if not gemini_parts:
@@ -218,11 +261,13 @@ class GeminiProvider(LLMProvider):
 
                     fc = getattr(part, "function_call", None)
                     if fc:
-                        ts = getattr(part, "thought_signature", None)
-                        if not ts:
-                            ts = getattr(fc, "id", None) or getattr(
-                                fc, "thought_signature", None
-                            )
+                        # Only genuine thought signatures round-trip here.
+                        # fc.id is a provider call identifier, NOT a
+                        # signature — replaying it as one corrupts the
+                        # next turn's signature validation.
+                        ts = getattr(part, "thought_signature", None) or getattr(
+                            fc, "thought_signature", None
+                        )
                         if ts and isinstance(ts, bytes):
                             ts = ts.hex()
 
@@ -258,7 +303,7 @@ class GeminiProvider(LLMProvider):
                             text=f"[inline {mt} attachment]",
                         )
         except Exception as exc:
-            yield StreamEvent(kind="error", text=str(exc))
+            yield StreamEvent(kind="error", text=_sanitize_stream_error(exc))
             raise
 
         if last_usage and not usage_emitted:

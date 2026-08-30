@@ -42,7 +42,10 @@ def test_history_keeps_collapsed_intermediate_information():
     web = read("mu/gui/static/js/app.js")
     loop = read("mu/agent/loop_body.py")
 
-    assert "ArtifactRegistry(session_dir).list()" in sessions
+    # Round-44 F2: the registry read is bounded (limit kwarg) and scoped to
+    # the requested window — the guard now pins the bounded-read contract
+    # instead of the old unbounded .list() call.
+    assert "ArtifactRegistry(session_dir).list(limit=registry_read_limit)" in sessions
     assert '"tool_args": part.get("tool_args")' in sessions
     assert 'ptype in {"thinking", "reasoning", "thought"}' in sessions
     assert 'part.type in {"thinking", "reasoning", "thought"}' in loop
@@ -52,13 +55,19 @@ def test_history_keeps_collapsed_intermediate_information():
 
 
 def test_visualization_guidance_and_codemirror_dependency():
+    """Guidance pins plus the CodeMirror-removal contract.
+
+    Commit 1b8ec71 removed the embedded file editor and every CodeMirror
+    dependency (971d101 base.html cleanup, 650f4e8/8ae58b9/4709bdb/e6ae5cc
+    vendor removals). The visualization guidance assertions are unaffected;
+    the CodeMirror portion now pins the ABSENCE contract that
+    test_web_product_ui guards: no vendor files, no base.html tags.
+    """
     config = read("utils/config.py")
     base = read("mu/gui/templates/base.html")
-    addon = read("mu/gui/static/vendor/codemirror-simple.js")
 
     assert config.count("Use `publish_visualization` proactively") == 3
     assert "do not wait for the user to nudge a tool call" in config
-    assert base.index("codemirror-simple.js") < base.index(
-        "codemirror-modes.min.js"
-    )
-    assert "CodeMirror.defineSimpleMode" in addon
+    # CodeMirror stays removed: no vendor script tags in the web shell.
+    assert "codemirror" not in base.lower()
+    assert not (ROOT / "mu/gui/static/vendor/codemirror-simple.js").exists()

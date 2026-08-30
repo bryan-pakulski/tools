@@ -44,25 +44,43 @@ def register_live_observability_hooks() -> None:
             if publish is None:
                 return None
             try:
-                from mu.agent.loop_body import (
-                    _estimate_messages_tokens,
-                    _estimate_tools_tokens,
-                )
-                from utils.token_estimator import estimate_tokens
-
+                # Round-47 F11: the request estimate reuses the preflight
+                # manifest when available (loop_body stashes
+                # _request_estimate_manifest) instead of re-walking every
+                # message; only unseen callers estimate directly.
+                est = getattr(ctx.session, "_request_estimate_manifest", None)
                 request_tokens = (
-                    estimate_tokens(ctx.system_prompt or "")
-                    + _estimate_messages_tokens(ctx.messages or [])
-                    + _estimate_tools_tokens(ctx.tools or [])
+                    int(est["total"])
+                    if est
+                    else (
+                        estimate_tokens(ctx.system_prompt or "")
+                        + _estimate_messages_tokens(ctx.messages or [])
+                        + _estimate_tools_tokens(ctx.tools or [])
+                    )
                 )
                 ctx.session._memory_map_request_token_estimate = int(request_tokens)
-                snapshot = build_memory_snapshot(
-                    ctx.session,
-                    cols=LIVE_RESOLUTION,
-                    rows=LIVE_RESOLUTION,
-                    request_token_estimate=request_tokens,
-                )
-                timeline_point = record_context_snapshot(ctx.session, snapshot)
+                # F11: materialize layer texts ONCE here — both
+                # build_memory_snapshot (grid fingerprints) and
+                # record_context_snapshot (64-slice timeline) previously
+                # walked every layer independently per provider call
+                # (2x O(history) passes).
+                from mu.gui.memory_snapshot import _LAYER_ORDER, _layer_text
+                ctx.session._memory_layer_texts = {
+                    lid: _layer_text(ctx.session, lid) for lid in _LAYER_ORDER
+                }
+                try:
+                    snapshot = build_memory_snapshot(
+                        ctx.session,
+                        cols=LIVE_RESOLUTION,
+                        rows=LIVE_RESOLUTION,
+                        request_token_estimate=request_tokens,
+                    )
+                    timeline_point = record_context_snapshot(ctx.session, snapshot)
+                finally:
+                    # Round-48 F14: try/finally — the r47 shape cleared the
+                    # stash only on the success path, leaking stale texts
+                    # after any exception between set and clear.
+                    ctx.session._memory_layer_texts = None
             except Exception as exc:  # observability must never break a turn
                 _logger.warning("context snapshot hook failed: %s", exc)
                 return None

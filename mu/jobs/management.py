@@ -476,19 +476,57 @@ class JobManagementService:
         if job.worker_id:
             raise JobManagementError("A job with an active worker lease cannot be deleted.")
 
+        # Round-37 F1: DELETE the row FIRST (inside the transaction that
+        # revalidates status/lease/archive), and only remove the worktree
+        # afterwards. The old order — rmtree the worktree, then revalidate
+        # and DELETE the row — had a destructive TOCTOU: a concurrent
+        # requeue could move this archived job back to QUEUED and acquire
+        # a lease after the snapshot checks but before the removal; the
+        # deletion then destroyed the ACTIVE worker's checkout and the
+        # transaction (correctly) refused the row delete, leaving a live
+        # job with no execution environment. Now the row delete commits
+        # first; the worktree of a deleted job is unreachable by workers
+        # (start/retry require the row), so removal afterwards is safe.
+        with self.store._transaction() as conn:
+            # Re-verify inside the write transaction: a concurrent lease
+            # acquisition, requeue, or archive flip between the checks
+            # above and this DELETE must not let an active job be deleted
+            # under a running worker.
+            row = conn.execute(
+                "SELECT status, worker_id FROM jobs WHERE id = ?",
+                (job.id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job.id)
+            if row["status"] not in {s.value for s in HISTORIC_STATUSES}:
+                raise JobManagementError(
+                    f"Job {job.id} can no longer be deleted: it is {row['status']}."
+                )
+            if row["worker_id"]:
+                raise JobManagementError(
+                    "A job with an active worker lease cannot be deleted."
+                )
+            mg = conn.execute(
+                "SELECT archived_at FROM job_management WHERE job_id = ?",
+                (job.id,),
+            ).fetchone()
+            if mg is None or mg["archived_at"] is None:
+                raise JobManagementError(
+                    "Archive a historic job before deleting it."
+                )
+            cursor = conn.execute("DELETE FROM jobs WHERE id = ?", (job.id,))
+            if cursor.rowcount != 1:
+                raise KeyError(job.id)
+
         worktree_removed = False
         if purge_artifacts and job.worktree and os.path.exists(job.worktree):
             try:
                 worktree_removed = JobWorktreeManager(self.service).remove(job, force=False)
             except WorktreeError as exc:
-                raise JobManagementError(
-                    f"Refusing to delete job because its managed worktree could not be removed safely: {exc}"
-                ) from exc
-
-        with self.store._transaction() as conn:
-            cursor = conn.execute("DELETE FROM jobs WHERE id = ?", (job.id,))
-            if cursor.rowcount != 1:
-                raise KeyError(job.id)
+                # The job row is already gone; the worktree is orphaned but
+                # harmless (unregistered from any live job). Surface the
+                # cleanup failure without corrupting the delete result.
+                worktree_removed = False
 
         removed: List[str] = []
         warnings: List[str] = []

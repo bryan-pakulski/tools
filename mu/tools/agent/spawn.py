@@ -84,6 +84,7 @@ def _short_task_title(task: str, explicit: str = "", specialist: str = "general"
 
 
 _SPECIALIST_SYSTEM_TEMPLATE = """ROLE: persistent SUB-AGENT specialist \"{specialist}\" (depth={depth}).
+Sub-agent task directive: run the newest delegation to completion and return one self-contained result.
 You retain your own history and durable memory across related delegations in this parent session.
 The latest user message is the current delegation; execute it with available tools and return one concise self-contained result.
 Reuse retained repository knowledge instead of rediscovering it. Supersede stale findings when evidence changes.
@@ -216,6 +217,16 @@ def spawn_agent(args: Dict[str, Any], context) -> Dict[str, Any]:
     arg_model = str(args.get("model") or "").strip()
     def pick(candidate):
         return candidate if candidate and _model_installed(candidate, installed) else ""
+    if arg_model and not _model_installed(arg_model, installed):
+        logger.warning(
+            "spawn_agent: requested model '%s' is not installed; falling back to parent model '%s'.",
+            arg_model, parent_model or "default",
+        )
+    if cfg_model and not _model_installed(cfg_model, installed):
+        logger.warning(
+            "spawn_agent: configured subagent_model '%s' is not installed; falling back to parent model '%s'.",
+            cfg_model, parent_model or "default",
+        )
     resolved_model = pick(cfg_model) or pick(arg_model) or parent_model
     provider_key = str(getattr(parent.provider, "name", "") or f"{type(parent.provider).__module__}.{type(parent.provider).__name__}")
     disabled = _tool_profile(parent, args.get("tools"), remaining_depth)
@@ -310,6 +321,13 @@ def spawn_agent(args: Dict[str, Any], context) -> Dict[str, Any]:
     record = registry.register(child, task=task, title=title, depth=child_depth, lifecycle=lifecycle, tracker_agent_id=tracker_agent_id, model=resolved_model, specialist_key=specialist_key, worker_id=worker.worker_id, reused_specialist=reused, max_iterations=max_iterations, parent_history_index=parent_history_index, parent_turn_index=parent_turn_index, parent_turn_id=parent_turn_id)
     child.variables["subagent_parent_task_id"] = record.task_id
     child._parent_registry = registry
+    if root_ui is not None:
+        try:
+            root_ui.show_info(
+                f"Spawning subagent '{title}' (task {record.task_id}): {task}"
+            )
+        except Exception:
+            pass
     registry.launch(record, _delegation_prompt(task, explicit_context))
 
     return _envelope(ok=True, message=f"Dispatched {specialist_key} specialist ({'reused' if reused else 'new'} worker {worker.worker_id}); task_id={record.task_id}.", data={

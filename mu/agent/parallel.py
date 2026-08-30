@@ -172,13 +172,16 @@ def execute_calls(
 #
 # Inclusions:
 #   * Read-only tools (workspace + research) — pure reads, no shared mutation.
-#   * `bash` — each call is its own subprocess with isolated cwd.
 #   * `spawn_agent` — every child gets its own SessionManager / scratchpad /
 #     memory store, so concurrent children don't race on harness state. They
 #     can still race on workspace writes if the model spawns conflicting
 #     children, but that is a model-level decision, not a harness invariant.
 #
 # Exclusions (NOT in this set; run serially):
+#   * `bash` — a shell command can perform arbitrary workspace/process
+#     mutations; a subprocess with its own cwd does NOT isolate filesystem
+#     effects, so two concurrent bash calls can clobber the same file or
+#     race on repo state.
 #   * Filesystem writes (`write_file`, `apply_diff`, `search_and_replace_file`)
 #     — two concurrent edits of the same file would silently clobber.
 #   * Memory / scratchpad mutators — `BaseNoteStore` increments a shared
@@ -196,8 +199,6 @@ PARALLEL_SAFE_TOOLS = frozenset(
         "search_for_string",
         "search_references",
         "retrieve_relevant_context",
-        # Shell — each subprocess is isolated
-        "bash",
         # Research / network reads
         "web_search",
         "arxiv_search",

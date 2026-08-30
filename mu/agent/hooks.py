@@ -34,6 +34,7 @@ The registry is intentionally lightweight — no async, no thread safety
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -55,6 +56,11 @@ HOOK_POINTS: Tuple[str, ...] = (
     "post_tool",
     "on_stop",
 )
+
+# Points whose hooks enforce security/policy gates. An exception raised by
+# a hook at these points is treated as a denial (fail closed) instead of a
+# skip (fail open) — see HookRegistry.fire.
+ENFORCEMENT_HOOK_POINTS: frozenset = frozenset({"pre_tool", "pre_provider_call"})
 
 
 @dataclass
@@ -186,11 +192,31 @@ class HookRegistry:
         for spec in self._by_point[point]:
             try:
                 out = spec.handler(ctx)
-            except Exception as exc:  # pragma: no cover — defensive
-                import logging
-                logging.getLogger("mucli").warning(
-                    "hook %s at %s raised %s; continuing", spec.name, point, exc
-                )
+            except Exception as exc:
+                # Enforcement points (pre_tool gates, retries) must FAIL
+                # CLOSED: a raising security hook (plan-mode guard, secret
+                # scrubber) denies the action rather than waving it
+                # through. Non-enforcement points stay advisory — a buggy
+                # user hook must not break the loop.
+                if point in ENFORCEMENT_HOOK_POINTS:
+                    logging.getLogger("mucli").error(
+                        "enforcement hook %s at %s raised %s; denying action",
+                        spec.name,
+                        point,
+                        exc,
+                    )
+                    results.append(
+                        HookResult(
+                            action="short_circuit" if point == "pre_tool" else "abort",
+                            payload=(
+                                f"Enforcement hook {spec.name!r} failed: {exc}"
+                            ),
+                        )
+                    )
+                else:
+                    logging.getLogger("mucli").warning(
+                        "hook %s at %s raised %s; continuing", spec.name, point, exc
+                    )
                 continue
             if out is None:
                 continue

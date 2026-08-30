@@ -88,13 +88,22 @@ def _sanitize_diff(diff: str, filename: str) -> str:
     if not lines:
         return diff
 
+    # Chatter stripping must only apply OUTSIDE hunks: unified-diff content
+    # lines may legitimately contain '***' or '```' (markdown separators,
+    # fence examples) and stripping them would corrupt the patch.
+    in_hunk = False
     cleaned_lines = []
     for line in lines:
-        trimmed = line.strip()
-        if trimmed.startswith("***") or trimmed.endswith("***"):
-            continue
-        if trimmed.startswith("```"):
-            continue
+        if line.startswith("@@"):
+            in_hunk = True
+        elif line.startswith("--- ") or line.startswith("+++ "):
+            in_hunk = False
+        if not in_hunk:
+            trimmed = line.strip()
+            if trimmed.startswith("***") or trimmed.endswith("***"):
+                continue
+            if trimmed.startswith("```"):
+                continue
         cleaned_lines.append(line)
     lines = cleaned_lines
 
@@ -193,10 +202,10 @@ def apply_diff(filename: str, diff: str, folder_context, *, session_type: str = 
         logger.warning(f"apply_diff: Access denied or path ignored: {filename}")
         return f"Error: Access denied or path ignored. '{filename}'"
 
-    try:
-        if not os.path.exists(filename):
-            return f"Error: File '{filename}' does not exist. Cannot apply diff."
+    if not os.path.exists(filename):
+        return f"Error: File '{filename}' does not exist. Cannot apply diff."
 
+    try:
         diff = _sanitize_diff(diff, filename)
 
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp_diff:
@@ -209,27 +218,30 @@ def apply_diff(filename: str, diff: str, folder_context, *, session_type: str = 
                 capture_output=True,
                 text=True,
             )
-            os.unlink(tmp_diff_path)
-
-            if result.returncode == 0:
-                if folder_context and hasattr(folder_context, "track_file"):
-                    folder_context.track_file(filename)
-                return f"Successfully applied diff to {filename}"
-            else:
-                logger.error(
-                    f"apply_diff: Patch error for {filename}: {result.stderr or result.stdout}"
-                )
-                return (
-                    f"Error applying diff via 'patch': {result.stderr or result.stdout}"
-                )
         except FileNotFoundError:
-            os.unlink(tmp_diff_path)
             logger.error("apply_diff: 'patch' utility not found.")
             return "Error: 'patch' utility not found on system. Please install it to apply diffs."
-
+        finally:
+            # Temp cleanup in finally (codex round-8 F6): exceptions
+            # previously leaked the temp diff (patch content) in /tmp.
+            try:
+                os.unlink(tmp_diff_path)
+            except OSError:
+                pass
     except Exception as e:
         logger.error(f"apply_diff: Exception for {filename}: {e}")
         return f"Error applying diff: {e}"
+
+    if result.returncode == 0:
+        if folder_context and hasattr(folder_context, "track_file"):
+            folder_context.track_file(filename)
+        return f"Successfully applied diff to {filename}"
+    logger.error(
+        f"apply_diff: Patch error for {filename}: {result.stderr or result.stdout}"
+    )
+    return (
+        f"Error applying diff via 'patch': {result.stderr or result.stdout}"
+    )
 
 
 @tool(
@@ -252,6 +264,13 @@ def apply_diff(filename: str, diff: str, folder_context, *, session_type: str = 
                     "The unified diff content to apply. MUST follow standard "
                     "unified diff format: --- filename, +++ filename, "
                     "@@ -L,C +L,C @@ headers, and +/-/space line markers."
+                ),
+            },
+            "proposal_id": {
+                "type": "string",
+                "description": (
+                    "Review-mode only: id of the approved diff proposal this "
+                    "diff matches. Required when feature review mode is active."
                 ),
             },
         },
@@ -319,6 +338,14 @@ def search_and_replace_file(
     except Exception as e:
         return json.dumps({"success": False, "error": f"Error reading file: {str(e)}"})
 
+    # Capture identity before read; re-check before write so a concurrent
+    # modification between read and write is not silently lost.
+    try:
+        _stat_before = os.stat(filename)
+        _mtime_before = _stat_before.st_mtime_ns
+        _size_before = _stat_before.st_size
+    except OSError as e:
+        return json.dumps({"success": False, "error": f"Error statting file: {str(e)}"})
     try:
         with open(filename, "r", encoding="utf-8") as f:
             content = f.read()
@@ -453,6 +480,27 @@ def search_and_replace_file(
                 "dry_run": True,
             }
         )
+
+    # Concurrent-edit guard: if the file changed since our read, refuse
+    # instead of silently clobbering the interleaved modification.
+    try:
+        _stat_now = os.stat(filename)
+        if (
+            _stat_now.st_mtime_ns != _mtime_before
+            or _stat_now.st_size != _size_before
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"File '{filename}' changed since it was read "
+                        "(concurrent modification). Re-read the file and retry."
+                    ),
+                    "concurrent_modification": True,
+                }
+            )
+    except OSError as e:
+        return json.dumps({"success": False, "error": f"Error statting file: {str(e)}"})
 
     try:
         with open(filename, "w", encoding="utf-8") as f:

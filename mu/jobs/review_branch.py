@@ -36,11 +36,20 @@ class ReviewBranchInfo:
         }
 
 
-def materialize_review_branch(service: JobService, job_id: str) -> ReviewBranchInfo:
+def materialize_review_branch(
+    service: JobService,
+    job_id: str,
+    *,
+    expected_head_sha: Optional[str] = None,
+) -> ReviewBranchInfo:
     """Make the job branch the sole review artifact and retire its worktree.
 
     Safety contract:
     - branch + captured base must exist;
+    - when `expected_head_sha` is supplied (the SHA the verification run
+      actually tested), both the branch ref and any present worktree HEAD
+      must equal it — otherwise an unverified commit slipped in between
+      the checks finishing and this materialization;
     - any still-present worktree must be clean;
     - worktree HEAD must equal the branch ref before removal;
     - branch must descend from the captured base;
@@ -85,6 +94,17 @@ def materialize_review_branch(service: JobService, job_id: str) -> ReviewBranchI
         raise WorktreeError(
             f"Review branch {job.branch!r} has no commit.",
             stage="review_branch_head",
+        )
+    if expected_head_sha and branch_head != expected_head_sha:
+        raise WorktreeError(
+            "Verification evidence is stale: branch HEAD advanced after the "
+            "checks ran. Refusing to materialize an unverified commit.",
+            stage="review_branch_head_stale",
+            context={
+                "branch": job.branch,
+                "expected_head_sha": expected_head_sha,
+                "branch_head": branch_head,
+            },
         )
 
     ancestor = manager._run(
@@ -155,7 +175,57 @@ def materialize_review_branch(service: JobService, job_id: str) -> ReviewBranchI
             check=False,
             stage="review_worktree_unlock",
         )
-        manager.remove(job, force=True)
+        # Round-37 F3: the cleanliness/HEAD checks above are a snapshot; a
+        # concurrent process could modify the worktree between them and the
+        # removal (verified-but-uncommitted work would be silently
+        # discarded, or an unverified commit destroyed while metadata
+        # records the stale SHA). Re-verify BOTH invariants immediately
+        # before the destructive remove and abort loudly on any change.
+        recheck_status = manager._run(
+            retired_worktree,
+            "status",
+            "--porcelain",
+            stage="review_worktree_cleanliness_recheck",
+            check=False,
+        )
+        if (recheck_status.stdout or "").strip():
+            raise WorktreeError(
+                "Worktree changed during review materialization: uncommitted "
+                "changes appeared after the first cleanliness check.",
+                stage="review_worktree_cleanliness_recheck",
+                stdout=(recheck_status.stdout or "").strip(),
+                context={"worktree": retired_worktree, "branch": job.branch},
+            )
+        recheck_head = (
+            manager._run(
+                retired_worktree,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+                stage="review_worktree_head_recheck",
+                check=False,
+            ).stdout
+            or ""
+        ).strip()
+        if recheck_head != branch_head:
+            raise WorktreeError(
+                "Worktree HEAD moved during review materialization; refusing "
+                "to discard an unverified commit.",
+                stage="review_worktree_branch_mismatch_recheck",
+                context={
+                    "worktree": retired_worktree,
+                    "worktree_head": recheck_head,
+                    "branch_head": branch_head,
+                },
+            )
+        # Round-39 F5: remove WITHOUT --force — git re-checks dirtiness at
+        # removal time, closing the recheck-to-removal window for new
+        # modifications (a --force removal would delete them silently).
+        # If the removal still fails because the tree changed in the
+        # microseconds between recheck and remove, the WorktreeError
+        # surfaces and materialization fails loudly — the correct outcome
+        # when the invariants cannot be held.
+        manager.remove(job, force=False)
     else:
         manager._run(repo, "worktree", "prune", check=False, stage="review_worktree_prune")
 

@@ -87,7 +87,14 @@ def test_stop_falls_back_to_port_when_pid_file_missing(monkeypatch, tmp_path):
     # that we can signal(0). Use our own process group isn't ideal; instead
     # stub pid_for_port to return a long-lived child and verify stop signals
     # it via os.kill by observing the child exits.
-    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    # Round-27 F1: stop() now verifies the port-derived PID's cmdline
+    # looks like mucli before signaling — the sleeper child is spawned
+    # with a mucli-looking argv0 so it passes the identity guard, and a
+    # companion test asserts a foreign process is NOT signaled.
+    sleeper = subprocess.Popen(
+        ["mucli-sleeper", "-c", "import time; time.sleep(30)"],
+        executable=sys.executable,
+    )
     monkeypatch.setattr(daemon, "pid_for_port", lambda port: sleeper.pid)
     try:
         ok, msg = daemon.stop(port=30311, timeout=5.0)
@@ -115,3 +122,25 @@ def test_stop_returns_false_when_nothing_running(monkeypatch, tmp_path):
     ok, msg = daemon.stop(port=9999)
     assert ok is False
     assert "no GUI server is running" in msg
+
+def test_stop_port_fallback_refuses_foreign_process(monkeypatch, tmp_path):
+    """Round-27 F1: a port-derived PID whose cmdline does NOT look like
+    mucli (foreign process holding the port, or PID reuse) must NOT be
+    signaled — stop() refuses instead."""
+    monkeypatch.setattr(daemon._config, "HISTORY_DIR", str(tmp_path), raising=False)
+    assert daemon.is_running() is None
+
+    foreign = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    monkeypatch.setattr(daemon, "pid_for_port", lambda port: foreign.pid)
+    try:
+        ok, msg = daemon.stop(port=30311, timeout=1.0)
+        assert not ok, "stop must refuse a foreign port holder"
+        assert "no GUI server" in msg
+        # Foreign process was NOT signaled — still alive before cleanup.
+        assert foreign.poll() is None
+    finally:
+        foreign.terminate()
+        try:
+            foreign.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            foreign.kill()

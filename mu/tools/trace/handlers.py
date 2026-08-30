@@ -43,13 +43,38 @@ def _err(msg: str) -> str:
     return json.dumps({"error": msg})
 
 
+def _scrub_json_text(text: str) -> str:
+    """Redact known secret patterns from a serialized trace payload.
+
+    Trace records embed raw tool-result and assistant previews, so a
+    credential that reached a preview must not leak back out through the
+    trace tools.
+    """
+    try:
+        from mu.security.secret_paths import redact_secrets
+
+        scrubbed, _ = redact_secrets(text)
+        return scrubbed
+    except Exception:
+        return text
+
+
 def _resolve(run_id: str):
-    """Resolve run_id to a parsed TraceRun, or (None, error_str)."""
-    from mu.trace import find_trace_path, parse_trace
+    """Resolve run_id to a parsed TraceRun, or (None, error_str).
+
+    ``latest`` resolves to the newest recorded run — skips the
+    list_traces round-trip when debugging the most recent run.
+    """
+    from mu.trace import find_trace_path, list_trace_runs, parse_trace
 
     run_id = str(run_id or "").strip()
     if not run_id:
         return None, _err("run_id is required")
+    if run_id.lower() == "latest":
+        runs = list_trace_runs()  # newest-first
+        if not runs:
+            return None, _err("no traces recorded under $MUCLI_HOME/trace/")
+        run_id = runs[0]["run_id"]
     path = find_trace_path(run_id)
     if path is None:
         return None, _err("trace run not found: " + run_id)
@@ -92,7 +117,7 @@ def list_traces(args: Dict[str, Any], context) -> str:
     session = str(args.get("session") or "").strip().lower()
     if session:
         runs = [r for r in runs if session in str(r.get("session", "")).lower()]
-    return json.dumps({"runs": runs, "count": len(runs)})
+    return _scrub_json_text(json.dumps({"runs": runs, "count": len(runs)}))
 
 
 @tool(
@@ -113,7 +138,10 @@ def list_traces(args: Dict[str, Any], context) -> str:
         "properties": {
             "run_id": {
                 "type": "string",
-                "description": "Run id (or a unique substring of the trace filename).",
+                "description": (
+                    "Run id (or a unique substring of the trace filename). "
+                    "The special value 'latest' resolves to the newest run."
+                ),
             },
         },
         "required": ["run_id"],
@@ -131,7 +159,7 @@ def trace_summary(args: Dict[str, Any], context) -> str:
     if run is None:
         return err
     series = build_series(run)
-    return json.dumps(build_summary(run, series), default=str)
+    return _scrub_json_text(json.dumps(build_summary(run, series), default=str))
 
 
 @tool(
@@ -206,7 +234,7 @@ def trace_series(args: Dict[str, Any], context) -> str:
                      if isinstance(el, dict) and el.get("iter") == iter_val]
         payload = value
 
-    return json.dumps(payload, default=str)
+    return _scrub_json_text(json.dumps(payload, default=str))
 
 
 @tool(
@@ -253,10 +281,20 @@ def trace_iteration(args: Dict[str, Any], context) -> str:
 
     iter_record = next((i for i in run.iters if i.get("iter") == iter_val), None)
     if iter_record is None:
+        # Anomaly-aware hint (UX polish): point the caller at the
+        # iterations that actually had events (tools/nudges/compactions),
+        # not just the full iteration list.
+        event_iters = sorted({
+            t.get("iter") for t in run.tools if t.get("iter") is not None
+        } | {
+            c.get("iter") for c in run.compactions if c.get("iter") is not None
+        })
         return json.dumps({
             "error": "iteration not found: " + str(iter_val),
             "run_id": run.run_id,
             "iters": [i.get("iter") for i in run.iters],
+            "iters_with_events": event_iters,
+            "hint": "use trace_summary(run_id).suspects to find anomalous iters, or pick from iters_with_events",
         })
 
     _tool_fields = (
@@ -278,10 +316,10 @@ def trace_iteration(args: Dict[str, Any], context) -> str:
         for c in run.compactions
         if c.get("iter") == iter_val
     ]
-    return json.dumps({
+    return _scrub_json_text(json.dumps({
         "run_id": run.run_id,
         "iter": iter_record,
         "tools": tools,
         "nudges": nudges,
         "compactions": compactions,
-    }, default=str)
+    }, default=str))

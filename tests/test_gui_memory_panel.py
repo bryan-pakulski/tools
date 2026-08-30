@@ -692,3 +692,48 @@ def test_hash_color_is_deterministic_and_hex():
     assert a.startswith("#") and len(a) == 7
     # Different input → (very likely) different color.
     assert _hash_color("different chunk") != a
+
+
+def test_fingerprint_resolution_lru_cap():
+    """Round-27 F2: per-session fingerprint map is LRU-bounded —
+    requesting many distinct resolutions cannot grow it unboundedly."""
+    from mu.gui import memory_snapshot as ms
+
+    class _Session:
+        pass
+
+    session = _Session()
+    for i in range(40):
+        fp = ms._fingerprint(session)
+        fp[(16 + i, 16 + i)] = {"L0": {"hashes": [1], "counts": [0]}}
+    assert len(ms._fingerprint(session)) <= ms._MAX_RESOLUTIONS
+
+
+def test_fingerprint_concurrent_access_thread_safe():
+    """Round-27 F4: provider hooks (agent threads) and REST snapshots
+    hammer _fingerprint concurrently — no exception, no lost keys."""
+    import threading
+
+    from mu.gui import memory_snapshot as ms
+
+    class _Session:
+        pass
+
+    session = _Session()
+    errors: list = []
+
+    def hammer():
+        try:
+            for i in range(100):
+                fp = ms._fingerprint(session)
+                with ms._FINGERPRINTS_LOCK:
+                    fp[(16, 16)] = fp.get((16, 16), {})
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors

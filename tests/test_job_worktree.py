@@ -35,6 +35,27 @@ def make_service(tmp_path):
     return JobService(JobStore(str(tmp_path / "jobs.sqlite3")))
 
 
+def test_remove_rejects_unregistered_decoy_path(tmp_path):
+    """Round-37 F2: a corrupted job.worktree path (directory named after
+    the job id, but NOT a registered git worktree of the repository) must
+    be refused instead of rmtree'd. The decoy here holds a sentinel file
+    that would have been destroyed by the old unconditional rmtree."""
+    repo = make_repo(tmp_path)
+    service = make_service(tmp_path)
+    job = service.create(JobSpec(title="Decoy victim", repository=str(repo)))
+    decoy = tmp_path / "worktrees" / job.id
+    decoy.mkdir(parents=True)
+    sentinel = decoy / "sentinel.txt"
+    sentinel.write_text("precious\n", encoding="utf-8")
+    service.store.update_runtime_fields(job.id, worktree=str(decoy))
+    fresh = service.get(job.id)
+    manager = JobWorktreeManager(service, root=str(tmp_path / "worktrees"))
+    with pytest.raises(WorktreeError) as excinfo:
+        manager.remove(fresh, force=True)
+    assert "not a registered worktree" in str(excinfo.value)
+    assert sentinel.read_text(encoding="utf-8") == "precious\n"
+
+
 def test_prepare_creates_branch_and_worktree_without_touching_primary_checkout(tmp_path):
     repo = make_repo(tmp_path)
     service = make_service(tmp_path)

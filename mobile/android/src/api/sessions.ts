@@ -154,6 +154,11 @@ export interface SessionHistoryOptions extends SessionRequestOptions {
   limitTurns?: number;
   artifactLimit?: number;
   beforeIndex?: number;
+  /** Minimum number of user-prompt checkpoints to include when scanning backward. */
+  checkpointCount?: number;
+  // Round-44 F6: forward pagination — reload evicted newer pages when the
+  // user scrolls back down. Server caps the forward window at limit_turns.
+  afterIndex?: number;
 }
 
 export interface CreateSessionOptions {
@@ -195,6 +200,8 @@ export const sessionsApi = {
         limit_turns: options?.limitTurns,
         artifact_limit: options?.artifactLimit,
         before_index: options?.beforeIndex,
+        after_index: options?.afterIndex,
+        checkpoint_count: options?.checkpointCount,
       },
     }),
   suggestWorkspaces: (path: string, limit: number = 12) =>

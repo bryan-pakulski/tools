@@ -6,6 +6,48 @@
 /* ---------------------------------------------------------------- main timeline */
 .chat-history {
     padding-top: 36px !important;
+    padding-right: max(50px, calc((100% - 860px) / 2)) !important;
+}
+.ui-loading-spinner {
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
+    border: 2px solid var(--border-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: ui-loading-spin .72s linear infinite;
+}
+.ui-loading-spinner.small { width: 13px; height: 13px; border-width: 1.5px; }
+@keyframes ui-loading-spin { to { transform: rotate(360deg); } }
+.chat-history-loading {
+    position: absolute;
+    z-index: 30;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: fit-content;
+    max-width: calc(100% - 24px);
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 10px 13px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--bg) 90%, transparent);
+    color: var(--text-dim);
+    box-shadow: 0 10px 30px rgba(0,0,0,.12);
+    backdrop-filter: blur(12px);
+    font: 11px/1.2 var(--sans);
+}
+.chat-history-loading.compact { margin: 0; }
+@media (prefers-reduced-motion: reduce) {
+    .ui-loading-spinner { animation-duration: 1.5s; }
+}
+
+@media (max-width: 900px) {
+    .chat-history { padding-right: 50px !important; }
 }
 
 .chat-history > .turn-wrap > .msg {

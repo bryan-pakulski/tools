@@ -270,3 +270,38 @@ def test_stats_autocomplete_includes_clear():
     )
     texts = {c.text for c in completions}
     assert "clear" in texts
+
+
+def test_post_tool_parallel_no_lost_updates(session):
+    """Round-20 F9: post_tool hooks run concurrently under parallel tool
+    execution — the stats read-modify-write must not lose increments."""
+    import threading
+
+    from mu.agent import usage_tracker as ut
+    from mu.agent.hooks import HookContext
+
+    n_threads, n_incr = 8, 50
+    barrier = threading.Barrier(n_threads)
+
+    def worker():
+        barrier.wait()  # maximize contention
+        for _ in range(n_incr):
+            ctx = HookContext(
+                point="post_tool",
+                session=session,
+                tool_name="bash",
+                tool_args={"command": "x"},
+                metadata={},
+                tool_result={"ok": True},
+            )
+            ut.usage_tracker_post(ctx)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    bucket = session.tool_stats["tools"]["bash"]
+    assert bucket["count"] == n_threads * n_incr
+    assert bucket["success"] == n_threads * n_incr

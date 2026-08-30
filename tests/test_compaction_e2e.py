@@ -296,6 +296,9 @@ def test_auto_compact_hook_fires_at_most_once_per_turn(monkeypatch):
     from mu.agent.hooks import HookContext
 
     session = _make_session()
+    # Round-9 F3: the hook is gated on the same auto_compaction_enabled
+    # opt-in as the turn-start roll — opt this session in.
+    session.variables["auto_compaction_enabled"] = True
     sm = session.session_manager
     _stuff_history_over_budget(sm, n_turns=10, size=1500)
     session._compaction_watermark = 0

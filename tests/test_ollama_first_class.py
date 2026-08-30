@@ -263,6 +263,12 @@ def _mock_urlopen_factory(body_bytes, status=200):
     response.__exit__ = MagicMock(return_value=False)
     response.read.return_value = body_bytes
     response.status = status
+    # Stream path iterates NDJSON lines; a mock that iterates as empty
+    # would previously be masked by the provider fabricating a `done`
+    # event. Emit real lines so truncated-stream assertions are honest.
+    response.__iter__ = MagicMock(
+        return_value=iter(body_bytes.splitlines(keepends=True))
+    )
     return response
 
 

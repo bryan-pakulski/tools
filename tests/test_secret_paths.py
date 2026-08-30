@@ -165,3 +165,23 @@ def test_extract_paths_with_unbalanced_quotes_falls_back():
     # The fallback should still surface the suspicious token, possibly
     # quoted; either way, a downstream denied-path check would fire.
     assert any("shadow" in t for t in tokens)
+
+
+def test_other_user_home_ssh_denied():
+    """Round-28 F1: /home/<other>/.ssh subtrees are denied even though
+    the invoking user's ~ expansion only covers one account."""
+    denied, why = is_denied_path("/home/alice/.ssh/id_rsa")
+    assert denied and ".ssh" in why
+    denied, why = is_denied_path("/root/.ssh/authorized_keys")
+    assert denied
+
+
+def test_command_substitution_path_extracted():
+    """Round-28 F1: `$(echo /home/u/.ssh/id_rsa)` tokenizes as `$(echo`
+    + `path)` — paren-splitting must expose the inner path to the
+    denylist."""
+    from mu.security.secret_paths import extract_paths_from_command
+
+    tokens = list(extract_paths_from_command("cat $(echo /home/u/.ssh/id_rsa)"))
+    denied = [t for t in tokens if is_denied_path(t)[0]]
+    assert denied, tokens

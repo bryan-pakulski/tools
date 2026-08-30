@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, AppState, Linking, StyleSheet, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, AppState, StyleSheet, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { ArtifactDescriptor, artifactsApi } from '../api/artifacts';
+import { openExternalUrl } from '../api/urlSafety';
 import { useConnectionStore } from '../store/connection';
 import { useTheme } from '../theme/ThemeContext';
 import { ModernBottomSheet } from './ModernBottomSheet';
@@ -63,7 +64,7 @@ export function ArtifactsSheet({ visible, onClose }: { visible: boolean; onClose
         <View key={item.artifact_id} style={[styles.row, { borderBottomColor: colors.border }]}>
           <TouchableOpacity
             style={styles.open}
-            onPress={() => sessionName && Linking.openURL(artifactsApi.downloadUrl(sessionName, item.artifact_id))}
+            onPress={() => sessionName && openExternalUrl(artifactsApi.downloadUrl(sessionName, item.artifact_id))}
           >
             <View style={[styles.icon, { backgroundColor: colors.bgHover }]}>
               <Ionicons name="document-outline" size={20} color={colors.accent} />

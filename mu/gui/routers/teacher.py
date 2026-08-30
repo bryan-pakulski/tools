@@ -227,12 +227,22 @@ def _summarize_modules(course: Dict[str, Any]) -> List[Dict[str, Any]]:
     The frontend renders the curriculum tree as `module → lessons`, so
     pre-joining here keeps the template trivial (avoids fragile
     nested-find expressions in Alpine).
+
+    Round-44 F11: module-embedded lessons are CARD copies — the curriculum
+    tree renders only title/status/comprehension. The full lecture
+    transcript (``lecture_turns``) stays ONLY on the top-level lessons
+    list, which backs the lesson detail view; embedding it again here
+    serialized the whole lecture history twice per /state refresh.
     """
     summarized_lessons = _summarize_lessons(course)
     lessons_by_module: Dict[str, List[Dict[str, Any]]] = {}
     for l in summarized_lessons:
         mid = str(l.get("module_id") or "")
-        lessons_by_module.setdefault(mid, []).append(l)
+        card = {
+            k: v for k, v in l.items()
+            if k != "lecture_turns"  # F11: transcript lives on top-level lessons only
+        }
+        lessons_by_module.setdefault(mid, []).append(card)
 
     out: List[Dict[str, Any]] = []
     seen_module_ids: set[str] = set()

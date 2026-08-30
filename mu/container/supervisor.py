@@ -18,6 +18,7 @@ from .ref import ContainerRef, DeviceSpec, DEFAULT_WORKER_PORT, WORKER_PROTOCOL_
 from .registry import ContainerRegistry
 from .templates import ContainerTemplate, TemplateRegistry
 from .runner import attach_session_folder, detach_session_folder, mount_folder
+from utils.logger import logger
 
 
 class ContainerSupervisor:
@@ -54,7 +55,8 @@ class ContainerSupervisor:
                 ref.status = "running" if running else ("stopped" if exists else "missing")
                 self.registry.upsert(ref)
             except Exception:
-                pass
+                # Defensive: best-effort path must not break the caller.
+                logger.debug("Suppressed exception", exc_info=True)
         return refs
 
     def _validate_rebuild_inputs(
@@ -79,7 +81,7 @@ class ContainerSupervisor:
             host_path = str((item or {}).get("host_path") or "").strip()
             if host_path and not os.path.isdir(os.path.abspath(os.path.expanduser(host_path))):
                 raise ContainerRuntimeError(f"container bind mount is missing: {host_path}")
-        validate_hardware(gpu_request, devices, runner=self.runner)
+        validate_hardware(gpu_request, devices, runner=getattr(self, "runner", None))
 
     def create_environment(
         self,
@@ -161,9 +163,9 @@ class ContainerSupervisor:
             raise ContainerRuntimeError(f"managed container not found: {container_name}")
         attached_sessions = list(ref.attached_sessions)
         standalone = bool(ref.standalone)
-        resolved_gpu = ref.gpu_request if gpu_request is None else gpu_request
+        resolved_gpu = getattr(ref, "gpu_request", "") if gpu_request is None else gpu_request
         resolved_devices = (
-            [item.to_dict() for item in ref.devices]
+            [item.to_dict() for item in getattr(ref, "devices", [])]
             if devices is None
             else devices
         )

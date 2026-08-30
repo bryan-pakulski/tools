@@ -61,8 +61,12 @@ def test_snapshot_commits_and_registers_template(tmp_path):
     assert item.source_container == "mucli-demo"
     assert template_registry.get("python-tools") is not None
     commit = next(command for command in runner.commands if command[1] == "commit")
-    assert "ENV OPENAI_API_KEY=" in commit
-    assert "ENV MUCLI_WORKER_TOKEN=" in commit
+    # Round-18 F31 + round-20 F45: the ledger stores the REDACTED argv as
+    # proper tokens — ENV keys must be present, secret values must never
+    # be. Substring match: a rendered token may be `ENV KEY=<redacted>`.
+    assert any("OPENAI_API_KEY=<redacted>" in part for part in commit)
+    assert any("MUCLI_WORKER_TOKEN=<redacted>" in part for part in commit)
+    assert not any("OPENAI_API_KEY=" in part and "<redacted>" not in part for part in commit)
 
 
 def test_create_standalone_environment_from_template_refreshes_worker_layer(tmp_path):

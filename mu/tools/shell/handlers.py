@@ -17,7 +17,26 @@ from mu.tools._bounds import (
 )
 from mu.tools.capabilities import normalize_session_type, session_type_from_context
 from mu.tools._scrub import scrub_and_annotate as _scrub_and_annotate
-from utils.logger import logger
+
+
+def _scrub_json_payload(payload: Any) -> Any:
+    """Recursively scrub every string in a background-task payload before
+    serialization (codex round-8 F4): bash_status/logs/kill/list return
+    captured stdout/stderr that may contain provider keys, tokens, or
+    private keys — same redaction contract as synchronous bash output."""
+    from mu.security.secret_paths import redact_secrets
+
+    if isinstance(payload, str):
+        scrubbed, _ = redact_secrets(payload)
+        return scrubbed
+    if isinstance(payload, list):
+        return [_scrub_json_payload(item) for item in payload]
+    if isinstance(payload, dict):
+        return {k: _scrub_json_payload(v) for k, v in payload.items()}
+    return payload
+
+
+from utils.logger import logger  # noqa: E402
 
 
 # ---------------------------------------------------------------- bg registry resolver
@@ -92,9 +111,13 @@ def bash_command(
         partial = f"{exc.stdout or ''}\n{exc.stderr or ''}".strip()
         if len(partial) > max_output_chars:
             partial = partial[:max_output_chars]
-        return (
-            f"Error: Command timed out after {timeout_seconds} seconds.\n"
-            f"{partial}".strip()
+        # Scrub the timeout path too (codex round-8 F5): a command that
+        # prints a secret then blocks must not leak it via partial output.
+        return _scrub_and_annotate(
+            (
+                f"Error: Command timed out after {timeout_seconds} seconds.\n"
+                f"{partial}"
+            ).strip()
         )
     except Exception as exc:
         logger.error(f"bash_command: Error executing command {command!r}: {exc}")
@@ -266,7 +289,7 @@ def bash_status(args: Dict[str, Any], context) -> str:
     if task is None:
         return json.dumps({"error": f"no such task: {task_id}"})
     tail_lines = max(0, int(args.get("tail_lines", 20) or 20))
-    return json.dumps(summarize_task(task, tail_lines=tail_lines), indent=2)
+    return json.dumps(_scrub_json_payload(summarize_task(task, tail_lines=tail_lines)), indent=2)
 
 
 @tool(
@@ -316,7 +339,7 @@ def bash_logs(args: Dict[str, Any], context) -> str:
         payload["stdout"] = _tail(task.stdout_buf, lines)
     if stream in ("stderr", "both"):
         payload["stderr"] = _tail(task.stderr_buf, lines)
-    return json.dumps(payload, indent=2)
+    return json.dumps(_scrub_json_payload(payload), indent=2)
 
 
 @tool(
@@ -346,7 +369,7 @@ def bash_kill(args: Dict[str, Any], context) -> str:
     task = registry.kill(task_id)
     if task is None:
         return json.dumps({"error": f"no such task: {task_id}"})
-    return json.dumps(summarize_task(task, tail_lines=5), indent=2)
+    return json.dumps(_scrub_json_payload(summarize_task(task, tail_lines=5)), indent=2)
 
 
 @tool(
@@ -362,4 +385,4 @@ def bash_list(args: Dict[str, Any], context) -> str:
 
     registry = _bg_registry(context)
     tasks = [summarize_task(t, tail_lines=3) for t in registry.list()]
-    return json.dumps({"tasks": tasks, "count": len(tasks)}, indent=2)
+    return json.dumps(_scrub_json_payload({"tasks": tasks, "count": len(tasks)}), indent=2)

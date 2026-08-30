@@ -16,10 +16,24 @@ from __future__ import annotations
 import glob
 import json
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 from .emitter import trace_dir
+
+
+# Round-46 F5: per-file cache for the list-view iter count. Keyed by absolute
+# path; validated by (size, mtime_ns) so an unchanged file is a pure dict hit
+# and an actively-appending run only rescans its newly appended tail.
+_SCAN_CACHE: Dict[str, Dict[str, Any]] = {}
+_SCAN_CACHE_LOCK = threading.Lock()
+_SCAN_CACHE_CAP = 512
+
+# Round-46 F4: default per-category retention for parse_trace. Matches the
+# GUI's per-category event caps (mu/gui/routers/traces.py _MAX_EVENTS) so a
+# parsed run is bounded end-to-end without changing dashboard fidelity.
+_DEFAULT_EVENT_CAP = 2000
 
 
 # ----------------------------------------------------------- parsing
@@ -63,9 +77,37 @@ def _iter_jsonl(path: str) -> Iterable[Dict[str, Any]]:
         return
 
 
-def parse_trace(path: str) -> TraceRun:
-    """Stream a trace JSONL into a :class:`TraceRun`. Never raises on bad data."""
+_PARSE_CATEGORY_CAPS: Dict[str, Optional[int]] = {
+    "iters": None,          # never dropped — snapshot grid + window math need all
+    "tools": _DEFAULT_EVENT_CAP,
+    "nudges": _DEFAULT_EVENT_CAP,
+    "compactions": _DEFAULT_EVENT_CAP,
+    "requests": _DEFAULT_EVENT_CAP,
+    "context_artifacts": _DEFAULT_EVENT_CAP,
+}
+
+
+def parse_trace(path: str, *, max_events: Optional[int] = _DEFAULT_EVENT_CAP) -> "TraceRun":
+    """Stream a trace JSONL into a :class:`TraceRun`. Never raises on bad data.
+
+    Round-46 F4: the per-category event lists used to retain every record, so
+    a multi-GB trace was fully materialized as Python objects (~4x file size
+    in RAM) just to render a dashboard that only shows the newest window.
+    ``max_events`` (default 2000) caps tools / nudges / compactions /
+    requests / context_artifacts to the NEWEST records via a drop-from-front
+    list; iterations stay complete (bounded separately by the GUI payload)
+    because the snapshot grid and series math need every iter id. Pass
+    ``max_events=None`` for the full-fidelity export path.
+    """
     run = TraceRun(path=path)
+    if max_events is not None:
+        caps = dict(_PARSE_CATEGORY_CAPS)
+        for key, cap in caps.items():
+            if key != "iters":
+                caps[key] = max_events
+    else:
+        caps = {key: None for key in _PARSE_CATEGORY_CAPS}
+    lists = {key: _BoundedList(cap) for key, cap in caps.items()}
     try:
         run.bytes = os.path.getsize(path)
     except OSError:
@@ -76,23 +118,29 @@ def parse_trace(path: str) -> TraceRun:
             run.header = obj
             run.run_id = obj.get("run_id", "") or run.run_id
         elif t == "iter":
-            run.iters.append(obj)
+            lists["iters"].append(obj)
             if not run.run_id:
                 run.run_id = obj.get("run_id", "")
         elif t == "tool":
-            run.tools.append(obj)
+            lists["tools"].append(obj)
         elif t == "nudge":
-            run.nudges.append(obj)
+            lists["nudges"].append(obj)
         elif t == "compaction":
-            run.compactions.append(obj)
+            lists["compactions"].append(obj)
         elif t == "request":
-            run.requests.append(obj)
+            lists["requests"].append(obj)
         elif t == "context_artifact":
-            run.context_artifacts.append(obj)
+            lists["context_artifacts"].append(obj)
         elif t == "turn_end":
             run.turn_end = obj
             if not run.run_id:
                 run.run_id = obj.get("run_id", "")
+    run.iters = lists["iters"]
+    run.tools = lists["tools"]
+    run.nudges = lists["nudges"]
+    run.compactions = lists["compactions"]
+    run.requests = lists["requests"]
+    run.context_artifacts = lists["context_artifacts"]
     return run
 
 
@@ -117,17 +165,86 @@ def _read_header(path: str) -> Dict[str, Any]:
     return {}
 
 
+class _BoundedList(list):
+    """A list that keeps only the NEWEST ``cap`` entries (F4).
+
+    The parser appends chronologically, so dropping from the front preserves
+    exactly the ``[-cap:]`` slice the GUI's bounded payloads want — without
+    ever materializing the full list first. ``cap=None`` behaves like list.
+    """
+
+    __slots__ = ("cap",)
+
+    def __init__(self, cap: Optional[int] = None) -> None:
+        super().__init__()
+        self.cap = cap
+
+    def append(self, item: Any) -> None:
+        super().append(item)
+        cap = self.cap
+        if cap is not None:
+            excess = len(self) - cap
+            if excess > 0:
+                del self[0:excess]
+
+
 def _iter_count_fast(path: str) -> int:
-    """Count ``"type":"iter"`` lines without a full parse — cheap for listing."""
+    """Count ``"type":"iter"`` lines without a full parse — cheap for listing.
+
+    Round-46 F5: this used to re-read EVERY byte of EVERY trace on each
+    ``list_trace_runs()`` call, so every GUI poll rescanned the whole trace
+    corpus (one active multi-GB run = a multi-GB scan per poll). Results are
+    now cached per file and refreshed incrementally: unchanged files are a
+    dict hit, and an actively-appending run only has its newly appended tail
+    rescanned (append-only JSONL). A tail scan is only trusted when the
+    previous scan ended on a line boundary; otherwise the file is rescanned
+    in full once, which re-establishes the clean boundary.
+    """
     try:
-        with open(path, encoding="utf-8") as fh:
-            return sum(
-                1
-                for line in fh
-                if '"type": "iter"' in line or '"type":"iter"' in line
-            )
+        st = os.stat(path)
     except OSError:
         return 0
+    size, mtime_ns = st.st_size, st.st_mtime_ns
+    with _SCAN_CACHE_LOCK:
+        entry = _SCAN_CACHE.get(path)
+    if entry and entry["size"] == size and entry["mtime_ns"] == mtime_ns:
+        return entry["count"]
+    count = 0
+    if entry and entry["clean"] and size > entry["size"]:
+        # Incremental: count iter lines in the appended tail only.
+        base = entry["count"]
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                fh.seek(entry["size"])
+                for line in fh:
+                    if '"type": "iter"' in line or '"type":"iter"' in line:
+                        count += 1
+        except OSError:
+            return entry["count"]
+        count += base
+        clean = True
+    else:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                raw = fh.read()
+        except OSError:
+            return 0
+        count = sum(
+            1
+            for line in raw.splitlines()
+            if '"type": "iter"' in line or '"type":"iter"' in line
+        )
+        clean = raw.endswith("\n") or not raw
+    with _SCAN_CACHE_LOCK:
+        if len(_SCAN_CACHE) >= _SCAN_CACHE_CAP and path not in _SCAN_CACHE:
+            _SCAN_CACHE.pop(next(iter(_SCAN_CACHE)), None)
+        _SCAN_CACHE[path] = {
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "count": count,
+            "clean": clean,
+        }
+    return count
 
 
 def list_trace_runs() -> List[Dict[str, Any]]:
@@ -168,6 +285,11 @@ def find_trace_path(run_id: str) -> Optional[str]:
     under the trace dir. Callers that need a raise-on-miss (the GUI router)
     wrap this; the agent tools return an error envelope on ``None``.
     """
+    if run_id == "latest":
+        files = glob.glob(os.path.join(trace_dir(), "*.jsonl"))
+        if files:
+            return max(files, key=os.path.getmtime)
+        return None
     for path in _trace_files():
         if run_id and run_id in os.path.basename(path):
             return path
@@ -210,6 +332,10 @@ def combine_runs(runs: List["TraceRun"]) -> "TraceRun":
     contiguously. Tools / nudges / compactions are remapped to the global iter
     via a per-run {local: global} map built from that run's iters; an event
     whose iter isn't in the map falls back to the run's last global iter.
+
+    Round-46 F6: the merge CONSUMES the source runs (event dicts are remapped
+    in place and their lists emptied) so peak memory is the merged run alone,
+    not sources + merged.
     """
     merged = TraceRun(path="")
     if not runs:
@@ -223,34 +349,43 @@ def combine_runs(runs: List["TraceRun"]) -> "TraceRun":
         for i in run.iters:
             local = i.get("iter")
             iter_map[local] = global_iter
-            new_i = dict(i)
-            new_i["iter"] = global_iter
-            merged.iters.append(new_i)
+            i["iter"] = global_iter
+            merged.iters.append(i)
             global_iter += 1
         # Fall-back global iter for events whose local iter isn't recorded as
         # an iteration (defensive — shouldn't normally happen).
         fallback = global_iter - 1 if run.iters else global_iter
+        # Round-46 F6: remap each source event IN PLACE (mutating the source
+        # run's event dicts and moving them into the merged run) instead of
+        # shallow-copying everything. The source runs are consumed by the
+        # merge — build_session_view passes ownership — so peak memory for a
+        # multi-run session drops from (sources + merged) to just merged.
+        # Callers that still need their runs intact pass copies.
         for t in run.tools:
-            nt = dict(t)
-            nt["iter"] = iter_map.get(t.get("iter"), fallback)
-            merged.tools.append(nt)
+            t["iter"] = iter_map.get(t.get("iter"), fallback)
+            merged.tools.append(t)
+        run.tools = []
         for n in run.nudges:
-            nn = dict(n)
             local = n.get("iteration", n.get("iter"))
             if local in iter_map:
                 gi = iter_map[local]
-                nn["iteration"] = gi
-                if "iter" in nn:
-                    nn["iter"] = gi
-            merged.nudges.append(nn)
+                n["iteration"] = gi
+                if "iter" in n:
+                    n["iter"] = gi
+            merged.nudges.append(n)
+        run.nudges = []
         for c in run.compactions:
-            nc = dict(c)
-            nc["iter"] = iter_map.get(c.get("iter"), fallback)
-            merged.compactions.append(nc)
+            c["iter"] = iter_map.get(c.get("iter"), fallback)
+            merged.compactions.append(c)
+        run.compactions = []
         for req in run.requests:
-            nr = dict(req); nr["iter"] = iter_map.get(req.get("iter"), fallback); merged.requests.append(nr)
+            req["iter"] = iter_map.get(req.get("iter"), fallback)
+            merged.requests.append(req)
+        run.requests = []
         for artifact in run.context_artifacts:
-            na = dict(artifact); na["iter"] = iter_map.get(artifact.get("iter"), fallback); merged.context_artifacts.append(na)
+            artifact["iter"] = iter_map.get(artifact.get("iter"), fallback)
+            merged.context_artifacts.append(artifact)
+        run.context_artifacts = []
     return merged
 
 
@@ -910,7 +1045,103 @@ def build_summary(run: TraceRun, series: Dict[str, Any]) -> Dict[str, Any]:
         # invalidations / disk_hits / locator_hits / dup_bytes_avoided) when
         # present.
         "efficiency": _build_efficiency_summary(run, series),
+        # Suspects digest (UX polish): which harness suspects actually
+        # fired, so a debugging agent gets the "what to look at next"
+        # pointers without diffing the full summary by hand.
+        "suspects": _build_suspects(run, series, mechanical, nudges_broken),
     }
+
+
+def _build_suspects(run: TraceRun, series: Dict[str, Any], mechanical: int, nudges_broken: int) -> list:
+    """Ranked list of harness suspects observed in this run.
+
+    Each suspect names the signal, its severity, and the iterations to
+    drill into next (trace_series / trace_iteration). Empty list = clean
+    run. This is the 'where do I look' layer between the totals above
+    and the per-iteration drill-down.
+    """
+    suspects: list = []
+    context_limit = int(run.header.get("context_limit", 0) or 0)
+
+    # 1. Tokenizer drift — only reliable readings count.
+    reliable = [d for d in series["drift"] if d.get("reliable")]
+    drift_pts = [(d.get("iter"), d["drift_pct"]) for d in reliable]
+    if drift_pts:
+        worst_iter, worst_pct = max(drift_pts, key=lambda p: abs(p[1]))
+        if abs(worst_pct) >= 15.0:
+            suspects.append({
+                "suspect": "tokenizer_drift",
+                "severity": "high" if abs(worst_pct) >= 40.0 else "medium",
+                "detail": f"drift {worst_pct:.1f}% at iter {worst_iter} (reliable reading)",
+                "next": f"trace_series drift; trace_iteration iter={worst_iter}",
+            })
+
+    # 2. Emergency/mechanical compactions — lossy summarizer.
+    if mechanical:
+        iters = [c.get("iter") for c in series["compaction_timeline"]
+                 if c.get("summarizer") == "mechanical"]
+        suspects.append({
+            "suspect": "mechanical_compaction",
+            "severity": "high",
+            "detail": f"{mechanical} compaction(s) fell back to the lossy mechanical summarizer",
+            "next": f"trace_series compaction_timeline; iters {sorted(set(i for i in iters if i is not None))}",
+        })
+
+    # 3. Nudges that failed to break a loop — stuck-loop signal.
+    # Round-46 F9: this used to condition on nudges_broken (the HEALTHY
+    # case), so successful interventions were reported as suspects and the
+    # actual stuck-loop signal — a fired-but-unbroken nudge — was invisible.
+    # failed = fired - broken; each failed nudge's `broke` flag is False.
+    nudge_efficacy = series.get("nudge_efficacy") or []
+    nudge_failed = len(nudge_efficacy) - nudges_broken
+    if nudge_failed > 0:
+        iters = [e.get("iter") for e in nudge_efficacy if not e["broke"]]
+        suspects.append({
+            "suspect": "nudge_failed_to_break",
+            "severity": "medium",
+            "detail": f"{nudge_failed} nudge(s) fired but did NOT break the loop",
+            "next": f"trace_iteration for iters {sorted(set(i for i in iters if i is not None))}",
+        })
+
+    # 4. Context pressure — peak within 10% of the window.
+    peak_ctx = max((c["actual"] for c in series["context"]), default=0.0)
+    if context_limit and peak_ctx >= 0.9 * context_limit:
+        peak_iter = max(
+            series["context"], key=lambda c: c["actual"], default={}
+        ).get("iter")
+        suspects.append({
+            "suspect": "context_pressure",
+            "severity": "medium",
+            "detail": f"peak context {int(peak_ctx)} of {context_limit} tokens",
+            "next": "trace_series context" + (f"; trace_iteration iter={peak_iter}" if peak_iter else ""),
+        })
+
+    # 5. Redundant reads — wasted turns.
+    redundant = series["redundant_reads"]
+    if redundant:
+        iters = sorted({r.get("iter") for r in redundant if r.get("iter") is not None})
+        suspects.append({
+            "suspect": "redundant_reads",
+            "severity": "low",
+            "detail": f"{len(redundant)} redundant read(s)",
+            "next": f"trace_series redundant_reads; iters {iters[:10]}",
+        })
+
+    # 6. Subagent stalls.
+    stuck = [s for s in series["subagent_timeline"] if s.get("stuck") or s.get("stall")]
+    if stuck:
+        iters = sorted({s.get("iter") for s in stuck if s.get("iter") is not None})
+        suspects.append({
+            "suspect": "subagent_stall",
+            "severity": "medium",
+            "detail": f"{len(stuck)} subagent stuck/stall reading(s)",
+            "next": f"trace_series subagent_timeline; iters {iters[:10]}",
+        })
+
+    # Rank by severity.
+    order = {"high": 0, "medium": 1, "low": 2}
+    suspects.sort(key=lambda s: order.get(s["severity"], 3))
+    return suspects
 
 
 __all__ = [

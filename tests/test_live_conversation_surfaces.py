@@ -85,7 +85,9 @@ def test_mobile_handoff_does_not_fold_on_tool_or_thinking_activity():
 
     assert "scheduleAssistantHandoff" in source
     assert "handoff: 'leaving'" in source
-    assert "handoff: firstDelta ? 'entering'" in source
+    # Round-44 F5: deltas coalesce before flush; the handoff pin survives with
+    # the flush-side variable name (`first`), preserving identical behavior.
+    assert "handoff: first ? 'entering'" in source
     assert "foldLiveInterim(current, turnId)" in source
     assert "foldLiveInterim" not in event_block(source, "thinking_delta", "tool_call")
     assert "foldLiveInterim" not in event_block(source, "tool_call", "tool_result")

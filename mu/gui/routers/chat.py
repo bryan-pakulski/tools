@@ -15,6 +15,8 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
+from utils.logger import logger
+from utils.revision import js_safe_revision
 
 router = APIRouter()
 events_router = APIRouter()
@@ -59,9 +61,17 @@ def _run_send(
             except Exception as exc:
                 result = {"status": "error", "error": str(exc)}
             try:
-                session.session_manager.save_history(session.folder_context)
+                # Phase-6 r21 F5: CAS against this manager's own
+                # revision. A concurrent surface write that landed after
+                # the final turn save must stay authoritative — plain
+                # save_history here would clobber it with stale
+                # in-memory state once the turn CAS is disarmed.
+                session.session_manager.save_history_if_current(
+                    session.folder_context
+                )
             except Exception:
-                pass
+                # Defensive: best-effort path must not break the caller.
+                logger.debug("Suppressed exception", exc_info=True)
             return result
     finally:
         busy.clear()
@@ -336,7 +346,8 @@ async def send_message(request: Request, payload: Dict[str, Any]):
                     session.session_manager._load_session(name)
                     session.sync_runtime_state()
                 except Exception:
-                    pass
+                    # Defensive: best-effort path must not break the caller.
+                    logger.debug("Suppressed exception", exc_info=True)
                 new_artifacts = await _replay_new_artifacts(
                     bus, session, name, artifacts_before
                 )
@@ -372,7 +383,8 @@ async def send_message(request: Request, payload: Dict[str, Any]):
                     session.session_manager._load_session(name)
                     session.sync_runtime_state()
                 except Exception:
-                    pass
+                    # Defensive: best-effort path must not break the caller.
+                    logger.debug("Suppressed exception", exc_info=True)
                 new_artifacts = await _replay_new_artifacts(
                     bus, session, name, artifacts_before
                 )
@@ -405,7 +417,13 @@ async def send_message(request: Request, payload: Dict[str, Any]):
                 busy.clear()
 
         asyncio.create_task(_drive_container())
-        return {"accepted": True, "kind": "container", "session_name": name}
+        return {
+            "accepted": True,
+            "kind": "container",
+            "session_name": name,
+            # Round-31 F35: JS-safe If-Match token for optimistic concurrency.
+            "revision": js_safe_revision(getattr(session.session_manager, "revision", 0) or 0),
+        }
 
     lock = request.app.state.session_lock_for(name)
 
@@ -415,11 +433,17 @@ async def send_message(request: Request, payload: Dict[str, Any]):
     async def _drive():
         try:
             result = await asyncio.to_thread(_run)
+            # Round-31 F35: publish the post-turn revision (save_history
+            # inside the turn already bumped it) so clients capture a
+            # fresh If-Match token without an extra state poll.
             await bus.publish(
                 {
                     "kind": "turn_complete",
                     "result": _summarize_result(result),
                     "session_name": name,
+                    "revision": js_safe_revision(
+                        getattr(session.session_manager, "revision", 0) or 0
+                    ),
                 }
             )
         except Exception as exc:
@@ -428,7 +452,13 @@ async def send_message(request: Request, payload: Dict[str, Any]):
             )
 
     asyncio.create_task(_drive())
-    return {"accepted": True, "kind": "chat", "session_name": name}
+    return {
+        "accepted": True,
+        "kind": "chat",
+        "session_name": name,
+        # Round-31 F35: JS-safe If-Match token for optimistic concurrency.
+        "revision": js_safe_revision(getattr(session.session_manager, "revision", 0) or 0),
+    }
 
 
 @router.post("/interrupt")
@@ -500,9 +530,29 @@ def _summarize_result(result: Any) -> Dict[str, Any]:
 
 
 @events_router.get("/api/events")
-async def stream_events(request: Request):
+async def stream_events(request: Request, session: str | None = None):
+    """SSE event stream.
+
+    With ?session=NAME the stream is server-side filtered to that
+    session's events (and session-agnostic events) — a tab viewing one
+    session no longer receives other sessions' assistant text, tool
+    results, or approval prompts (codex round-6 F4). Without the
+    parameter behavior is unchanged (loopback single-user default).
+
+    Round-47 F2: every event carries a monotonic ``seq``; the stream
+    sends it as the SSE ``id:`` field, and a reconnecting browser's
+    ``Last-Event-ID`` header replays the missed events from the bus's
+    bounded ring instead of silently skipping them.
+    """
     bus = request.app.state.bus
-    queue = bus.subscribe()
+    last_id = None
+    raw_last = request.headers.get("last-event-id")
+    if raw_last:
+        try:
+            last_id = int(raw_last)
+        except ValueError:
+            last_id = None
+    queue = bus.subscribe(session_name=session, last_event_id=last_id)
 
     async def generator():
         try:
@@ -515,6 +565,8 @@ async def stream_events(request: Request):
                 "busy": busy_names,
             })}
             for pending in request.app.state.prompts.pending():
+                if session and pending.get("session_name") not in (None, session):
+                    continue
                 yield {
                     "event": "message",
                     "data": json.dumps(
@@ -534,7 +586,17 @@ async def stream_events(request: Request):
                 except asyncio.TimeoutError:
                     yield {"event": "ping", "data": "{}"}
                     continue
-                yield {"event": "message", "data": json.dumps(event)}
+                # Round-47 F2 + Round-48 F1: seq rides as the SSE id so
+                # EventSource reconnects replay from Last-Event-ID. The
+                # queue holds the SAME dict the replay ring and other tabs
+                # reference — never pop from it; serialize a copy.
+                seq = event.get("seq")
+                payload = {k: v for k, v in event.items() if k != "seq"}
+                yield {
+                    "event": "message",
+                    "id": str(seq) if seq is not None else None,
+                    "data": json.dumps(payload),
+                }
         finally:
             bus.unsubscribe(queue)
 

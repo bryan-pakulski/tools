@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mucli"
+version = "0.1.0"
+description = "Multi-provider agentic AI CLI harness: hierarchical context layers (L0-L5), GUI web mode, container mode, teacher/loop/feature modes, and a durable cross-session memory ledger."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Bryan Pakulski" }]
+keywords = ["ai", "agent", "cli", "llm", "harness"]
+
+# Runtime dependencies mirror requirements.txt minus dev-only and
+# optional-heavy extras (voice/audio, playwright browser).
+dependencies = [
+    "google-genai",
+    "openai>=1.40.0",
+    "prompt-toolkit",
+    "rich",
+    "Pillow",
+    "pypdf",
+    "ddgs",
+    "beautifulsoup4",
+    "httpx",
+    "tiktoken",
+    "fastapi",
+    "uvicorn[standard]",
+    "jinja2",
+    "python-multipart",
+    "sse-starlette",
+]
+
+[project.optional-dependencies]
+# Browser automation surfaces (visualization screenshots, security mode).
+browser = ["playwright"]
+# Voice / audio capabilities.
+voice = [
+    "kokoro>=0.9.2",
+    "faster-whisper>=1.0.0",
+    "soundfile",
+]
+dev = [
+    "pytest",
+    "black",
+]
+
+[project.scripts]
+mucli = "mucli:main"
+
+[tool.setuptools]
+py-modules = ["mucli"]
+
+[tool.setuptools.packages.find]
+include = ["mu*", "providers*", "utils*"]
+exclude = ["tests*", "mobile*", "documentation*", ".mucli-loop*"]
+
+# GUI templates, vendor JS/CSS, and static pages must ship in the wheel.
+[tool.setuptools.package-data]
+"mu.gui" = ["templates/**/*.html", "static/**/*"]
+"mu.gui.static" = ["**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

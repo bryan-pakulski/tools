@@ -227,6 +227,11 @@ def is_repeated_tool_sequence(
     probably stuck."""
     if len(sequence_history) < repeat_threshold:
         return False
+    # Round-50 F8-hotfix: callers now pass bounded deques (r46 F8) —
+    # deque supports indexing but NOT slicing, so materialize once (the
+    # history is capped, this is cheap). Same fix is_periodic_sequence
+    # already got.
+    sequence_history = list(sequence_history)
     tail = sequence_history[-repeat_threshold:]
     if not all(tail):
         return False
@@ -258,6 +263,9 @@ def is_periodic_sequence(
     n = len(sequence_history)
     if n < 2 * 2:  # need at least period-2 × min_repeats=2 = 4 entries
         return False
+    # Round-46 F8: callers now pass bounded deques — slicing is not supported
+    # on deque, so materialize once (the history is capped, this is cheap).
+    sequence_history = list(sequence_history)
     for period in range(2, max_period + 1):
         if n < period * min_repeats:
             continue

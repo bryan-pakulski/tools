@@ -13,6 +13,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Sequence
 
+from .ledger_queries import LedgerRecallMixin
+from .ledger_schema import ensure_schema as _schema_ddl, row_to_item as _map_row
 from .models import (
     EGRESS_POLICIES,
     LIFECYCLES,
@@ -69,7 +71,7 @@ def _merge_json_rows(left: Iterable[Any], right: Iterable[Any]) -> List[Any]:
     return result
 
 
-class SQLiteMemoryLedger:
+class SQLiteMemoryLedger(LedgerRecallMixin):
     """Transactional durable-memory repository.
 
     Connections are intentionally short-lived.  WAL mode and a busy timeout
@@ -82,6 +84,10 @@ class SQLiteMemoryLedger:
         self._schema_lock = threading.RLock()
         self._schema_ready = False
         self._fts_enabled = True
+        # Round-49 F3: thread-local connection reuse + one-time WAL setup.
+        self._local = threading.local()
+        self._wal_ready = False
+        self._wal_lock = threading.Lock()
 
     def _prepare_path(self) -> None:
         parent = Path(self.path).parent
@@ -92,11 +98,35 @@ class SQLiteMemoryLedger:
             pass
 
     def _connect(self) -> sqlite3.Connection:
+        # Round-49 F3: connections are thread-local and REUSED — the old
+        # shape opened a fresh connection (and re-ran PRAGMA
+        # journal_mode=WAL, which needs locking) for every operation, so a
+        # single recall opened ≥2 connections and every nominal read
+        # contended during setup. WAL + synchronous are persistent DB
+        # properties — set them ONCE at first open; connection-local
+        # pragmas (foreign_keys, busy_timeout) are re-applied per
+        # connection. The per-op chmod cost moves to first-open only.
+        connection = self._local.__dict__.get("conn")
+        if connection is not None:
+            try:
+                connection.execute("SELECT 1")
+                return connection
+            except sqlite3.Error:
+                # Stale/closed — rebuild below.
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+                self._local.__dict__.pop("conn", None)
         self._prepare_path()
         connection = sqlite3.connect(self.path, timeout=5.0)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=NORMAL")
+        if not self._wal_ready:
+            with self._wal_lock:
+                if not self._wal_ready:
+                    connection.execute("PRAGMA journal_mode=WAL")
+                    connection.execute("PRAGMA synchronous=NORMAL")
+                    self._wal_ready = True
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         if not self._schema_ready:
@@ -105,98 +135,23 @@ class SQLiteMemoryLedger:
             os.chmod(self.path, 0o600)
         except OSError:
             pass
+        self._local.conn = connection
         return connection
+
+    def _close_thread_connection(self) -> None:
+        connection = self._local.__dict__.pop("conn", None)
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
 
     def _ensure_schema(self, connection: sqlite3.Connection) -> None:
         with self._schema_lock:
             if self._schema_ready:
                 return
-            connection.executescript("""
-                CREATE TABLE IF NOT EXISTS memory_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS memories (
-                    id TEXT PRIMARY KEY,
-                    version INTEGER NOT NULL,
-                    statement TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    scope_type TEXT NOT NULL,
-                    scope_key TEXT NOT NULL,
-                    scope_label TEXT NOT NULL DEFAULT '',
-                    lifecycle TEXT NOT NULL DEFAULT 'active',
-                    pinned INTEGER NOT NULL DEFAULT 0,
-                    trust_origin TEXT NOT NULL DEFAULT 'model',
-                    verification TEXT NOT NULL DEFAULT 'unverified',
-                    confidence REAL NOT NULL DEFAULT 0.7,
-                    sensitivity TEXT NOT NULL DEFAULT 'normal',
-                    egress_policy TEXT NOT NULL DEFAULT 'any',
-                    tags_json TEXT NOT NULL DEFAULT '[]',
-                    source_refs_json TEXT NOT NULL DEFAULT '[]',
-                    relations_json TEXT NOT NULL DEFAULT '[]',
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    last_recalled_at REAL,
-                    recall_count INTEGER NOT NULL DEFAULT 0,
-                    content_hash TEXT NOT NULL,
-                    etag TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL DEFAULT '{}'
-                );
-                CREATE INDEX IF NOT EXISTS idx_memories_scope
-                    ON memories(scope_type, scope_key, lifecycle, updated_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_memories_hash
-                    ON memories(scope_type, scope_key, content_hash);
-                CREATE INDEX IF NOT EXISTS idx_memories_kind
-                    ON memories(kind, lifecycle, updated_at DESC);
-
-                CREATE TABLE IF NOT EXISTS memory_revisions (
-                    memory_id TEXT NOT NULL,
-                    version INTEGER NOT NULL,
-                    statement TEXT NOT NULL,
-                    snapshot_json TEXT NOT NULL,
-                    actor TEXT NOT NULL,
-                    reason TEXT NOT NULL DEFAULT '',
-                    created_at REAL NOT NULL,
-                    PRIMARY KEY(memory_id, version),
-                    FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS memory_events (
-                    event_id TEXT PRIMARY KEY,
-                    memory_id TEXT,
-                    version INTEGER NOT NULL DEFAULT 0,
-                    event_type TEXT NOT NULL,
-                    actor TEXT NOT NULL,
-                    device_id TEXT NOT NULL DEFAULT 'local',
-                    before_hash TEXT NOT NULL DEFAULT '',
-                    after_json TEXT NOT NULL DEFAULT '{}',
-                    reason TEXT NOT NULL DEFAULT '',
-                    created_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_memory_events_item
-                    ON memory_events(memory_id, created_at DESC);
-
-                CREATE TABLE IF NOT EXISTS memory_recall_receipts (
-                    id TEXT PRIMARY KEY,
-                    session_name TEXT NOT NULL DEFAULT '',
-                    query_text TEXT NOT NULL,
-                    scopes_json TEXT NOT NULL,
-                    budget_tokens INTEGER NOT NULL,
-                    token_count INTEGER NOT NULL,
-                    included_json TEXT NOT NULL,
-                    excluded_json TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_memory_receipts_session
-                    ON memory_recall_receipts(session_name, created_at DESC);
-
-                CREATE TABLE IF NOT EXISTS memory_sync_tombstones (
-                    memory_id TEXT PRIMARY KEY,
-                    content_hash TEXT NOT NULL,
-                    forgotten_at REAL NOT NULL
-                );
-                """)
+            _schema_ddl(connection)
+            # FTS5 is an optional SQLite build feature — degrade gracefully.
             try:
                 connection.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts "
@@ -209,21 +164,37 @@ class SQLiteMemoryLedger:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(SCHEMA_VERSION),),
             )
+            # Commit the version row NOW: initialization can happen on a
+            # _read() connection (first op = a mixin query like stats()),
+            # and _read() closes without committing — which would roll the
+            # write back while _schema_ready already skips future passes.
             connection.commit()
             self._schema_ready = True
-
     @contextmanager
     def _read(self) -> Iterator[sqlite3.Connection]:
+        # Round-49 F3: thread-local connection is REUSED, not closed — the
+        # close would destroy the reuse. Rollback any residue so a leaked
+        # open transaction from a previous op can't span calls.
         connection = self._connect()
         try:
             yield connection
         finally:
-            connection.close()
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
+        # Round-49 F3: thread-local connection is REUSED, not closed.
         connection = self._connect()
         try:
+            # executescript() (inside _ensure_schema) implicitly COMMITs any
+            # open transaction, so the schema pass must finish BEFORE the
+            # BEGIN IMMEDIATE below — otherwise the explicit commit at the
+            # end of this block raises "cannot start a transaction within
+            # a transaction".
+            connection.commit()
             connection.execute("BEGIN IMMEDIATE")
             yield connection
             connection.commit()
@@ -231,43 +202,16 @@ class SQLiteMemoryLedger:
             connection.rollback()
             raise
         finally:
-            connection.close()
+            # Leave no open transaction on the reused connection; keep the
+            # connection itself for the next operation.
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
 
     @staticmethod
     def _row_to_item(row: sqlite3.Row | None) -> MemoryItem | None:
-        if row is None:
-            return None
-        return MemoryItem(
-            id=str(row["id"]),
-            version=int(row["version"]),
-            statement=str(row["statement"] or ""),
-            kind=str(row["kind"] or "observation"),
-            scope_type=str(row["scope_type"]),
-            scope_key=str(row["scope_key"]),
-            scope_label=str(row["scope_label"] or ""),
-            lifecycle=str(row["lifecycle"] or "active"),
-            pinned=bool(row["pinned"]),
-            trust_origin=str(row["trust_origin"] or "model"),
-            verification=str(row["verification"] or "unverified"),
-            confidence=float(row["confidence"] or 0.0),
-            sensitivity=str(row["sensitivity"] or "normal"),
-            egress_policy=str(row["egress_policy"] or "any"),
-            tags=list(_loads(row["tags_json"], [])),
-            source_refs=list(_loads(row["source_refs_json"], [])),
-            relations=list(_loads(row["relations_json"], [])),
-            created_at=float(row["created_at"]),
-            updated_at=float(row["updated_at"]),
-            last_recalled_at=(
-                float(row["last_recalled_at"])
-                if row["last_recalled_at"] is not None
-                else None
-            ),
-            recall_count=int(row["recall_count"] or 0),
-            content_hash=str(row["content_hash"] or ""),
-            etag=str(row["etag"] or ""),
-            metadata=dict(_loads(row["metadata_json"], {})),
-        )
-
+        return _map_row(row)
     def _sync_fts(self, connection: sqlite3.Connection, item: MemoryItem) -> None:
         if not self._fts_enabled:
             return
@@ -910,36 +854,53 @@ class SQLiteMemoryLedger:
             # shadow copy of content the user explicitly forgot. Retain the
             # candidate/score/hash receipt and remove the copied memory body
             # and its derived metadata from every historical receipt.
-            receipt_rows = connection.execute(
-                "SELECT id, included_json, excluded_json FROM memory_recall_receipts"
-            ).fetchall()
-            for receipt_row in receipt_rows:
-                changed = False
-                payloads: Dict[str, Any] = {}
-                for column in ("included_json", "excluded_json"):
-                    candidates = list(_loads(receipt_row[column], []))
-                    for candidate in candidates:
-                        memory = candidate.get("memory", {})
-                        if str(memory.get("id") or "") != memory_id:
-                            continue
-                        candidate["memory"] = {
-                            "id": memory_id,
-                            "version": version,
-                            "lifecycle": "forgotten",
-                            "content_hash": current.content_hash,
-                        }
-                        changed = True
-                    payloads[column] = candidates
-                if changed:
-                    connection.execute(
-                        "UPDATE memory_recall_receipts SET included_json=?, "
-                        "excluded_json=? WHERE id=?",
-                        (
-                            _json(payloads["included_json"]),
-                            _json(payloads["excluded_json"]),
-                            receipt_row["id"],
-                        ),
-                    )
+            # Round-49 F1 (compact receipts): receipts written since the r49
+            # change carry NO memory body (id/version only) — nothing to
+            # redact. Legacy full-payload receipts are still scrubbed, but
+            # BOUNDED (round-49 F4): the old shape loaded every receipt
+            # fetchall() and rewrote matching ones inside the single
+            # forget transaction — unbounded memory + writer-lock hold as
+            # receipts accumulate. Redaction now scans in bounded batches.
+            _RECEIPT_BATCH = 500
+            max_receipt_id = ""
+            while True:
+                receipt_rows = connection.execute(
+                    "SELECT id, included_json, excluded_json FROM memory_recall_receipts "
+                    "WHERE id > ? ORDER BY id LIMIT ?",
+                    (max_receipt_id, _RECEIPT_BATCH),
+                ).fetchall()
+                if not receipt_rows:
+                    break
+                for receipt_row in receipt_rows:
+                    max_receipt_id = receipt_row["id"]
+                    changed = False
+                    payloads: Dict[str, Any] = {}
+                    for column in ("included_json", "excluded_json"):
+                        candidates = list(_loads(receipt_row[column], []))
+                        for candidate in candidates:
+                            memory = candidate.get("memory", {})
+                            if str(memory.get("id") or "") != memory_id:
+                                continue
+                            candidate["memory"] = {
+                                "id": memory_id,
+                                "version": version,
+                                "lifecycle": "forgotten",
+                                "content_hash": current.content_hash,
+                            }
+                            changed = True
+                        payloads[column] = candidates
+                    if changed:
+                        connection.execute(
+                            "UPDATE memory_recall_receipts SET included_json=?, "
+                            "excluded_json=? WHERE id=?",
+                            (
+                                _json(payloads["included_json"]),
+                                _json(payloads["excluded_json"]),
+                                receipt_row["id"],
+                            ),
+                        )
+                if len(receipt_rows) < _RECEIPT_BATCH:
+                    break
             connection.execute(
                 """UPDATE memories SET version=?, statement='', kind='observation',
                 lifecycle='forgotten', pinned=0, tags_json='[]', source_refs_json='[]',
@@ -968,217 +929,6 @@ class SQLiteMemoryLedger:
             item = self._row_to_item(forgotten)
             assert item is not None
             return item
-
-    def record_recall(self, receipt: RecallReceipt, *, actor: str = "system") -> None:
-        included_payload = [candidate.to_dict() for candidate in receipt.included]
-        excluded_payload = [candidate.to_dict() for candidate in receipt.excluded]
-        with self._write() as connection:
-            connection.execute(
-                "INSERT INTO memory_recall_receipts(id, session_name, query_text, scopes_json, "
-                "budget_tokens, token_count, included_json, excluded_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    receipt.id,
-                    receipt.session_name,
-                    receipt.query,
-                    _json(receipt.scopes),
-                    receipt.budget_tokens,
-                    receipt.token_count,
-                    _json(included_payload),
-                    _json(excluded_payload),
-                    receipt.created_at,
-                ),
-            )
-            for candidate in receipt.included:
-                connection.execute(
-                    "UPDATE memories SET recall_count=recall_count+1, last_recalled_at=? WHERE id=?",
-                    (receipt.created_at, candidate.item.id),
-                )
-                self._event(
-                    connection,
-                    memory_id=candidate.item.id,
-                    version=candidate.item.version,
-                    event_type="recalled",
-                    actor=actor,
-                    after={
-                        "receipt_id": receipt.id,
-                        "session_name": receipt.session_name,
-                        "score": round(candidate.score, 4),
-                        "token_cost": candidate.token_cost,
-                    },
-                )
-
-    def get_recall(
-        self, receipt_id: str = "", *, session_name: str = ""
-    ) -> Dict[str, Any] | None:
-        with self._read() as connection:
-            if receipt_id:
-                where_session = " AND session_name=?" if session_name else ""
-                params: List[Any] = [receipt_id]
-                if session_name:
-                    params.append(session_name)
-                row = connection.execute(
-                    "SELECT * FROM memory_recall_receipts WHERE id=?" + where_session,
-                    params,
-                ).fetchone()
-                # TUI receipts deliberately display compact IDs. Accept a
-                # unique prefix there while retaining canonical IDs in data.
-                if row is None and len(str(receipt_id)) >= 6:
-                    prefix_params: List[Any] = [f"{receipt_id}%"]
-                    if session_name:
-                        prefix_params.append(session_name)
-                    matches = connection.execute(
-                        "SELECT * FROM memory_recall_receipts WHERE id LIKE ?"
-                        + where_session
-                        + " ORDER BY created_at DESC LIMIT 2",
-                        prefix_params,
-                    ).fetchall()
-                    row = matches[0] if len(matches) == 1 else None
-            elif session_name:
-                row = connection.execute(
-                    "SELECT * FROM memory_recall_receipts WHERE session_name=? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (session_name,),
-                ).fetchone()
-            else:
-                row = connection.execute(
-                    "SELECT * FROM memory_recall_receipts ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()
-            if row is None:
-                return None
-            return {
-                "id": row["id"],
-                "session_name": row["session_name"],
-                "query": row["query_text"],
-                "scopes": _loads(row["scopes_json"], []),
-                "budget_tokens": row["budget_tokens"],
-                "token_count": row["token_count"],
-                "included": _loads(row["included_json"], []),
-                "excluded": _loads(row["excluded_json"], []),
-                "created_at": row["created_at"],
-            }
-
-    def events(
-        self,
-        *,
-        memory_id: str = "",
-        scopes: Sequence[tuple[str, str]] | None = None,
-        limit: int = 100,
-    ) -> List[Dict[str, Any]]:
-        sql = "SELECT e.* FROM memory_events e"
-        params: List[Any] = []
-        clauses: List[str] = []
-        if scopes:
-            sql += " JOIN memories m ON m.id=e.memory_id"
-            clauses.append(
-                "("
-                + " OR ".join("(m.scope_type=? AND m.scope_key=?)" for _ in scopes)
-                + ")"
-            )
-            for scope_type, scope_key in scopes:
-                params.extend([scope_type, scope_key])
-        if memory_id:
-            clauses.append("e.memory_id=?")
-            params.append(memory_id)
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY e.created_at DESC LIMIT ?"
-        params.append(max(1, min(int(limit), 1000)))
-        with self._read() as connection:
-            return [
-                {
-                    "event_id": row["event_id"],
-                    "memory_id": row["memory_id"],
-                    "version": row["version"],
-                    "type": row["event_type"],
-                    "actor": row["actor"],
-                    "device_id": row["device_id"],
-                    "before_hash": row["before_hash"],
-                    "after": _loads(row["after_json"], {}),
-                    "reason": row["reason"],
-                    "created_at": row["created_at"],
-                }
-                for row in connection.execute(sql, params).fetchall()
-            ]
-
-    def revisions(self, memory_id: str, *, limit: int = 100) -> List[Dict[str, Any]]:
-        with self._read() as connection:
-            rows = connection.execute(
-                "SELECT memory_id, version, statement, snapshot_json, actor, reason, created_at "
-                "FROM memory_revisions WHERE memory_id=? ORDER BY version DESC LIMIT ?",
-                (memory_id, max(1, min(int(limit), 1000))),
-            ).fetchall()
-            return [
-                {
-                    "memory_id": row["memory_id"],
-                    "version": row["version"],
-                    "statement": row["statement"],
-                    "snapshot": _loads(row["snapshot_json"], {}),
-                    "actor": row["actor"],
-                    "reason": row["reason"],
-                    "created_at": row["created_at"],
-                }
-                for row in rows
-            ]
-
-    def graph(self, memory_id: str) -> Dict[str, Any]:
-        item = self.get(memory_id)
-        if item is None:
-            raise KeyError(memory_id)
-        target_ids = {
-            str(relation.get("target_id") or "")
-            for relation in item.relations
-            if isinstance(relation, dict) and relation.get("target_id")
-        }
-        nodes = [item.to_dict()]
-        for target_id in sorted(target_ids):
-            target = self.get(target_id)
-            if target is not None:
-                nodes.append(target.to_dict())
-        edges = [
-            {
-                "source": item.id,
-                "target": relation.get("target_id"),
-                "type": relation.get("type", "related_to"),
-            }
-            for relation in item.relations
-            if isinstance(relation, dict) and relation.get("target_id")
-        ]
-        return {"center": item.id, "nodes": nodes, "edges": edges}
-
-    def stats(
-        self, *, scopes: Sequence[tuple[str, str]] | None = None
-    ) -> Dict[str, Any]:
-        clauses = ["lifecycle!='forgotten'"]
-        params: List[Any] = []
-        if scopes:
-            clauses.append(
-                "("
-                + " OR ".join("(scope_type=? AND scope_key=?)" for _ in scopes)
-                + ")"
-            )
-            for scope_type, scope_key in scopes:
-                params.extend([scope_type, scope_key])
-        where = " AND ".join(clauses)
-        with self._read() as connection:
-            total = connection.execute(
-                f"SELECT COUNT(*) FROM memories WHERE {where}", params
-            ).fetchone()[0]
-            rows = connection.execute(
-                f"SELECT lifecycle, COUNT(*) AS n FROM memories WHERE {where} GROUP BY lifecycle",
-                params,
-            ).fetchall()
-            pinned = connection.execute(
-                f"SELECT COUNT(*) FROM memories WHERE {where} AND pinned=1", params
-            ).fetchone()[0]
-        return {
-            "total": int(total),
-            "pinned": int(pinned),
-            "by_lifecycle": {str(row["lifecycle"]): int(row["n"]) for row in rows},
-            "database": self.path,
-            "schema_version": SCHEMA_VERSION,
-            "fts_enabled": self._fts_enabled,
-        }
 
 
 __all__ = ["MemoryConflictError", "SCHEMA_VERSION", "SQLiteMemoryLedger"]

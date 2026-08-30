@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,10 +32,21 @@ class WorkerHandle:
     process: subprocess.Popen
     log_path: str
     log_handle: Optional[IO[bytes]] = None
+    # Round-35 F6: monotonic timestamp of the first SIGTERM sent for
+    # cancellation — None until termination starts. Drives SIGKILL
+    # escalation after the grace window (SIGTERM-ignoring workers must not
+    # hold a controller slot forever).
+    terminate_started: Optional[float] = None
 
 
 class JobController:
     """Lease jobs and launch isolated implementation/verification processes."""
+
+    # Round-35 F6: seconds between SIGTERM and SIGKILL-escalation for a
+    # cancelled worker that has not exited.
+    _TERMINATION_GRACE_S = 10.0
+    # Round-41 F7a: per-phase worker log size cap before rotation.
+    _LOG_MAX_BYTES = 32 * 1024 * 1024
 
     def __init__(
         self,
@@ -76,7 +89,13 @@ class JobController:
         self._thread.start()
 
     def stop(self, *, wait: bool = False) -> None:
-        """Stop scheduling without killing active child workers."""
+        """Stop scheduling without killing active child workers.
+
+        Round-49 F12: wait=True previously joined the controller thread
+        with timeout=None AND waited on every child process with NO
+        timeout — a wedged worker made shutdown hang forever. Bounded:
+        10s grace for children, then SIGTERM → 5s → SIGKILL.
+        """
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=None if wait else 2.0)
@@ -85,9 +104,17 @@ class JobController:
                 handles = list(self._active.values())
             for handle in handles:
                 try:
-                    handle.process.wait()
+                    handle.process.wait(timeout=10.0)
                 except Exception:
-                    pass
+                    # Wedged or already gone — escalate TERM → KILL.
+                    try:
+                        handle.process.terminate()
+                        handle.process.wait(timeout=5.0)
+                    except Exception:
+                        try:
+                            handle.process.kill()
+                        except Exception:
+                            pass
             self._reap()
 
     @property
@@ -131,6 +158,7 @@ class JobController:
         """One deterministic scheduler pass; returns processes started."""
         self._reap()
         self._terminate_cancelled()
+        self._enforce_runtime_deadlines()
         self.service.recover_expired_leases()
         with self._lock:
             capacity = self.max_workers - len(self._active)
@@ -167,6 +195,18 @@ class JobController:
 
         module = "mu.jobs.verify_worker" if phase == "verification" else "mu.jobs.worker"
         log_path = os.path.join(self.log_root, f"{job_id}.{phase}.log")
+        # Round-41 F7a: bound the log before re-opening it in append mode —
+        # retries append forever to the same phase log, and a noisy worker
+        # could grow it without bound. Rotate (rename) once past the cap;
+        # keep the previous log as .1 for diagnosis, drop any older one.
+        try:
+            if os.path.exists(log_path) and os.path.getsize(log_path) > self._LOG_MAX_BYTES:
+                older = f"{log_path}.1"
+                if os.path.exists(older):
+                    os.unlink(older)
+                os.replace(log_path, older)
+        except OSError:
+            pass  # rotation is best-effort; keep spawning either way
         log_handle: Optional[IO[bytes]] = None
         try:
             log_handle = open(log_path, "ab", buffering=0)
@@ -262,7 +302,14 @@ class JobController:
             except Exception:
                 pass
 
-    def _terminate_cancelled(self) -> None:
+    def _enforce_runtime_deadlines(self) -> None:
+        """Round-36 F4 (round-38 F3/F4): enforce Job.max_runtime_seconds.
+        The deadline covers the WHOLE job (all attempts, implementation +
+        verification phases), measured from started_at. A job past its
+        deadline is transitioned to TIMED_OUT ONCE and handed to the same
+        SIGTERM→grace→SIGKILL group escalation cancellations use
+        (_terminate_cancelled handles both CANCELLED and TIMED_OUT)."""
+        now = time.time()
         with self._lock:
             handles = list(self._active.values())
         for handle in handles:
@@ -270,14 +317,53 @@ class JobController:
                 job = self.service.get(handle.job_id)
             except KeyError:
                 continue
-            if job.status != JobStatus.CANCELLED or handle.process.poll() is not None:
+            limit = job.max_runtime_seconds
+            if not limit or job.started_at is None:
                 continue
+            if now - float(job.started_at) < float(limit):
+                continue
+            if job.status in {JobStatus.CANCELLED, JobStatus.MERGED}:
+                continue
+            if job.status == JobStatus.TIMED_OUT or handle.terminate_started is not None:
+                # Already timed out and escalating — no repeat transition
+                # (TIMED_OUT→TIMED_OUT would be a no-op write) and no
+                # second SIGTERM; escalation continues in
+                # _terminate_cancelled.
+                continue
+            self.service.store.append_event(
+                handle.job_id,
+                "worker_runtime_deadline_exceeded",
+                reason=f"exceeded max_runtime_seconds={limit}",
+                payload={
+                    "pid": getattr(handle.process, "pid", None),
+                    "phase": handle.phase,
+                    "runtime_seconds": round(now - float(job.started_at), 1),
+                },
+            )
+            try:
+                self.service.transition(
+                    handle.job_id,
+                    JobStatus.TIMED_OUT,
+                    reason=f"max_runtime_seconds={limit} exceeded",
+                )
+            except Exception as exc:
+                self.service.store.append_event(
+                    handle.job_id,
+                    "worker_timeout_transition_failed",
+                    reason=str(exc),
+                    payload={"pid": getattr(handle.process, "pid", None)},
+                )
+                continue
+            # Kick off the shared escalation: mark the start time, send the
+            # first SIGTERM. _terminate_cancelled performs the SIGKILL
+            # escalation after the grace window.
+            handle.terminate_started = time.monotonic()
             try:
                 handle.process.terminate()
                 self.service.store.append_event(
                     handle.job_id,
                     "worker_process_terminated",
-                    reason="job cancelled",
+                    reason="runtime deadline exceeded",
                     payload={
                         "pid": getattr(handle.process, "pid", None),
                         "phase": handle.phase,
@@ -288,6 +374,66 @@ class JobController:
                     handle.job_id,
                     "worker_termination_failed",
                     reason=str(exc),
+                    payload={"pid": getattr(handle.process, "pid", None)},
+                )
+
+    def _terminate_cancelled(self) -> None:
+        """Round-35 F6 (round-38 F4): SIGTERM first, SIGKILL the process
+        GROUP after the grace window. Workers started with
+        start_new_session() lead their own process group, so kill()
+        targets the group (descendants die too). Handles both CANCELLED
+        and TIMED_OUT jobs (runtime-deadline enforcement marks the job
+        TIMED_OUT and starts the same escalation). A worker that ignores
+        SIGTERM no longer holds its controller slot forever."""
+        with self._lock:
+            handles = list(self._active.values())
+        for handle in handles:
+            try:
+                job = self.service.get(handle.job_id)
+            except KeyError:
+                continue
+            if job.status not in {JobStatus.CANCELLED, JobStatus.TIMED_OUT}:
+                continue
+            if handle.process.poll() is not None:
+                continue
+            if handle.terminate_started is None:
+                try:
+                    handle.process.terminate()
+                    handle.terminate_started = time.monotonic()
+                    self.service.store.append_event(
+                        handle.job_id,
+                        "worker_process_terminated",
+                        reason="job cancelled",
+                        payload={
+                            "pid": getattr(handle.process, "pid", None),
+                            "phase": handle.phase,
+                        },
+                    )
+                except Exception as exc:
+                    self.service.store.append_event(
+                        handle.job_id,
+                        "worker_termination_failed",
+                        reason=str(exc),
+                        payload={
+                            "pid": getattr(handle.process, "pid", None),
+                            "phase": handle.phase,
+                        },
+                    )
+                continue
+            if time.monotonic() - handle.terminate_started >= self._TERMINATION_GRACE_S:
+                try:
+                    # process group kill: start_new_session made the worker
+                    # its group leader, so pid == pgid.
+                    os.killpg(os.getpgid(handle.process.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        handle.process.kill()
+                    except OSError:
+                        pass  # already dead; _reap will collect it
+                self.service.store.append_event(
+                    handle.job_id,
+                    "worker_process_killed",
+                    reason=f"SIGKILL after {self._TERMINATION_GRACE_S}s grace",
                     payload={
                         "pid": getattr(handle.process, "pid", None),
                         "phase": handle.phase,

@@ -162,7 +162,7 @@ def _new(session: Any, rest: str) -> CommandResult:
     record = _sync_record(session, course)
     session.session_manager.active_course_id = course.course_id
     session.session_manager.teacher_state = dict(record)
-    session.session_manager.save_history(fc)
+    session.session_manager.save_history_turn(fc)
     msg = (
         f"Created course `{course.course_id}` for subject {course.subject!r}.\n"
         f"Directory: {course.directory}\n"
@@ -186,7 +186,7 @@ def _load(session: Any, rest: str) -> CommandResult:
     record = _sync_record(session, course)
     session.session_manager.active_course_id = course.course_id
     session.session_manager.teacher_state = dict(record)
-    session.session_manager.save_history(fc)
+    session.session_manager.save_history_turn(fc)
     _queue_course_resumption_briefing(session, course)
     return CommandResult(
         ok=True,

@@ -70,12 +70,15 @@ def bucket_for(job: Job) -> str:
 def build_job_board(service: JobService, *, limit: int = 1000) -> JobBoard:
     # Archive is a management concern rather than a runtime state. Keep the
     # operational board quiet while retaining archived jobs in durable history.
-    from .management import JobManagementService
-
-    archived = JobManagementService(service).archived_ids()
+    # Round-49 F9/F10: the board previously loaded ALL archived ids (a set
+    # that grows forever) then materialized up to 1000 jobs and filtered in
+    # Python — O(archived + 1000) work per GUI poll, and the silent 1000-job
+    # cap could hide older ACTIVE jobs while section counts described only
+    # the truncated window. The cap now applies per section (each section
+    # keeps its newest `limit` entries — active work never disappears), and
+    # archived filtering runs in the service query (NOT EXISTS) instead of
+    # materializing the archived-id set in Python.
     sections = {name: [] for name in BOARD_ORDER}
-    for job in service.list(limit=limit):
-        if job.id in archived:
-            continue
+    for job in service.list_unarchived(limit=limit):
         sections[bucket_for(job)].append(job)
     return JobBoard(**sections)

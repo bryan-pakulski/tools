@@ -264,13 +264,13 @@ def test_compaction_budget_shrinks_when_non_l5_layers_grow(session):
     )
 
 
-def test_compaction_budget_has_floor(session):
-    """Even with absurdly large non-L5 layers, the compactor must
-    return at least its 512-token floor so callers don't divide by
-    zero or get into pathological trim loops."""
+def test_compaction_budget_zero_when_no_capacity(session):
+    """When non-L5 layers alone exceed the window, there is no real
+    history capacity — the budget must be 0 (not a fabricated floor);
+    compaction cannot help and must not loop (codex round-7 F6)."""
     session.variables["context_token_limit"] = 10_000
     session._build_skills_block = lambda: "x" * 1_000_000
-    assert session._compaction_token_budget() >= 512
+    assert session._compaction_token_budget() == 0
 
 
 # ----------------------------------------------- /set / schema coverage

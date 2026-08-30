@@ -137,43 +137,68 @@ def _resolve_host(explicit: Optional[str] = None, mode: str = "auto") -> str:
     return host.rstrip("/")
 
 
+_THINK_OPEN = "<" + "t" + "h" + "i" + "n" + "k" + ">"
+_THINK_CLOSE = "<" + "/" + "t" + "h" + "i" + "n" + "k" + ">"
+
+
 def _split_think_blocks(text: str, *, in_think: bool) -> tuple:
-    """Split a streamed content chunk on `<think>…</think>` boundaries.
+    """Split a streamed content chunk on think-block boundaries.
 
     Returns `(content_chunks, think_chunks, new_in_think)`. The boundary
-    tracking is stateful — callers must thread `in_think` from the
-    previous chunk so a `<think>` opening in chunk N and the matching
-    `</think>` in chunk N+5 are handled correctly.
-
-    Example for `before<think>plan</think>after`:
-      content_chunks = ["before", "after"]
-      think_chunks   = ["plan"]
-      new_in_think   = False
+    tracking is stateful - callers must thread `in_think` from the
+    previous chunk so an opening delimiter in chunk N and the matching
+    closing delimiter in chunk N+5 are handled correctly.
     """
     content_chunks: List[str] = []
     think_chunks: List[str] = []
     remaining = text
     while remaining:
         if in_think:
-            close_idx = remaining.find("</think>")
+            close_idx = remaining.find(_THINK_CLOSE)
             if close_idx < 0:
-                think_chunks.append(remaining)
-                remaining = ""
+                # Hold back a possible partial closing delimiter split
+                # across the chunk boundary instead of emitting it as
+                # thinking text.
+                hold = _partial_suffix_len(remaining, _THINK_CLOSE)
+                if hold:
+                    think_chunks.append(remaining[:-hold])
+                    remaining = ""
+                else:
+                    think_chunks.append(remaining)
+                    remaining = ""
             else:
                 think_chunks.append(remaining[:close_idx])
-                remaining = remaining[close_idx + len("</think>") :]
+                remaining = remaining[close_idx + len(_THINK_CLOSE) :]
                 in_think = False
         else:
-            open_idx = remaining.find("<think>")
+            open_idx = remaining.find(_THINK_OPEN)
             if open_idx < 0:
-                content_chunks.append(remaining)
+                # Hold back a possible partial opening delimiter split
+                # across the chunk boundary instead of leaking it as
+                # visible text.
+                hold = _partial_suffix_len(remaining, _THINK_OPEN)
+                if hold:
+                    content_chunks.append(remaining[:-hold])
+                else:
+                    content_chunks.append(remaining)
                 remaining = ""
             else:
                 if open_idx > 0:
                     content_chunks.append(remaining[:open_idx])
-                remaining = remaining[open_idx + len("<think>") :]
+                remaining = remaining[open_idx + len(_THINK_OPEN) :]
                 in_think = True
     return content_chunks, think_chunks, in_think
+
+
+def _partial_suffix_len(text: str, delimiter: str) -> int:
+    """Length of the longest proper suffix of `text` that is a proper
+    prefix of `delimiter`. Used to hold back delimiters split across
+    stream chunk boundaries."""
+    max_len = min(len(text), len(delimiter) - 1)
+    for n in range(max_len, 0, -1):
+        if text[-n:] == delimiter[:n]:
+            return n
+    return 0
 
 
 def _classify_url_error(host: str, exc: BaseException) -> OllamaError:
@@ -232,6 +257,8 @@ def _classify_api_error_body(host: str, model: str, body: str) -> OllamaError:
             ),
         )
     return OllamaError(f"Ollama API error: {body[:300]}", actionable=body[:500])
+
+
 
 
 class OllamaProvider(LLMProvider):
@@ -552,10 +579,9 @@ class OllamaProvider(LLMProvider):
                     opts[key] = val
         if thinking and "temperature" not in opts:
             opts["temperature"] = 0.7
-        if reasoning_effort:
-            # Ollama doesn't have a native reasoning_effort knob; surface
-            # it as `num_predict` cap when "low" / "medium".
-            opts.setdefault("reasoning_effort", reasoning_effort)
+        # `reasoning_effort` is intentionally NOT forwarded: Ollama's native
+        # `options` object has no such knob, and unknown options can be
+        # rejected or silently ignored depending on the server version.
         return opts
 
     # --------------------------------------------------------------- streaming
@@ -629,65 +655,129 @@ class OllamaProvider(LLMProvider):
         emitted_tool_index = 0
         last_in = 0
         last_out = 0
+        saw_done = False  # only a chunk with done:true ends a valid stream
+        think_carry = ""  # partial delimiter held back across chunks
         in_think = False  # state for cross-chunk <think>…</think> tracking
 
         try:
             with urllib.request.urlopen(req, timeout=self.request_timeout) as response:
+                line_buffer = ""  # partial NDJSON record across reads
                 for raw in response:
                     if not raw:
                         continue
-                    try:
-                        chunk = json.loads(raw.decode("utf-8"))
-                    except json.JSONDecodeError:
-                        continue
+                    # NDJSON records are newline-framed; the response reader
+                    # may still surface a partial record split mid-line. Buffer
+                    # by newline and parse only complete records.
+                    line_buffer += raw.decode("utf-8", errors="replace")
+                    while "\n" in line_buffer:
+                        record, line_buffer = line_buffer.split("\n", 1)
+                        if not record.strip():
+                            continue
+                        try:
+                            chunk = json.loads(record)
+                        except json.JSONDecodeError as exc:
+                            # A complete but malformed record is a stream
+                            # error, not something to silently skip.
+                            err = _classify_api_error_body(
+                                self.host,
+                                self.model_name,
+                                f"malformed NDJSON record in stream: {exc}",
+                            )
+                            yield StreamEvent(kind="error", text=err.actionable)
+                            raise err
 
-                    # Ollama returns errors mid-stream as { "error": "..." }.
+                        # Ollama returns errors mid-stream as { "error": "..." }.
+                        if "error" in chunk and not chunk.get("message"):
+                            err = _classify_api_error_body(
+                                self.host, self.model_name, str(chunk.get("error", ""))
+                            )
+                            yield StreamEvent(kind="error", text=err.actionable)
+                            raise err
+
+                        msg = chunk.get("message") or {}
+                        content = msg.get("content") or ""
+                        if content:
+                            # Prepend any partial-delimiter carry held back
+                            # from the previous chunk so delimiters split
+                            # across chunk boundaries reassemble.
+                            content = think_carry + content
+                            think_carry = ""
+                            raw_tail = content
+                            content_parts, think_parts, in_think = _split_think_blocks(
+                                content, in_think=in_think
+                            )
+                            hold = max(
+                                _partial_suffix_len(raw_tail, _THINK_OPEN),
+                                _partial_suffix_len(raw_tail, _THINK_CLOSE),
+                            )
+                            if hold:
+                                think_carry = raw_tail[-hold:]
+                            for piece in content_parts:
+                                if piece:
+                                    yield StreamEvent(kind="text_delta", text=piece)
+                            for piece in think_parts:
+                                if piece:
+                                    yield StreamEvent(kind="thinking_delta", text=piece)
+
+                        # Models may also use a structured `thinking` field —
+                        # surface it identically.
+                        thought = msg.get("thinking") or msg.get("reasoning")
+                        if thought:
+                            yield StreamEvent(kind="thinking_delta", text=str(thought))
+
+                        for tc in msg.get("tool_calls", []) or []:
+                            fn = tc.get("function") or {}
+                            cid = f"ollama_call_{emitted_tool_index}"
+                            emitted_tool_index += 1
+                            yield StreamEvent(
+                                kind="tool_call_start",
+                                tool_name=fn.get("name"),
+                                tool_call_id=cid,
+                            )
+                            yield StreamEvent(
+                                kind="tool_call_complete",
+                                tool_name=fn.get("name"),
+                                tool_args=fn.get("arguments") or {},
+                                tool_call_id=cid,
+                            )
+
+                        last_in = chunk.get("prompt_eval_count", last_in) or last_in
+                        last_out = chunk.get("eval_count", last_out) or last_out
+                        if chunk.get("done"):
+                            saw_done = True
+                            break
+                    if saw_done:
+                        # done:true terminates the stream - do not keep
+                        # reading the outer response loop.
+                        break
+                # EOF: a final record without a trailing newline is still
+                # a valid NDJSON record - parse it before the saw_done check.
+                residue = line_buffer.strip()
+                if residue and not saw_done:
+                    try:
+                        chunk = json.loads(residue)
+                    except json.JSONDecodeError as exc:
+                        err = _classify_api_error_body(
+                            self.host,
+                            self.model_name,
+                            f"malformed NDJSON record in stream: {exc}",
+                        )
+                        yield StreamEvent(kind="error", text=err.actionable)
+                        raise err
                     if "error" in chunk and not chunk.get("message"):
                         err = _classify_api_error_body(
                             self.host, self.model_name, str(chunk.get("error", ""))
                         )
                         yield StreamEvent(kind="error", text=err.actionable)
                         raise err
-
-                    msg = chunk.get("message") or {}
-                    content = msg.get("content") or ""
-                    if content:
-                        content_parts, think_parts, in_think = _split_think_blocks(
-                            content, in_think=in_think
-                        )
-                        for piece in content_parts:
-                            if piece:
-                                yield StreamEvent(kind="text_delta", text=piece)
-                        for piece in think_parts:
-                            if piece:
-                                yield StreamEvent(kind="thinking_delta", text=piece)
-
-                    # Models may also use a structured `thinking` field —
-                    # surface it identically.
-                    thought = msg.get("thinking") or msg.get("reasoning")
-                    if thought:
-                        yield StreamEvent(kind="thinking_delta", text=str(thought))
-
-                    for tc in msg.get("tool_calls", []) or []:
-                        fn = tc.get("function") or {}
-                        cid = f"ollama_call_{emitted_tool_index}"
-                        emitted_tool_index += 1
-                        yield StreamEvent(
-                            kind="tool_call_start",
-                            tool_name=fn.get("name"),
-                            tool_call_id=cid,
-                        )
-                        yield StreamEvent(
-                            kind="tool_call_complete",
-                            tool_name=fn.get("name"),
-                            tool_args=fn.get("arguments") or {},
-                            tool_call_id=cid,
-                        )
-
-                    last_in = chunk.get("prompt_eval_count", last_in) or last_in
-                    last_out = chunk.get("eval_count", last_out) or last_out
                     if chunk.get("done"):
-                        break
+                        saw_done = True
+                if think_carry:
+                    if in_think:
+                        yield StreamEvent(kind="thinking_delta", text=think_carry)
+                    else:
+                        yield StreamEvent(kind="text_delta", text=think_carry)
+                    think_carry = ""
         except urllib.error.HTTPError as exc:
             body = ""
             try:
@@ -699,6 +789,15 @@ class OllamaProvider(LLMProvider):
             raise err
         except urllib.error.URLError as exc:
             err = _classify_url_error(self.host, exc)
+            yield StreamEvent(kind="error", text=err.actionable)
+            raise err
+
+        if not saw_done:
+            # Truncated body (proxy cut, connection died cleanly). Never
+            # present a partial answer as a successful completion.
+            err = _classify_api_error_body(
+                self.host, self.model_name, "stream ended without done marker"
+            )
             yield StreamEvent(kind="error", text=err.actionable)
             raise err
 

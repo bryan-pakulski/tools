@@ -427,14 +427,16 @@ class HistoryMixin:
 
         sections = _parse_summary_sections(self.conversation_summary)
         if not sections:
-            # Legacy/unstructured summary — keep-newest fallback.
-            clipped = self.conversation_summary[-limit:].lstrip()
+            # Legacy/unstructured summary — keep-newest fallback. Subtract
+            # the marker overhead so the final summary respects the limit
+            # instead of exceeding it by the marker length.
+            marker = f"[conversation_summary_truncated_to_last_{limit}_chars]"
+            keep = max(0, limit - len(marker) - 1)
+            clipped = self.conversation_summary[-keep:].lstrip() if keep else ""
             newline_index = clipped.find("\n")
             if newline_index > 0:
                 clipped = clipped[newline_index + 1 :]
-            self.conversation_summary = (
-                f"[conversation_summary_truncated_to_last_{limit}_chars]\n{clipped}"
-            ).strip()
+            self.conversation_summary = f"{marker}\n{clipped}".strip()
             return
 
         # Trim sections in priority order until under budget. Trim from the
@@ -525,9 +527,25 @@ class HistoryMixin:
         start = (
             self.summary_anchor if start_index is None else max(0, int(start_index))
         )
-        return sum(
+        total = sum(
             self._estimate_message_tokens(message) for message in self.history[start:]
         )
+        # prepare_runtime_history() re-injects protected messages below the
+        # anchor (plus a preserved-context marker) into every provider
+        # request. Include them here so budget/compaction decisions see the
+        # TRUE request size — otherwise compaction can declare the history
+        # under budget while up to _PROTECTED_CAP verbatim messages ride
+        # along uncounted.
+        protected = getattr(self, "protected_indices", set())
+        below = [idx for idx in protected if idx < start]
+        if below:
+            total += sum(
+                self._estimate_message_tokens(self.history[idx])
+                for idx in below
+                if idx < len(self.history)
+            )
+            total += 60  # preserved-context marker envelope
+        return total
 
     # ------------------------------------------------------ rolling summary
 
@@ -614,6 +632,15 @@ class HistoryMixin:
         summary_batch = self._generate_llm_summary(provider, entries_to_summarize)
         if summary_batch is None:
             summary_batch = self._summarize_history_batch(entries_to_summarize)
+        else:
+            # Verbatim tail: even a good LLM summary can drop exact
+            # identifiers (file paths, error strings, command text). Append
+            # the bounded mechanical lines so the compacted L2 keeps
+            # searchable original tokens; _clip_conversation_summary bounds
+            # growth.
+            mechanical = self._summarize_history_batch(entries_to_summarize)
+            if mechanical:
+                summary_batch = f"{summary_batch}\n\n[verbatim segment]\n{mechanical}"
 
         # Record which summarizer path produced this batch, so the run tracer
         # can flag the catastrophically-lossy mechanical fallback (140-char

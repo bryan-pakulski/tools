@@ -17,6 +17,9 @@ export type ButtonProps = {
   loading?: boolean;
   style?: ViewStyle;
   textStyle?: TextStyle;
+  /** Round-32b F11: expose a11y state (e.g. {disabled: true}) to screen
+   * readers while a conflict action is in progress. */
+  accessibilityState?: { disabled?: boolean; busy?: boolean; checked?: boolean };
 };
 
 export function Button({
@@ -27,6 +30,7 @@ export function Button({
   loading,
   style,
   textStyle,
+  accessibilityState,
 }: ButtonProps) {
   const { colors, spacing, radii, typography } = useTheme();
 
@@ -59,6 +63,7 @@ export function Button({
   return (
     <TouchableOpacity
       accessibilityRole="button"
+      accessibilityState={accessibilityState ?? (disabled || loading ? { disabled: true } : undefined)}
       onPress={onPress}
       disabled={disabled || loading}
       style={[baseStyle, variantStyles[variant], style]}

@@ -271,7 +271,7 @@ const LINE_HEIGHT = 19;
 const VISIBLE_LINES = 25;
 const OVERSCAN = 8;
 
-export const CodeBlock = React.memo(function CodeBlock({ code, language, colors }: CodeBlockProps) {
+export function CodeBlock({ code, language, colors }: CodeBlockProps) {
   const langLabel = language ? language.toLowerCase().trim() : '';
   const tokenizedLines = useMemo(() => tokenize(code, langLabel), [code, langLabel]);
   const totalLines = tokenizedLines.length;
@@ -353,7 +353,7 @@ export const CodeBlock = React.memo(function CodeBlock({ code, language, colors 
       </ScrollView>
     </View>
   );
-}, (prev, next) => prev.code === next.code && prev.language === next.language && prev.colors === next.colors);
+}
 
 const styles = StyleSheet.create({
   container: {

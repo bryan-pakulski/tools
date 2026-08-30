@@ -34,6 +34,25 @@ def run_gui(args, build_session) -> None:
     port = int(getattr(args, "port", None) or DEFAULT_PORT)
     host = getattr(args, "host", None) or DEFAULT_HOST
 
+    # Non-loopback bind requires explicit opt-in (codex round-6 F5): the
+    # GUI has no authentication — every LAN-reachable client could delete
+    # sessions/files, watch all SSE traffic, and open container shells.
+    # MUCLI_GUI_ALLOW_REMOTE=1 documents informed consent at the env level.
+    import ipaddress as _ip
+
+    try:
+        bind_is_loopback = _ip.ip_address(host.split("%")[0]).is_loopback
+    except ValueError:
+        bind_is_loopback = host in ("localhost", "")
+    if not bind_is_loopback and not os.environ.get("MUCLI_GUI_ALLOW_REMOTE"):
+        raise SystemExit(
+            f"Refusing to bind the GUI to {host}: the GUI has no built-in "
+            "authentication (any LAN client could delete sessions/files, "
+            "read all event traffic, and open container shells).\n"
+            "Keep the default 127.0.0.1, or set MUCLI_GUI_ALLOW_REMOTE=1 "
+            "to accept the risk explicitly."
+        )
+
     # gui_foreground marker MUST be checked before is_running — the
     # parent writes the pid file before spawning the child, so the
     # child would otherwise read its OWN pid and exit thinking the GUI

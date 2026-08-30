@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from mu.container.ref import WORKER_PROTOCOL_VERSION
+from mu.session.manager import RevisionConflict
 from mu.ui.base import BaseUI
 
 
@@ -113,11 +114,11 @@ class WorkerBridgeUI(BaseUI):
             self._thinking_buffer.clear()
             self._last_delta_flush = now
         if thinking:
-            self._publish_raw(
+            self.publish(
                 {"kind": "thinking_delta", "turn_id": self.turn_id, "text": thinking}
             )
         if assistant:
-            self._publish_raw(
+            self.publish(
                 {"kind": "assistant_delta", "turn_id": self.turn_id, "text": assistant}
             )
 
@@ -236,11 +237,14 @@ class WorkerBridgeUI(BaseUI):
             # loop delivers the same text token-by-token. If we already
             # streamed it, skip. _streamed_any_text resets on next stream.
             if self._streamed_any_text:
+                self._streamed_any_text = False
                 return
             turn_id = uuid.uuid4().hex[:12]
-            self.publish_event({"kind": "assistant_start", "turn_id": turn_id})
-            self.publish_event({"kind": "assistant_delta", "turn_id": turn_id, "text": text})
-            self.publish_event({"kind": "assistant_end", "turn_id": turn_id})
+            # Route through publish (the compatibility alias) so integrations
+            # that override publish observe assistant events too.
+            self.publish({"kind": "assistant_start", "turn_id": turn_id})
+            self.publish({"kind": "assistant_delta", "turn_id": turn_id, "text": text})
+            self.publish({"kind": "assistant_end", "turn_id": turn_id})
         elif role == "user":
             self.publish({"kind": "user_message", "text": text})
         else:
@@ -268,11 +272,13 @@ class WorkerBridgeUI(BaseUI):
             # New turn — reset the dedup flag from the previous turn.
             self._streamed_any_text = False
             self.turn_id = uuid.uuid4().hex[:12]
-            self._publish_raw({"kind": "assistant_start", "turn_id": self.turn_id})
+            self.publish({"kind": "assistant_start", "turn_id": self.turn_id})
         self._streamed_any_text = True
         with self._delta_lock:
             self._assistant_buffer.append(text)
-        self._flush_deltas()
+        # Force the flush so each delta is observable immediately — callers
+        # that override publish see every delta, preserving the event contract.
+        self._flush_deltas(force=True)
 
     def stream_thinking_delta(self, text: str):
         if not text:
@@ -416,6 +422,15 @@ _sessions: dict[str, Any] = {}
 _locks: dict[str, threading.Lock] = {}
 _busy: dict[str, threading.Event] = {}
 _threads: dict[str, int] = {}
+# Round-18 F28: _sessions/_locks/_busy were mutated from concurrent HTTP
+# handlers with no synchronization — two simultaneous first requests for
+# the same session could both build a session and one would silently
+# overwrite the other's cached state (and its per-session lock/busy event),
+# while the sync/async endpoints could both pass the busy check and run
+# overlapping turns on one history. One registry lock guards the
+# check-build-insert; turn claims are then atomic (Event set inside the
+# same critical section before any thread starts).
+_registry_lock = threading.RLock()
 _request_session_name: contextvars.ContextVar[str] = contextvars.ContextVar(
     "mucli_worker_request_session", default=""
 )
@@ -518,45 +533,71 @@ def _proxy_readiness() -> tuple[bool, str]:
 
 
 def _build_session(request: SendRequest):
-    existing = _sessions.get(request.session_name)
-    if existing is not None:
-        _sync_request_context(existing, request)
-        return existing
-    from mu.gui.live_observability import register_live_observability_hooks
-    from mucli import build_session
+    # Round-18 F28: the check-then-build-then-insert sequence ran without
+    # any lock — two concurrent first requests for the same session both
+    # built a session and the second insert silently replaced the first
+    # (including its lock/busy event). The whole check/build/publish is
+    # serialized under _registry_lock now. Build happens INSIDE the lock:
+    # build_session is expensive but idempotent-per-name and the race it
+    # prevents (duplicate cached sessions) is worse than holding a lock
+    # across it.
+    with _registry_lock:
+        existing = _sessions.get(request.session_name)
+        if existing is not None:
+            _sync_request_context(existing, request)
+            return existing
+        from mu.gui.live_observability import register_live_observability_hooks
+        from mucli import build_session
 
-    register_live_observability_hooks()
+        register_live_observability_hooks()
 
-    ui = WorkerBridgeUI(request.session_name)
-    try:
-        configured_workspaces = json.loads(os.getenv("MUCLI_WORKSPACES", "[\"/workspace\"]"))
-    except (TypeError, ValueError):
-        configured_workspaces = ["/workspace"]
-    workspaces = [
-        str(path) for path in configured_workspaces
-        if isinstance(path, str) and os.path.isdir(path)
-    ] or ["/workspace"]
-    args = argparse.Namespace(
-        session=request.session_name,
-        provider=request.provider,
-        model=request.model,
-        provider_prevalidated=True,
-        session_type="container",
-        system=request.system_instruction,
-        debug=False,
-        workspace=workspaces,
-        yolo=True,
-        system_file=None,
-        mode_prompt=[],
-    )
-    session = build_session(args, ui, allow_prompt=False)
-    _sync_request_context(session, request)
-    session.session_manager.save_history(session.folder_context)
-    session.sync_runtime_state()
-    _sessions[request.session_name] = session
-    _locks[request.session_name] = threading.Lock()
-    _busy[request.session_name] = threading.Event()
-    return session
+        ui = WorkerBridgeUI(request.session_name)
+        try:
+            configured_workspaces = json.loads(os.getenv("MUCLI_WORKSPACES", "[\"/workspace\"]"))
+        except (TypeError, ValueError):
+            configured_workspaces = ["/workspace"]
+        workspaces = [
+            str(path) for path in configured_workspaces
+            if isinstance(path, str) and os.path.isdir(path)
+        ] or ["/workspace"]
+        args = argparse.Namespace(
+            session=request.session_name,
+            provider=request.provider,
+            model=request.model,
+            provider_prevalidated=True,
+            session_type="container",
+            system=request.system_instruction,
+            debug=False,
+            workspace=workspaces,
+            yolo=True,
+            system_file=None,
+            mode_prompt=[],
+        )
+        session = build_session(args, ui, allow_prompt=False)
+        _sync_request_context(session, request)
+        # Round-18 F29: CAS against the revision we loaded — the host GUI may
+        # have written this session document while the worker was starting;
+        # a plain save would silently clobber it (LWW).
+        try:
+            session.session_manager.save_history(
+                session.folder_context,
+                expected_revision=int(
+                    getattr(session.session_manager, "revision", 0) or 0
+                ),
+            )
+        except RevisionConflict:
+            logger.warning(
+                "session %s changed on disk during worker init; host copy wins",
+                request.session_name,
+            )
+        session.sync_runtime_state()
+        # Round-18 F28: still inside _registry_lock — the dicts are published
+        # atomically as a group so no reader ever observes a session without
+        # its lock/busy event.
+        _sessions[request.session_name] = session
+        _locks[request.session_name] = threading.Lock()
+        _busy[request.session_name] = threading.Event()
+        return session
 
 
 def _sync_request_context(session: Any, request: SendRequest) -> None:
@@ -586,12 +627,26 @@ def _run_turn(session, request: SendRequest) -> None:
     name = request.session_name
     busy = _busy[name]
     ui = session.ui
-    busy.set()
+    # Round-18 F28: busy is claimed atomically by the endpoint before the
+    # thread starts; setting it here again was a second, racy write.
     _threads[name] = threading.current_thread().ident or 0
     try:
         with _locks[name]:
             result = session.send_message(request.text)
-            session.session_manager.save_history(session.folder_context)
+            # Round-18 F29: CAS the turn save — a host GUI write between
+            # our load and here must not be silently clobbered.
+            try:
+                session.session_manager.save_history(
+                    session.folder_context,
+                    expected_revision=int(
+                        getattr(session.session_manager, "revision", 0) or 0
+                    ),
+                )
+            except RevisionConflict:
+                logger.warning(
+                    "session %s: host wrote during worker turn; host copy wins",
+                    name,
+                )
         ui.publish(
             {
                 "kind": "turn_complete",
@@ -679,17 +734,34 @@ def send_sync(request: SendRequest, x_mucli_worker_token: str | None = Header(de
             status_code=500,
             detail=f"worker session initialisation failed: {type(exc).__name__}: {exc}",
         ) from exc
-    if _busy[request.session_name].is_set():
-        raise HTTPException(status_code=409, detail="session already has a turn in flight")
+    # Round-18 F28: claim the turn atomically — check and set under the
+    # registry lock so two concurrent sync requests cannot both pass the
+    # busy gate and run overlapping turns on one history.
+    with _registry_lock:
+        if _busy[request.session_name].is_set():
+            raise HTTPException(status_code=409, detail="session already has a turn in flight")
+        _busy[request.session_name].set()
     name = request.session_name
     busy = _busy[name]
-    busy.set()
     _threads[name] = threading.current_thread().ident or 0
     start_index = len(session.session_manager.history)
     try:
         with _locks[name]:
             result = session.send_message(request.text)
-            session.session_manager.save_history(session.folder_context)
+            # Round-18 F29: CAS the turn save — a host GUI write between
+            # our load and here must not be silently clobbered.
+            try:
+                session.session_manager.save_history(
+                    session.folder_context,
+                    expected_revision=int(
+                        getattr(session.session_manager, "revision", 0) or 0
+                    ),
+                )
+            except RevisionConflict:
+                logger.warning(
+                    "session %s: host wrote during worker turn; host copy wins",
+                    name,
+                )
         return jsonable_encoder({
             "ok": bool(not isinstance(result, dict) or result.get("status") != "error"),
             "session_name": name,
@@ -721,8 +793,13 @@ def send(request: SendRequest, x_mucli_worker_token: str | None = Header(default
             status_code=500,
             detail=f"worker session initialisation failed: {type(exc).__name__}: {exc}",
         ) from exc
-    if _busy[request.session_name].is_set():
-        raise HTTPException(status_code=409, detail="session already has a turn in flight")
+    # Round-18 F28: claim the turn atomically BEFORE starting the thread —
+    # the old shape set busy inside _run_turn, so two requests could both
+    # pass the gate and both spawn threads before either had set the flag.
+    with _registry_lock:
+        if _busy[request.session_name].is_set():
+            raise HTTPException(status_code=409, detail="session already has a turn in flight")
+        _busy[request.session_name].set()
     thread = threading.Thread(target=_run_turn, args=(session, request), daemon=True)
     thread.start()
     return {"accepted": True, "session_name": request.session_name}

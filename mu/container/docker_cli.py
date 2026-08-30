@@ -27,8 +27,13 @@ class CommandResult:
     stderr: str
 
 
-def _redact_command(command: Sequence[str]) -> str:
-    """Render a command for diagnostics without exposing provider secrets."""
+def _redact_command_list(command: Sequence[str]) -> list[str]:
+    """Return a copy of argv safe for diagnostics objects.
+
+    Round-20 F45: create commands carry `-e KEY=value` provider secrets.
+    Anything that outlives the run — result objects, ledgers, exception
+    payloads — must hold the redacted form; raw argv stays execution-local.
+    """
     values = [str(item) for item in command]
     rendered: list[str] = []
     redact_next = False
@@ -51,7 +56,12 @@ def _redact_command(command: Sequence[str]) -> str:
             rendered.append(f"{key}=<redacted>")
         else:
             rendered.append(value)
-    return " ".join(rendered)
+    return rendered
+
+
+def _redact_command(command: Sequence[str]) -> str:
+    """Render a command for diagnostics without exposing provider secrets."""
+    return " ".join(_redact_command_list(command))
 
 
 def run_with_output(
@@ -101,11 +111,16 @@ class CommandRunner:
         output_callback: OutputCallback | None = None,
     ) -> CommandResult:
         command = [str(item) for item in args]
-        self.commands.append(command)
+        # Round-18 F31: the ledger previously stored the RAW argv —
+        # create commands carry `-e KEY=value` provider secrets, so any
+        # introspection path reading runner.commands got live API keys
+        # even though rendered diagnostics were redacted. Store the
+        # redacted rendering instead; the ledger is diagnostics-only.
+        self.commands.append(_redact_command_list(command))
         if output_callback is not None:
             output_callback("command", f"$ {_redact_command(command)}")
         if self.dry_run:
-            return CommandResult(command, 0, "", "")
+            return CommandResult(_redact_command_list(command), 0, "", "")
         if output_callback is None:
             proc = subprocess.run(
                 command,
@@ -115,7 +130,11 @@ class CommandRunner:
                 timeout=timeout,
                 check=False,
             )
-            result = CommandResult(command, proc.returncode, proc.stdout, proc.stderr)
+            # Round-20 F45: result objects outlive the run and are used
+            # for diagnostics — never carry the raw secret-bearing argv.
+            result = CommandResult(
+                _redact_command_list(command), proc.returncode, proc.stdout, proc.stderr
+            )
         else:
             result = self._run_streaming(
                 command,
@@ -175,7 +194,13 @@ class CommandRunner:
             if timeout is not None and time.monotonic() - started > timeout:
                 proc.kill()
                 proc.wait()
-                raise subprocess.TimeoutExpired(command, timeout)
+                # Round-20 F45: TimeoutExpired embeds cmd in its payload;
+                # callers render str(exc) into logs/diagnostics. Raise
+                # with the REDACTED argv so secrets never enter the
+                # exception chain.
+                raise subprocess.TimeoutExpired(
+                    _redact_command_list(command), timeout
+                )
             try:
                 label, line = events.get(timeout=0.1)
             except queue.Empty:
@@ -195,7 +220,7 @@ class CommandRunner:
         for thread in threads:
             thread.join(timeout=0.2)
         return CommandResult(
-            command,
+            _redact_command_list(command),
             returncode,
             "".join(stdout_parts),
             "".join(stderr_parts),

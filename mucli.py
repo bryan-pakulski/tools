@@ -95,658 +95,35 @@ def _extract_recent_sources(history, limit=12):
     return urls
 
 
-def _slugify_feature_id(value):
-    return (
-        re.sub(r"[^a-zA-Z0-9]+", "_", str(value or "").strip().lower()).strip("_")
-        or "feature"
-    )
-
-
-def _default_feature_directory(session, feature_name):
-    workspace_root = (
-        os.path.abspath(session.folder_context.folders[0])
-        if session.folder_context.folders
-        else os.getcwd()
-    )
-    return os.path.join(
-        workspace_root,
-        "documentation",
-        f"feature_req_{_slugify_feature_id(feature_name)}",
-    )
-
-
-def refresh_feature_record(session, feature_id=None):
-    record = session.session_manager.get_feature(feature_id)
-    if not isinstance(record, dict):
-        return None
-
-    metadata_path = str(record.get("metadata_path", "") or "").strip()
-    directory = str(record.get("directory", "") or "").strip()
-    if not (metadata_path and directory and os.path.exists(metadata_path)):
-        return record
-
-    try:
-        plan = refresh_and_persist_feature_plan(
-            session.session_manager.current_session_name,
-            metadata_path=metadata_path,
-        )
-    except (FileNotFoundError, OSError, ValueError):
-        return record
-
-    summary = summarize_feature_plan(plan)
-    updated = {
-        **record,
-        "feature_id": summary["feature_id"],
-        "feature_name": summary["feature_name"],
-        "directory": summary["directory"],
-        "metadata_path": summary.get("metadata_path"),
-        "feature_plan": summary,
-        "next_phase": summary.get("next_phase"),
-        "status": derive_feature_state_status(summary),
-        "updated_at": record.get("updated_at"),
-    }
-    session.session_manager.upsert_feature(updated)
-    if session.session_manager.active_feature_id == updated["feature_id"]:
-        session.session_manager.set_feature_state(updated, session.folder_context)
-    else:
-        session.session_manager.save_history(session.folder_context)
-        session.sync_runtime_state()
-    return session.session_manager.get_feature(updated["feature_id"])
-
-
-def get_current_feature_task_label(session):
-    feature_state = session.session_manager.get_feature_state()
-    if not isinstance(feature_state, dict):
-        return None
-
-    feature_plan = feature_state.get("feature_plan")
-    if not isinstance(feature_plan, dict):
-        return None
-
-    next_task = feature_plan.get("next_task") or feature_plan.get("next_phase")
-    if isinstance(next_task, dict):
-        title = str(next_task.get("title", "") or "").strip()
-        return title or None
-    return None
-
-
-def get_feature_prompt_context(session):
-    feature_state = session.session_manager.get_feature_state()
-    if not isinstance(feature_state, dict):
-        return None
-
-    plan = feature_state.get("feature_plan")
-    if not isinstance(plan, dict):
-        return None
-
-    tasks = plan.get("phases", [])
-    overall_total = max(1, len(tasks))
-    overall_done = sum(1 for task in tasks if task.get("status") == "completed")
-    all_completed = bool(tasks) and (
-        bool(plan.get("phases_completed"))
-        or bool(plan.get("tasks_completed"))
-        or overall_done >= len(tasks)
-        or str(feature_state.get("status", "")).strip().lower() == "completed"
-    )
-
-    next_task = plan.get("next_task") or plan.get("next_phase")
-    active_task = None
-    if isinstance(next_task, dict):
-        next_number = next_task.get("number") or next_task.get("id")
-        active_task = next(
-            (task for task in tasks if task.get("number") == next_number),
-            None,
-        )
-    if active_task is None and tasks:
-        active_task = next(
-            (task for task in tasks if task.get("status") != "completed"),
-            tasks[0],
-        )
-
-    phase_done = 0
-    phase_total = 1
-    task_title = "n/a"
-    if all_completed:
-        phase_done = 1
-        phase_total = 1
-        task_title = "completed"
-    elif isinstance(active_task, dict):
-        task_title = str(active_task.get("title", "") or "").strip() or "n/a"
-        counts = active_task.get("task_counts", {}) or {}
-        phase_done = int(counts.get("completed", 0) or 0)
-        phase_total = int(sum(int(v or 0) for v in counts.values()) or 0)
-        if phase_total <= 0:
-            phase_total = 1
-            if active_task.get("status") == "completed":
-                phase_done = 1
-
-    return {
-        "status": str(feature_state.get("status", "unknown") or "unknown"),
-        "task": task_title,
-        "phase_done": phase_done,
-        "phase_total": phase_total,
-        "overall_done": overall_done,
-        "overall_total": overall_total,
-    }
-
-
-def build_feature_markdown(feature, *, include_phases=True):
-    if not isinstance(feature, dict):
-        return "## Feature\n\nNo feature is currently selected."
-
-    plan = (
-        feature.get("feature_plan")
-        if isinstance(feature.get("feature_plan"), dict)
-        else {}
-    )
-    feature_name = (
-        feature.get("feature_name")
-        or plan.get("feature_name")
-        or feature.get("feature_id", "feature")
-    )
-    lines = [
-        f"# Feature: {feature_name}",
-        "",
-        f"- **ID:** `{feature.get('feature_id', 'unknown')}`",
-        f"- **Status:** `{feature.get('status', 'unknown')}`",
-        f"- **Directory:** `{feature.get('directory', 'n/a')}`",
-        f"- **Metadata:** `{feature.get('metadata_path', 'n/a')}`",
-        f"- **Approved:** `{plan.get('approved', False)}`",
-        f"- **Review:** `{plan.get('review_status', 'pending')}`",
-        "",
-    ]
-
-    request = str(plan.get("feature_request", "") or "").strip()
-    if request:
-        lines.extend(["## Request", "", request, ""])
-
-    tasks = plan.get("phases", [])
-    completed = sum(1 for task in tasks if task.get("status") == "completed")
-    total = len(tasks)
-    started_at = float(feature.get("started_at", 0) or 0)
-    elapsed = max(0, int(time.time() - started_at)) if started_at else 0
-    token_total = int(feature.get("token_total", 0) or 0)
-    start_tokens = int(feature.get("start_tokens", 0) or 0)
-    token_delta = max(0, token_total - start_tokens)
-    next_task = plan.get("next_phase")
-    if not isinstance(next_task, dict):
-        next_task = plan.get("next_task")
-
-    def _fmt_elapsed(seconds):
-        minutes, secs = divmod(max(0, int(seconds or 0)), 60)
-        hours, minutes = divmod(minutes, 60)
-        if hours:
-            return f"{hours}h {minutes}m {secs}s"
-        return f"{minutes}m {secs}s"
-
-    def _fmt_delta(tokens):
-        if tokens >= 1000:
-            return f"{tokens / 1000:.1f}k"
-        return str(tokens)
-
-    lines.extend(
-        [
-            "## Progress Snapshot",
-            "",
-            f"- **Completed:** {completed}/{total}",
-            f"- **Elapsed:** {_fmt_elapsed(elapsed)}",
-            f"- **Token delta:** ↓ {_fmt_delta(token_delta)} tokens",
-            "",
-        ]
-    )
-
-    if isinstance(next_task, dict):
-        lines.extend(
-            [
-                "### Active Work",
-                "",
-                f"*Implementing {next_task.get('title', '')}… ({_fmt_elapsed(elapsed)} · ↓ {_fmt_delta(token_delta)} tokens)*",
-                "",
-            ]
-        )
-
-    if include_phases:
-        lines.extend(["### Task Checklist", ""])
-        if tasks:
-            for task in tasks:
-                counts = task.get("task_counts", {})
-                icon = {
-                    "completed": "✔",
-                    "in_progress": "◼",
-                    "not_started": "◻",
-                }.get(task.get("status", "not_started"), "◻")
-                lines.append(
-                    f"- {icon} **{task.get('title', '')}** "
-                    f"`{task.get('status', 'unknown')}` "
-                    f"(done: {counts.get('completed', 0)}, in-progress: {counts.get('in_progress', 0)}, remaining: {counts.get('not_started', 0)})"
-                )
-        else:
-            lines.append("- No tasks defined yet.")
-        lines.append("")
-
-    blocker = feature.get("blocker")
-    if isinstance(blocker, dict) and any(blocker.values()):
-        lines.extend(
-            [
-                "## Blocker",
-                "",
-                f"- **Summary:** {blocker.get('summary', '')}",
-                f"- **Requested input:** {blocker.get('requested_input', '')}",
-                "",
-            ]
-        )
-
-    return "\n".join(lines).strip()
-
-
-def _feature_three_option_prompt(question, options, *, allow_prompt):
-    choices = options[:3]
-    if len(choices) != 3:
-        raise ValueError("feature prompt requires exactly three options")
-    if not allow_prompt:
-        return choices[0][0]
-    console.print(f"[bold cyan]{safe_markup(question)}[/bold cyan]")
-    for idx, (_, label) in enumerate(choices, start=1):
-        console.print(f"  {idx}. {label}", markup=False)
-    selected = IntPrompt.ask("Select option", choices=[1, 2, 3], default=1)
-    return choices[selected - 1][0]
-
-
-def _log_feature_cli_event(session, *, kind, payload):
-    feature_state = session.session_manager.get_feature_state()
-    if not isinstance(feature_state, dict):
-        return
-    metadata_path = str(feature_state.get("metadata_path", "") or "").strip()
-    if not metadata_path or not os.path.exists(metadata_path):
-        return
-    try:
-        plan = load_feature_plan(metadata_path)
-    except (FileNotFoundError, OSError, ValueError):
-        return
-    plan.add_event(
-        kind=kind,
-        entity="cli",
-        entity_id=str(feature_state.get("feature_id", "unknown") or "unknown"),
-        payload=payload,
-        actor="cli",
-    )
-    save_feature_plan("", plan)
-    refresh_feature_record(session, None)
-
-
-def _feature_prompt_with_logging(
-    session,
-    *,
-    question,
-    options,
-    allow_prompt,
-    prompt_id,
-    context=None,
-):
-    selected = _feature_three_option_prompt(question, options, allow_prompt=allow_prompt)
-    _log_feature_cli_event(
-        session,
-        kind="cli_prompt_selected",
-        payload={
-            "prompt_id": prompt_id,
-            "question": question,
-            "selected": selected,
-            "options": [option[0] for option in options[:3]],
-            "context": context or {},
-        },
-    )
-    return selected
-
-
-def _feature_confirm_deny_edit_loop(
-    session,
-    *,
-    label,
-    value,
-    allow_prompt,
-    context=None,
-):
-    current_value = str(value or "").strip()
-    while True:
-        choice = _feature_prompt_with_logging(
-            session,
-            question=f"Confirm {label}: {current_value}",
-            options=[
-                ("confirm", "Confirm (Recommended): proceed"),
-                ("edit", "Edit: change and re-confirm"),
-                ("deny", "Deny: cancel command"),
-            ],
-            allow_prompt=allow_prompt,
-            prompt_id=f"confirm_{label}",
-            context={"label": label, **(context or {})},
-        )
-        if choice == "confirm":
-            return {"decision": "confirm", "value": current_value}
-        if choice == "deny":
-            return {"decision": "deny", "value": current_value}
-        current_value = Prompt.ask(f"Edit {label}", default=current_value).strip()
-
-
-def _monitor_compact_line(snapshot):
-    execution = snapshot.get("execution", {}) if isinstance(snapshot, dict) else {}
-    next_phase = (execution.get("next_phase") or {}) if isinstance(execution, dict) else {}
-    next_task = (execution.get("next_task") or {}) if isinstance(execution, dict) else {}
-    blocked = execution.get("blocked_tasks", []) if isinstance(execution, dict) else []
-    blockers = ", ".join(str(item.get("title", "")).strip() for item in blocked if isinstance(item, dict) and str(item.get("title", "")).strip())
-    completion = "done" if execution.get("all_phases_completed") else "in_progress"
-    return (
-        f"phase={next_phase.get('title') or '-'} | "
-        f"task={next_task.get('title') or '-'} | "
-        f"blockers={len(blocked)}{f' ({blockers})' if blockers else ''} | "
-        f"completion={completion}"
-    )
-
-
-def _execute_feature_tool(session, tool_name, args):
-    raw = execute_tool(
-        tool_name,
-        args,
-        session.folder_context,
-        session.ui,
-        session.variables,
-        session=session,
-    )
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": raw}
-
-
-def build_stats_snapshot(session):
-    stats = {
-        "history_turns": len(session.session_manager.history),
-        "summary_anchor": session.session_manager.summary_anchor,
-        "active_turns": len(session.session_manager.history)
-        - session.session_manager.summary_anchor,
-        "token_counts": dict(session.session_manager.token_counts),
-        "feature_state": session.session_manager.get_feature_state(),
-        "feature_plan": None,
-    }
-
-    feature_state = stats["feature_state"]
-    if isinstance(feature_state, dict):
-        directory = str(feature_state.get("directory", "") or "").strip()
-        metadata_path = str(feature_state.get("metadata_path", "") or "").strip()
-        if directory:
-            try:
-                plan = refresh_and_persist_feature_plan(
-                    directory,
-                    metadata_path=metadata_path or None,
-                )
-                stats["feature_plan"] = summarize_feature_plan(plan)
-            except (FileNotFoundError, OSError, ValueError):
-                stats["feature_plan"] = None
-
-    return stats
-
-
-# Single source of truth for /help. Grouped by purpose. Aliases column
-# only lists the ONE alias that survived the cleanup (most commands have
-# no alias — /quit's /q is the only one kept for muscle memory).
-_HELP_GROUPS = [
-    (
-        "Session",
-        [
-            ("/help", "", "Show this menu"),
-            ("/quit", "/q", "Exit"),
-            ("/session [list|load|new|delete]", "", "Manage saved sessions"),
-            ("/clear", "", "Clear the terminal screen"),
-            ("/history [clear]", "", "Show conversation history; clear wipes it"),
-            ("/continue", "", "Resume last paused execution after Ctrl+C"),
-        ],
-    ),
-    (
-        "Workspace",
-        [
-            ("/workspace", "", "Show attached folders + staged files"),
-            ("/workspace folder <path>", "", "Attach a folder"),
-            ("/workspace folder remove <p>", "", "Detach a folder"),
-            ("/workspace folder clear", "", "Detach all folders"),
-            ("/workspace file <path>", "", "Stage a file for the next turn"),
-            ("/workspace file clear", "", "Drop staged files"),
-            ("/workspace clear", "", "Drop everything (folders + staged files)"),
-        ],
-    ),
-    (
-        "Model & provider",
-        [
-            ("/model [name]", "", "Show / change the model"),
-            ("/provider [name]", "", "Switch provider (gemini, ollama, openai)"),
-            ("/ollama [status|models|pull|options]", "", "Ollama-specific helpers"),
-        ],
-    ),
-    (
-        "Variables",
-        [
-            ("/set <key> <value>", "", "Set a session variable"),
-            ("/get <key>", "", "Get a session variable"),
-            ("/unset <key|--all>", "", "Unset a variable"),
-            ("/variables", "", "Show all variables"),
-        ],
-    ),
-    (
-        "Modes & toggles",
-        [
-            ("/mode <name>", "", "Switch agent mode (default|debug|feature|research|loop|security|teacher)"),
-            ("/plan [on|off|toggle]", "", "Toggle plan mode (read-only enforcement)"),
-            ("/yolo", "", "Toggle YOLO mode (auto-approve writes)"),
-            ("/agentic", "", "Toggle tool-calling mode"),
-            ("/thinking", "", "Toggle extended thinking / reasoning"),
-            ("/verbose [on|off|toggle]", "", "Toggle verbose rendering (tool dumps, token lines, etc.)"),
-            ("/show-thinking [on|off|toggle]", "", "Toggle display of reasoning deltas"),
-            ("/goal [<text>|clear|show]", "", "Pin top-level task into L3; survives compaction"),
-            ("/research [status|sources]", "", "Research workflow helpers"),
-        ],
-    ),
-    (
-        "Memory, tools, features",
-        [
-            ("/memory <status|list <target>|clear <target>>", "", "Inspect memory, scratchpad, or any layer (L1-L5)"),
-            ("/tool <enable|disable|list>", "", "Enable/disable tools or list all"),
-            (
-                "/feature <list|new|load|delete|status|phases|create|show|move|block|review|archive|monitor>",
-                "",
-                "Manage feature-mode plans",
-            ),
-            (
-                "/teach <list|new|load|exit|status|next|grades|curriculum|delete|help>",
-                "/t",
-                "Manage teacher-mode courses",
-            ),
-        ],
-    ),
-    (
-        "Shell escape",
-        [
-            ("/bash <cmd>", "/sh /!", "Run a shell command in the workspace folder (60s timeout)"),
-        ],
-    ),
-    (
-        "Extensions",
-        [
-            ("/skills [<name>|reload|enable <n>|disable <n>]", "", "Manage installed skills"),
-            ("/docs [<name>]", "", "Browse bundled documentation"),
-            ("/prompts [reload|init|show|validate|edit]", "", "Manage file-based system-prompt overrides"),
-        ],
-    ),
-    (
-        "Diagnostics",
-        [
-            ("/stats", "", "Tokens, cost, memory, context — current snapshot"),
-            ("/help", "/h", "Show this menu"),
-        ],
-    ),
-]
-
-
-def _curated_commands() -> set[str]:
-    """Set of leading command names mentioned in the curated _HELP_GROUPS.
-    Used by the auto-discovery safety net to find commands that are
-    registered but missing from the curated layout."""
-    covered: set[str] = set()
-    for _, entries in _HELP_GROUPS:
-        for cmd, alias, _desc in entries:
-            head = cmd.split()[0] if cmd else ""
-            if head.startswith("/"):
-                covered.add(head)
-            for token in (alias or "").replace(",", " ").split():
-                token = token.strip()
-                if token.startswith("/"):
-                    covered.add(token)
-    return covered
-
-
-def _uncurated_commands_section():
-    """Build an extra `(group_name, entries)` tuple for commands that are
-    registered via `@command` but never made it into `_HELP_GROUPS`.
-
-    Catches regressions where someone adds a slash command but forgets
-    to update the curated list — the entry shows up under "Other"
-    instead of being invisible.
-    """
-    from mu.commands import list_commands
-
-    covered = _curated_commands()
-    rows: list[tuple[str, str, str]] = []
-    seen_specs: set[int] = set()
-    for spec in list_commands():
-        if id(spec) in seen_specs:
-            continue
-        seen_specs.add(id(spec))
-        primary = spec.names[0]
-        if primary in covered:
-            continue
-        if any(alias in covered for alias in spec.names):
-            continue
-        aliases = " ".join(spec.names[1:]) if len(spec.names) > 1 else ""
-        rows.append((primary, aliases, spec.help or ""))
-    if not rows:
-        return None
-    rows.sort(key=lambda r: r[0])
-    return ("Other", rows)
-
-
-def print_help():
-    groups = list(_HELP_GROUPS)
-    extra = _uncurated_commands_section()
-    if extra is not None:
-        groups.append(extra)
-    for group_name, entries in groups:
-        table = Table(title=group_name, box=box.SIMPLE, show_header=False, padding=(0, 1))
-        table.add_column("Command", style="cyan", no_wrap=True)
-        table.add_column("Alias", style="magenta")
-        table.add_column("Description", style="white")
-        for cmd, alias, desc in entries:
-            table.add_row(cmd, alias, desc)
-        console.print(table)
-    console.print(
-        "[dim]Tip: end a line with '\\' to continue typing on the next line. "
-        "Tab to autocomplete every command.[/dim]"
-    )
-
-
-def print_splash(session):
-    welcome_text = Text()
-
-    # Neon μCLI Cyberpunk Ascii Art
-    welcome_text.append(" ██╗   ██╗", style="bold magenta")
-    welcome_text.append("  ██████╗ ██╗     ██╗\n", style="bold cyan")
-    welcome_text.append(" ██║   ██║", style="bold magenta")
-    welcome_text.append(" ██╔════╝ ██║     ██║\n", style="bold cyan")
-    welcome_text.append(" ██║   ██║", style="bold magenta")
-    welcome_text.append(" ██║      ██║     ██║\n", style="bold cyan")
-    welcome_text.append(" ██║   ██║", style="bold magenta")
-    welcome_text.append(" ██║      ██║     ██║\n", style="bold cyan")
-    welcome_text.append(" ███████╔╝", style="bold magenta")
-    welcome_text.append(" ╚██████╗ ███████╗██║\n", style="bold cyan")
-    welcome_text.append(" ██╔════╝ ", style="bold magenta")
-    welcome_text.append("  ╚═════╝ ╚══════╝╚═╝\n", style="bold cyan")
-    welcome_text.append(" ██║      \n", style="bold magenta")
-    welcome_text.append(" ╚═╝      \n", style="bold magenta")
-
-    welcome_text.append("\n > _AUTONOMOUS_AGENT_READY\n", style="bold yellow")
-
-    sys_status = "SET" if session.system_instruction else "NONE"
-    agent_mode = session.variables.get("agent_mode", "default")
-    session_type = session.variables.get("session_type", "workspace")
-    mode_meta = AGENT_MODE_METADATA.get(str(agent_mode), {})
-    mode_description = mode_meta.get("description", "")
-    yolo_status = "ON" if session.variables.get("yolo", False) else "OFF"
-    _session_type_glyph = {"chat": "○", "workspace": "▱", "container": "◇"}
-    session_type_glyph = _session_type_glyph.get(session_type, "▱")
-
-    # Workspace Folder info
-    folders = session.folder_context.folders
-    folder_count = len(folders)
-    if folder_count == 0:
-        folder_list = "None"
-    elif folder_count == 1:
-        folder_list = folders[0]
-    else:
-        folder_list = f"{folder_count} folders: " + ", ".join(
-            [os.path.basename(f) for f in folders[:3]]
-        )
-        if folder_count > 3:
-            folder_list += " ..."
-
-    info_grid = f"""                                                                   
-    [bold magenta]Session:[/bold magenta]  [bold yellow]{session.session_manager.current_session_name}[/bold yellow]
-    [bold magenta]System:[/bold magenta]   {sys_status}                                
-    [bold magenta]Model:[/bold magenta]    [bold cyan]{session.provider.model_name}[/bold cyan]       
-    [bold magenta]Thinking:[/bold magenta] [bold cyan]{session.thinking}[/bold cyan] | [bold magenta]Agentic:[/bold magenta] [bold cyan]{session.agentic}[/bold cyan] | [bold magenta]YOLO:[/bold magenta] [bold cyan]{yolo_status}[/bold cyan]
-    [bold magenta]Type:[/bold magenta]     [bold cyan]{session_type_glyph} {session_type}[/bold cyan]
-    [bold magenta]Mode:[/bold magenta]     [bold cyan]{agent_mode}[/bold cyan] — {mode_description}
-    [bold magenta]Workspace:[/bold magenta][bold green] {folder_list}[/bold green]
-"""
-    # Total context (sum of all layers) vs. the compactor's effective
-    # ceiling (drift_corrected_context_limit), not the raw provider window.
-    # The compactor fires on the effective ceiling — the raw
-    # context_token_limit divided by the provider's safety factor (2.5 for
-    # Ollama) and any learned cl100k→real drift — so the warning must use the
-    # same ceiling or it can read "60% full" while emergency compaction is
-    # already firing. No-op for providers with no safety factor (OpenAI/Gemini).
-    from utils.runtime_metrics import estimate_active_context_tokens
-
-    raw_limit = int(session.variables.get("context_token_limit", _DEFAULT_CONTEXT_TOKEN_LIMIT) or _DEFAULT_CONTEXT_TOKEN_LIMIT)
-    try:
-        from mu.session.budgets import drift_corrected_context_limit
-
-        context_limit = max(1, int(drift_corrected_context_limit(session)))
-    except Exception:  # noqa: BLE001
-        context_limit = raw_limit
-    trim_threshold = float(session.variables.get("context_trim_threshold", 0.85) or 0.85)
-    trim_threshold = max(0.10, min(trim_threshold, 1.0))
-    context_tokens = int(estimate_active_context_tokens(session) or 0)
-    threshold_tokens = int(context_limit * trim_threshold)
-    cap_note = (
-        f" [dim](effective cap ÷ safety; raw {raw_limit:,})[/dim]"
-        if context_limit < raw_limit
-        else ""
-    )
-    if context_tokens >= threshold_tokens:
-        info_grid += f"""
-    [bold magenta]Context:[/bold magenta]   [bold cyan]{context_tokens:,}[/bold cyan] / {context_limit:,} tokens  [bold yellow]⚠[/bold yellow] [dim](trim threshold: {int(trim_threshold * 100)}%)[/dim]{cap_note}"""
-    else:
-        info_grid += f"""
-    [bold magenta]Context:[/bold magenta]   [bold cyan]{context_tokens:,}[/bold cyan] / {context_limit:,} tokens{cap_note}"""
-
-    info_grid += "\n    "
-
-    console.print(
-        Panel(
-            Text.assemble(welcome_text, Text.from_markup(info_grid)),
-            title="[bold yellow] // μCLI TERMINAL // [/bold yellow]",
-            border_style="cyan",
-            box=box.HEAVY,
-        )
-    )
-    console.print("[dim] Type '/help' for commands.[/dim]\n")
-
+# Feature-mode helpers moved to mu/cli/feature.py — re-exported here so
+# existing `from mucli import X` call sites (mu/commands/*, tests) are
+# unaffected. mucli.py remains the stable public surface.
+from mu.cli.feature import (  # noqa: F401
+    _slugify_feature_id,
+    _default_feature_directory,
+    refresh_feature_record,
+    get_current_feature_task_label,
+    get_feature_prompt_context,
+    build_feature_markdown,
+    _feature_three_option_prompt,
+    _log_feature_cli_event,
+    _feature_prompt_with_logging,
+    _feature_confirm_deny_edit_loop,
+    _monitor_compact_line,
+    _execute_feature_tool,
+)
+
+# Stats/help/splash rendering moved to mu/cli/display.py — re-exported
+# so `from mucli import ...` call sites (mu/commands/misc.py, tests) keep
+# working. mucli.py remains the stable public surface.
+from mu.cli.display import (  # noqa: F401
+    _HELP_GROUPS,
+    build_stats_snapshot,
+    _curated_commands,
+    _uncurated_commands_section,
+    print_help,
+    print_splash,
+)
 
 def init_provider(
     provider_name, model_name, ollama_host=None, ollama_mode=None, ollama_api_key=None
@@ -1565,6 +942,32 @@ def main():
     print_splash(session)
     refresh_memory_hud(session, ui)
 
+    # Cross-surface continuity phases 2+3 (G1+G4): inbound session watcher +
+    # presence beacon. The watcher polls session.json only while another
+    # surface (GUI/mobile) holds a live beacon (§3.4); the toucher publishes
+    # this CLI's own beacon every ~5s so peers see us. MUCLI_SURFACE_SYNC=1
+    # forces the watcher on regardless of presence (single-surface opt-in).
+    # Reloads are deferred to the turn boundary while a turn executes.
+    _surface_sync = None
+    _presence_toucher = None
+    try:
+        from mu.session.presence import BeaconToucher
+        from mu.session.surface_sync import SurfaceSync
+
+        _surface_sync = SurfaceSync(session, ui)
+        session._surface_sync = _surface_sync
+        _surface_sync.start()
+        _presence_toucher = BeaconToucher(
+            lambda: session.session_manager.current_session_name,
+            "cli",
+            busy_fn=lambda: getattr(session, "_current_turn_start_index", None)
+            is not None,
+        )
+        _presence_toucher.start()
+    except Exception:
+        _surface_sync = None
+        _presence_toucher = None
+
     try:
         while True:
             try:
@@ -1612,6 +1015,16 @@ def main():
                 console.print("\nGoodbye!")
                 break
     finally:
+        if _surface_sync is not None:
+            try:
+                _surface_sync.stop()
+            except Exception:
+                pass
+        if _presence_toucher is not None:
+            try:
+                _presence_toucher.stop()
+            except Exception:
+                pass
         # Cancel any still-running async sub-agents and reap background bash
         # tasks so nothing outlives the session. No-op when none are active.
         try:

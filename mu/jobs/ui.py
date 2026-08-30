@@ -59,10 +59,19 @@ class JobUI(BaseUI):
             elif response_kind not in {kind, "question"}:
                 continue
             self._responses.pop(index)
-            self._event(
-                "interaction_response_consumed",
-                payload={"response_event_id": event.id, "kind": kind, "tool_name": tool_name},
-            )
+            # Round-41 F7: ATOMIC claim — two JobUI instances (GUI + worker
+            # session) previously both popped the same in-memory response
+            # and both consumed it, double-approving write approvals. The
+            # store-level claim lets exactly one caller win; the loser
+            # re-loads pending responses (the winner's consumption is now
+            # visible) and keeps looking.
+            if not self.service.store.claim_interaction_response(
+                self.job_id, event.id, kind=kind, tool_name=tool_name
+            ):
+                self._responses = self._load_pending_responses()
+                continue
+            # The claim itself wrote the interaction_response_consumed
+            # event — do NOT append a second one (double-count).
             return payload
         return None
 

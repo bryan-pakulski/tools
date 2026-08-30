@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any, Dict, Iterable, List, Optional
 
 from .models import AttentionReason, Job, JobAttempt, JobEvent, JobSpec, JobStatus, can_transition, coerce_status
 from .store import JobStore
+
+logger = logging.getLogger("mucli")
 
 
 class JobStateError(RuntimeError):
@@ -84,6 +87,11 @@ class JobService:
 
     def list(self, *, statuses: Optional[Iterable[JobStatus | str]] = None, limit: int = 200) -> List[Job]:
         return self.store.list_jobs(statuses=statuses, limit=limit)
+
+    def list_unarchived(self, *, limit: int = 200) -> List[Job]:
+        """Jobs not archived (round-49 F9/F10): SQL-side filter so the board
+        never materializes the full archived-id set per render."""
+        return self.store.list_unarchived_jobs(limit=limit)
 
     def events(self, job_id: str, *, after_id: int = 0, limit: int = 500) -> List[JobEvent]:
         self.get(job_id)
@@ -185,11 +193,97 @@ class JobService:
     def finish_attempt(self, attempt_id: str, *, status: str, error: str = "", cost_usd: float = 0.0, metadata: Optional[Dict[str, Any]] = None) -> JobAttempt:
         return self.store.finish_attempt(attempt_id, status=status, error=error, cost_usd=cost_usd, metadata=metadata)
 
+    def _resume_after_finished_attempt(
+        self, job: Job, attempt: JobAttempt, *, expired_worker: str
+    ) -> Job:
+        """Round-16 F20: idempotent replay of the post-finish steps the
+        worker would have taken for an attempt that committed as
+        completed/needs_human before the crash. Safe to call repeatedly —
+        the store transitions validate against the live row."""
+        metadata = attempt.metadata or {}
+        checkpoint = metadata.get("checkpoint")
+        if attempt.status == "completed":
+            return self.transition(
+                job.id,
+                JobStatus.VERIFYING,
+                reason="implementation attempt completed (recovered after crash)",
+                payload={"checkpoint": checkpoint, "attempt_id": attempt.id},
+            )
+        attention = metadata.get("attention") or {}
+        raw_reason = str(metadata.get("attention_reason") or "")
+        try:
+            reason = AttentionReason(raw_reason)
+        except ValueError:
+            reason = AttentionReason.NONE
+        if reason in (AttentionReason.NONE, ""):
+            # Older attempts (pre-round-16) never persisted the reason;
+            # NEEDS_HUMAN requires one, so fall back to a generic value
+            # instead of dropping the job into RECOVERING (re-run).
+            reason = AttentionReason.QUESTION
+        return self.require_human(
+            job.id,
+            reason,
+            str(metadata.get("attention_detail") or
+                "recovered from crash after needs-human attempt finished"),
+            payload={**attention, "checkpoint": checkpoint},
+        )
+
     def recover_expired_leases(self) -> List[Job]:
         recovered: List[Job] = []
         for job in self.store.expired_leases():
             worker = job.worker_id
+            # Round-36 F1: CLAIM the expired lease BEFORE acting on the
+            # stale snapshot. release_expired_lease is a CAS — it succeeds
+            # only when the lease is STILL this worker's AND still expired
+            # at write time. Acting first (transitioning to RECOVERING,
+            # replaying a finished attempt) and releasing afterwards let a
+            # worker that renewed between the snapshot and the release
+            # keep running while its job was yanked to RECOVERING — two
+            # owners, duplicated side effects. Now a renewed lease means
+            # this recovery pass skips the job entirely.
+            if not self.store.release_expired_lease(
+                job.id, worker, reason="expired lease claimed for recovery"
+            ):
+                continue
             if job.status in {JobStatus.PREPARING, JobStatus.RUNNING}:
+                # Round-16 F20: the worker commits the attempt result FIRST
+                # and the job transition SECOND — a crash between the two
+                # leaves a finished attempt attached to a RUNNING job. The
+                # old unconditional recovery sent that job to RECOVERING and
+                # re-ran work that had already completed. If the newest
+                # attempt for this job is terminal, finish what the worker
+                # started instead (idempotent replay of the post-finish
+                # steps) and only recover when the attempt truly died
+                # mid-run.
+                attempts = self.store.list_attempts(job.id)
+                newest = max(
+                    attempts,
+                    key=lambda a: (a.number, a.started_at or 0.0),
+                    default=None,
+                )
+                if newest is not None and newest.status in {
+                    "completed", "needs_human",
+                }:
+                    try:
+                        recovered.append(
+                            self._resume_after_finished_attempt(
+                                job, newest, expired_worker=worker
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Idempotent recovery failed for job %s "
+                            "(attempt %s, status %s); falling back to "
+                            "RECOVERING",
+                            job.id, newest.id, newest.status,
+                        )
+                        recovered.append(self.transition(
+                            job.id,
+                            JobStatus.RECOVERING,
+                            reason="implementation worker lease expired",
+                            payload={"worker_id": worker},
+                        ))
+                    continue
                 try:
                     recovered.append(self.transition(
                         job.id,
@@ -206,8 +300,6 @@ class JobService:
                     reason="verification worker lease expired; verifier will retry",
                     payload={"worker_id": worker},
                 )
-            self.store.release_lease(job.id, worker, reason="expired lease recovered")
-            if job.status == JobStatus.VERIFYING:
                 recovered.append(self.get(job.id))
         return recovered
 

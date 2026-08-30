@@ -56,6 +56,13 @@ def _stub_session(context_limit=8192, response_reserve=2048):
     session._prepare_runtime_history.return_value = short_history
     session._build_messages_from_history.return_value = _make_messages(["hi", ""])
 
+    # Post-compaction prompt rebuild: echo the base prompt back unchanged
+    # (the stub has no layered-context machinery). Tests assert identity.
+    session.system_instruction = "stub system"
+    session._inject_hierarchical_context = MagicMock(
+        side_effect=lambda base, cached_skills=None: base
+    )
+
     return session
 
 

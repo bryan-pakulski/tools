@@ -218,7 +218,7 @@ def test_request_manifest_attributes_context_components():
             type="tool_call", tool_name="read_file", tool_args={"path": "large.py"}
         )]),
         Message(role="tool", parts=[MessagePart(
-            type="tool_result", tool_name="read_file", tool_result="x" * 4000
+            type="tool_result", tool_name="read_file", tool_result="x" * 8000
         )]),
     ]
     tools = [ToolDefinition(

@@ -7,7 +7,7 @@ optional live quiz UI, persisting graded artifacts to disk).
 Each handler returns a JSON string envelope so the agent gets a
 structured result. State mutations save via
 `session.session_manager.upsert_teacher_course()` then
-`session.session_manager.save_history()` so courses survive across
+`session.session_manager.save_history_turn()` so courses survive across
 session restarts.
 """
 
@@ -115,7 +115,7 @@ def _persist(session, course: Course) -> dict[str, Any]:
     session.session_manager.upsert_teacher_course(record)
     if session.session_manager.active_course_id == course.course_id:
         session.session_manager.teacher_state = dict(record)
-    session.session_manager.save_history(fc)
+    session.session_manager.save_history_turn(fc)
     return record
 
 
@@ -207,7 +207,7 @@ def _activate(session, course: Course, folder_context: Any) -> None:
     session.session_manager.upsert_teacher_course(record)
     session.session_manager.active_course_id = course.course_id
     session.session_manager.teacher_state = dict(record)
-    session.session_manager.save_history(folder_context)
+    session.session_manager.save_history_turn(folder_context)
 
 
 def _write_assignment_artifacts(

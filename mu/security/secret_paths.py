@@ -48,6 +48,23 @@ _DENIED_DIR_ROOTS: Tuple[str, ...] = (
     "/etc/sudoers.d",
 )
 
+# Round-28 F1: absolute glob roots covering OTHER users' home dirs (the
+# invoking user's ~ only covers one account). fnmatch-matched against
+# the resolved path.
+_DENIED_DIR_ROOT_GLOBS: Tuple[str, ...] = (
+    "/home/*/.ssh",
+    "/home/*/.aws",
+    "/home/*/.azure",
+    "/home/*/.config/gcloud",
+    "/home/*/.kube",
+    "/home/*/.gnupg",
+    "/home/*/.config/gh",
+    "/root/.ssh",
+    "/root/.aws",
+    "/root/.gnupg",
+    "/root/.kube",
+)
+
 # Exact files (after ~ expansion). Compared by absolute path equality.
 _DENIED_EXACT_FILES: Tuple[str, ...] = (
     "~/.docker/config.json",
@@ -160,6 +177,12 @@ def is_denied_path(
         root_abs = _expand(root)
         if _is_within(abs_path, root_abs):
             return True, f"denied secret directory ({root})"
+    # Round-28 F1: glob roots (other users' home directories).
+    for pattern in _DENIED_DIR_ROOT_GLOBS:
+        if fnmatch.fnmatch(abs_path, pattern + "/*") or fnmatch.fnmatch(
+            abs_path, pattern
+        ):
+            return True, f"denied secret directory ({pattern})"
 
     # 3. Full-path globs
     for pattern in _DENIED_FULLPATH_GLOBS:
@@ -207,16 +230,23 @@ def extract_paths_from_command(command: str) -> Iterable[str]:
         # Strip a leading `-` so we don't mistake `-rf` for a flag-shaped path.
         if cleaned.startswith("-"):
             continue
-        if (
-            cleaned.startswith("/")
-            or cleaned.startswith("~")
-            or cleaned.startswith("./")
-            or "/" in cleaned
-        ):
-            yield cleaned
-            continue
-        # Bare basename — might still match a denied basename glob.
-        yield cleaned
+        # Round-28 F1: shell punctuation wraps paths in ways that break
+        # exact/glob matching — `$(echo /home/u/.ssh/id_rsa)` tokenizes
+        # as `$(echo` + `/home/u/.ssh/id_rsa)`. Split on parens and
+        # strip wrapping quotes so every inner fragment gets checked.
+        for fragment in cleaned.replace("(", " ").replace(")", " ").split():
+            frag = fragment.strip("'\"")
+            if not frag or frag.startswith("-"):
+                continue
+            if (
+                frag.startswith("/")
+                or frag.startswith("~")
+                or frag.startswith("./")
+                or "/" in frag
+            ):
+                yield frag
+            else:
+                yield frag
 
 
 # ---------------------------------------------------------------------------

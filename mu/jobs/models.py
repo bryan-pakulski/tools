@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional
@@ -44,9 +45,13 @@ TERMINAL_STATUSES = frozenset({JobStatus.CANCELLED, JobStatus.MERGED})
 
 ALLOWED_TRANSITIONS = {
     JobStatus.QUEUED: {JobStatus.PREPARING, JobStatus.CANCELLED},
+    # Round-38 F3: every worker-active state can hit the whole-job runtime
+    # deadline — a hung provider call is equally possible while preparing
+    # the worktree or verifying as while the agent runs.
     JobStatus.PREPARING: {
         JobStatus.RUNNING, JobStatus.NEEDS_HUMAN, JobStatus.RECOVERING,
         JobStatus.ENVIRONMENT_ERROR, JobStatus.FAILED, JobStatus.CANCELLED,
+        JobStatus.TIMED_OUT,
     },
     JobStatus.RUNNING: {
         JobStatus.NEEDS_HUMAN, JobStatus.VERIFYING, JobStatus.RECOVERING,
@@ -59,7 +64,7 @@ ALLOWED_TRANSITIONS = {
     JobStatus.VERIFYING: {
         JobStatus.READY_FOR_REVIEW, JobStatus.QUEUED, JobStatus.RUNNING,
         JobStatus.NEEDS_HUMAN, JobStatus.RECOVERING, JobStatus.CONFLICTED,
-        JobStatus.FAILED, JobStatus.CANCELLED,
+        JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.TIMED_OUT,
     },
     # Reviewer feedback is a first-class loop. READY_FOR_REVIEW keeps the same
     # durable job + branch, but its execution worktree has already been retired.
@@ -71,6 +76,7 @@ ALLOWED_TRANSITIONS = {
     },
     JobStatus.RECOVERING: {
         JobStatus.RUNNING, JobStatus.NEEDS_HUMAN, JobStatus.FAILED, JobStatus.CANCELLED,
+        JobStatus.TIMED_OUT,
     },
     JobStatus.CONFLICTED: {
         JobStatus.RUNNING, JobStatus.NEEDS_HUMAN, JobStatus.FAILED, JobStatus.CANCELLED,
@@ -132,16 +138,47 @@ class JobSpec:
         title = str(self.title or "").strip()
         if not title:
             raise ValueError("job title is required")
-        if self.max_cost_usd is not None and float(self.max_cost_usd) <= 0:
+        # Round-35 F8: finiteness + practical upper bounds. NaN passes
+        # `<= 0` comparisons and later defeats every budget check; absurd
+        # integers create effectively unbounded runs / resource fan-out.
+        max_cost_usd = (
+            float(self.max_cost_usd) if self.max_cost_usd is not None else None
+        )
+        max_runtime_seconds = (
+            int(self.max_runtime_seconds)
+            if self.max_runtime_seconds is not None
+            else None
+        )
+        max_iterations = (
+            int(self.max_iterations) if self.max_iterations is not None else None
+        )
+        max_retries = int(self.max_retries)
+        max_subagents = (
+            int(self.max_subagents) if self.max_subagents is not None else None
+        )
+        if max_cost_usd is not None and not math.isfinite(max_cost_usd):
+            raise ValueError("max_cost_usd must be finite")
+        if max_cost_usd is not None and max_cost_usd <= 0:
             raise ValueError("max_cost_usd must be positive")
-        if self.max_runtime_seconds is not None and int(self.max_runtime_seconds) <= 0:
-            raise ValueError("max_runtime_seconds must be positive")
-        if self.max_iterations is not None and int(self.max_iterations) <= 0:
-            raise ValueError("max_iterations must be positive")
-        if int(self.max_retries) < 0:
-            raise ValueError("max_retries cannot be negative")
-        if self.max_subagents is not None and int(self.max_subagents) < 0:
-            raise ValueError("max_subagents cannot be negative")
+        if max_cost_usd is not None and max_cost_usd > 1_000_000.0:
+            raise ValueError("max_cost_usd exceeds the supported maximum (1,000,000)")
+        if max_runtime_seconds is not None:
+            if max_runtime_seconds <= 0:
+                raise ValueError("max_runtime_seconds must be positive")
+            if max_runtime_seconds > 7 * 24 * 3600:
+                raise ValueError("max_runtime_seconds exceeds the supported maximum (7 days)")
+        if max_iterations is not None:
+            if max_iterations <= 0:
+                raise ValueError("max_iterations must be positive")
+            if max_iterations > 100_000:
+                raise ValueError("max_iterations exceeds the supported maximum (100,000)")
+        if not (0 <= max_retries <= 100):
+            raise ValueError("max_retries must be between 0 and 100")
+        if max_subagents is not None:
+            if max_subagents < 0:
+                raise ValueError("max_subagents cannot be negative")
+            if max_subagents > 10_000:
+                raise ValueError("max_subagents exceeds the supported maximum (10,000)")
         return JobSpec(
             title=title,
             description=str(self.description or "").strip(),

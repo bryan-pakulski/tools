@@ -255,6 +255,21 @@ def provider_generate_with_retry(
 
     attempt = 0
     elapsed = 0.0
+    # Round-15 F13: baseline so we can detect a pre_provider_call hook
+    # (auto-compactor crossing its threshold) that rolled/compacted
+    # session_manager.history AFTER the caller assembled `messages` from
+    # it — the in-memory list would otherwise go to the wire stale,
+    # re-sending already-summarized content verbatim and defeating the
+    # compaction for this call.
+    # Round-17 F24: length alone is NOT a sufficient trigger — the rolling
+    # compaction path (roll_history_summary_to_token_budget) advances
+    # summary_anchor / conversation_summary WITHOUT shrinking the history
+    # list, so a length-only check missed that compaction entirely.
+    # Snapshot the compaction-visible triple instead.
+    hist_len_before_hooks = len(session.session_manager.history)
+    anchor_before_hooks = getattr(
+        session.session_manager, "summary_anchor", 0
+    )
 
     while True:
         try:
@@ -272,6 +287,30 @@ def provider_generate_with_retry(
             if abort is not None:
                 session._record_hook_abort("pre_provider_call", abort)
                 raise _HookAbort(session._hook_abort_reason)
+
+            if (
+                len(session.session_manager.history) != hist_len_before_hooks
+                or getattr(
+                    session.session_manager, "summary_anchor", 0
+                ) != anchor_before_hooks
+            ):
+                # History changed under us (hook compaction or append) —
+                # rebuild the wire messages from live history. Mirrors the
+                # caller's build (runtime slice + trailing sentinel
+                # stripped); on any fake/legacy session lacking the
+                # builder, keep the original messages.
+                try:
+                    _live_recent = session._prepare_runtime_history(
+                        turn_start_index=getattr(
+                            session, "_current_turn_start_index", None
+                        )
+                    )
+                    messages = session._build_messages_from_history(
+                        _live_recent,
+                        {"role": "system", "parts": []},
+                    )[:-1]
+                except AttributeError:
+                    pass
 
             renderer = build_default_renderer(session.ui)
             events = session.provider.stream(

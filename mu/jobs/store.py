@@ -176,6 +176,11 @@ class JobStore:
         normalized = spec.normalized()
         now = float(self._clock())
         identifier = job_id or uuid.uuid4().hex
+        # Job ids feed worktree/evidence/receipt paths; reject ids that
+        # could escape those roots (absolute paths, '..', separators).
+        from .verification import ensure_safe_job_id
+
+        ensure_safe_job_id(identifier)
         with self._transaction() as conn:
             conn.execute(
                 """
@@ -251,6 +256,51 @@ class JobStore:
             conn.close()
         return [self._job_from_row(row) for row in rows]
 
+    def list_unarchived_jobs(
+        self,
+        *,
+        statuses: Optional[Iterable[JobStatus | str]] = None,
+        limit: int = 200,
+    ) -> List[Job]:
+        """Jobs not archived in job_management (round-49 F10).
+
+        The archived filter runs as a NOT EXISTS subquery — the board
+        previously materialized the entire archived-id set in Python on
+        every GUI poll, and that set grows without bound.
+        """
+        params: List[Any] = []
+        query = (
+            "SELECT * FROM jobs WHERE NOT EXISTS ("
+            "SELECT 1 FROM job_management m WHERE m.job_id = jobs.id "
+            "AND m.archived_at IS NOT NULL)"
+        )
+        if statuses:
+            values = [coerce_status(status).value for status in statuses]
+            query += " AND status IN (%s)" % ",".join("?" for _ in values)
+            params.extend(values)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        conn = self._connect()
+        try:
+            try:
+                rows = conn.execute(query, params).fetchall()
+            except sqlite3.OperationalError:
+                # job_management is created lazily by JobManagementService —
+                # a store touched before any management op has no table, so
+                # nothing is archived and the plain listing applies.
+                fallback = "SELECT * FROM jobs"
+                fallback_params: List[Any] = []
+                if statuses:
+                    values = [coerce_status(status).value for status in statuses]
+                    fallback += " WHERE status IN (%s)" % ",".join("?" for _ in values)
+                    fallback_params.extend(values)
+                fallback += " ORDER BY updated_at DESC LIMIT ?"
+                fallback_params.append(max(1, min(int(limit), 1000)))
+                rows = conn.execute(fallback, fallback_params).fetchall()
+        finally:
+            conn.close()
+        return [self._job_from_row(row) for row in rows]
+
     def transition(
         self,
         job_id: str,
@@ -273,6 +323,18 @@ class JobStore:
             if expected_version is not None and version != int(expected_version):
                 raise RuntimeError(
                     f"job {job_id} version changed: expected {expected_version}, found {version}"
+                )
+            # Validate the transition against the row actually observed
+            # inside this write transaction — not a snapshot read earlier —
+            # so a concurrent cancellation/recovery cannot be overwritten by
+            # a transition that is illegal from the true current state.
+            from .models import can_transition
+
+            if current != target_status and not can_transition(current, target_status):
+                from .service import JobStateError
+
+                raise JobStateError(
+                    f"cannot transition job {job_id} from {current.value} to {target_status.value}"
                 )
 
             attention = (
@@ -354,6 +416,48 @@ class JobStore:
             )
         return self.get_event(event_id)
 
+    def claim_interaction_response(
+        self,
+        job_id: str,
+        response_event_id: int,
+        *,
+        kind: str = "",
+        tool_name: str = "",
+    ) -> bool:
+        """Round-41 F7: atomically claim an interaction response. Exactly
+        ONE caller across all JobUI instances/processes wins: the consumed
+        marker is inserted inside a write transaction only if no earlier
+        consumption of the same response_event_id exists. The losing
+        claimant writes nothing and must re-poll for new input.
+
+        This IS the consumption event (round-41 F7 fix-up): the caller
+        must NOT append a second interaction_response_consumed event, or
+        downstream consumers counting consumed markers double-count."""
+        now = float(self._clock())
+        with self._transaction() as conn:
+            if conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone() is None:
+                raise KeyError(job_id)
+            already = conn.execute(
+                """
+                SELECT 1 FROM job_events
+                WHERE job_id = ? AND event_type = 'interaction_response_consumed'
+                  AND json_extract(payload_json, '$.response_event_id') = ?
+                """,
+                (job_id, int(response_event_id)),
+            ).fetchone()
+            if already is not None:
+                return False
+            self._insert_event(
+                conn, job_id, "interaction_response_consumed", None, None, "",
+                {
+                    "response_event_id": int(response_event_id),
+                    "kind": str(kind or ""),
+                    "tool_name": str(tool_name or ""),
+                },
+                now,
+            )
+        return True
+
     def get_event(self, event_id: int) -> JobEvent:
         conn = self._connect()
         try:
@@ -414,6 +518,142 @@ class JobStore:
             )
             return cursor.rowcount == 1
 
+    def assert_lease(self, job_id: str, worker_id: str) -> bool:
+        """Transactional ownership check: True iff worker_id currently owns
+        the job's lease AND the lease has not expired, evaluated inside a
+        write transaction. Used by workers/verifiers as the final gate
+        before applying results.
+
+        Round-36 F2: an expired lease is NOT ownership. Without the expiry
+        clause, a worker whose heartbeat thread died (GC pause, blocked
+        event loop) passed this gate and applied results to a job whose
+        lease had already lapsed — racing the takeover worker."""
+        now = float(self._clock())
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT worker_id, lease_expires_at FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None or row["worker_id"] != worker_id:
+                return False
+            expires = row["lease_expires_at"]
+            return expires is not None and float(expires) >= now
+
+    def finish_attempt_owned(
+        self,
+        attempt_id: str,
+        *,
+        worker_id: str,
+        status: str,
+        error: str = "",
+        cost_usd: float = 0.0,
+        metadata: Optional[Dict[str, Any]] = None,
+        target_status: Optional["JobStatus"] = None,
+        transition_reason: str = "",
+        transition_payload: Optional[Dict[str, Any]] = None,
+        attention_reason: Optional["AttentionReason"] = None,
+        attention_detail: str = "",
+        cost_add: float = 0.0,
+    ) -> bool:
+        """Round-36 F2: lease-conditioned atomic attempt finish + optional
+        job transition. Returns False (nothing written) when the job's
+        lease is no longer held unexpired by `worker_id` — closing the
+        check-then-act window between assert_lease() and finish_attempt()
+        where a takeover could acquire the lease and this worker would
+        still stamp its superseded outcome onto the replacement's state.
+
+        When target_status is given, the transition runs in the SAME
+        transaction, revalidating can_transition against the row observed
+        under the lock (a cancelled/merged job is left untouched and False
+        is returned only if the lease itself was lost)."""
+        from .models import JobStatus as _JS, can_transition
+        from .service import JobStateError
+
+        now = float(self._clock())
+        with self._transaction() as conn:
+            attempt_row = conn.execute(
+                "SELECT * FROM job_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if attempt_row is None:
+                return False
+            job_id = attempt_row["job_id"]
+            row = conn.execute(
+                "SELECT worker_id, lease_expires_at FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["worker_id"] != worker_id:
+                return False
+            expires = row["lease_expires_at"]
+            if expires is None or float(expires) < now:
+                return False
+            combined = _loads(attempt_row["metadata_json"], {})
+            combined.update(metadata or {})
+            # Round-40 F1: accumulate job cost INSIDE the same
+            # lease-conditioned transaction — a superseded worker must not
+            # add its cost to the replacement's job. The resulting total is
+            # stamped into the attempt metadata (callers no longer need a
+            # separate pre-transaction cost read).
+            new_total = float(cost_usd)
+            if cost_add:
+                cost_row = conn.execute(
+                    "SELECT cost_usd FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                new_total = float(cost_row["cost_usd"] or 0.0) + max(0.0, float(cost_add or 0.0))
+                conn.execute(
+                    "UPDATE jobs SET cost_usd = ?, updated_at = ? WHERE id = ?",
+                    (new_total, now, job_id),
+                )
+                combined.setdefault("total_job_cost_usd", new_total)
+            conn.execute(
+                """
+                UPDATE job_attempts SET status = ?, finished_at = ?, error = ?,
+                    cost_usd = ?, metadata_json = ? WHERE id = ?
+                """,
+                (str(status), now, str(error or ""), float(cost_usd), _json(combined), attempt_id),
+            )
+            self._insert_event(
+                conn, job_id, "attempt_finished", None, None, str(status),
+                {"attempt_id": attempt_id, "cost_usd": float(cost_usd), "error": str(error or "")}, now,
+            )
+            if target_status is not None:
+                target = coerce_status(target_status)
+                current = JobStatus(conn.execute(
+                    "SELECT status FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()["status"])
+                if current != target and not can_transition(current, target):
+                    raise JobStateError(
+                        f"cannot transition job {job_id} from {current.value} to {target.value}"
+                    )
+                attention_value = (
+                    attention_reason.value
+                    if isinstance(attention_reason, AttentionReason)
+                    else (str(attention_reason) if attention_reason else None)
+                )
+                if attention_value is not None:
+                    conn.execute(
+                        """
+                        UPDATE jobs SET status = ?, attention_reason = ?,
+                            attention_detail = ?, updated_at = ?, version = version + 1
+                        WHERE id = ?
+                        """,
+                        (target.value, attention_value, str(attention_detail or ""), now, job_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE jobs SET status = ?, updated_at = ?, version = version + 1
+                        WHERE id = ?
+                        """,
+                        (target.value, now, job_id),
+                    )
+                self._insert_event(
+                    conn, job_id, "status_changed", current, target,
+                    transition_reason, transition_payload or {}, now,
+                )
+        return True
+
     def release_lease(self, job_id: str, worker_id: str, *, reason: str = "") -> bool:
         now = float(self._clock())
         with self._transaction() as conn:
@@ -433,7 +673,41 @@ class JobStore:
             )
         return True
 
-    def expired_leases(self, *, now: Optional[float] = None) -> List[Job]:
+    def release_expired_lease(
+        self, job_id: str, worker_id: str, *, reason: str = ""
+    ) -> bool:
+        """CAS release: clear the lease only if it is still held by
+        `worker_id` AND still expired at write time. Prevents the TOCTOU
+        where a worker renews its lease between the caller's
+        `expired_leases()` read and this release, losing the fresh lease."""
+        now = float(self._clock())
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs SET worker_id = '', lease_expires_at = NULL, heartbeat_at = ?,
+                    updated_at = ?, version = version + 1
+                WHERE id = ? AND worker_id = ?
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at < ?
+                """,
+                (now, now, job_id, worker_id, now),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._insert_event(
+                conn, job_id, "worker_lease_released", None, None, reason,
+                {"worker_id": worker_id}, now,
+            )
+        return True
+
+    def expired_leases(self, *, now: Optional[float] = None, limit: int = 100) -> List[Job]:
+        """Expired leases, oldest expiry first, BOUNDED (round-49 F11).
+
+        Recovery after downtime previously materialized EVERY expired lease
+        in one query — hundreds of jobs made the restart pass unbounded
+        (plus a per-job attempt query downstream). Bounded batches ordered
+        by expiry let the controller drain the backlog incrementally per
+        poll; callers needing the full set pass a larger limit.
+        """
         timestamp = float(self._clock() if now is None else now)
         conn = self._connect()
         try:
@@ -442,8 +716,9 @@ class JobStore:
                 SELECT * FROM jobs
                 WHERE worker_id != '' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?
                 ORDER BY lease_expires_at ASC
+                LIMIT ?
                 """,
-                (timestamp,),
+                (timestamp, max(1, min(int(limit), 500))),
             ).fetchall()
         finally:
             conn.close()

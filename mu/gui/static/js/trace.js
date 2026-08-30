@@ -71,6 +71,8 @@ function traceApp() {
                     context_actual: [], context_est: [],
                     meta: { layers: [], labels: {}, layer_vmax: {}, n: 0 } },
         loading: false,
+        // Round-48 F16: opt-in "all runs" — bounded by default (newest 5).
+        allRuns: false,
         selectedIter: null,
         selectedTool: null,
         driftLog: false,        // signed-log y scale for the drift chart
@@ -112,12 +114,17 @@ function traceApp() {
         async loadSession() {
             // Combined multi-run view: every run in the session merged into
             // one series/summary/snapshot, with run_bounds for boundary markers.
+            // Round-47 F15 + Round-48 F16: default fetch is bounded to the
+            // NEWEST 5 runs; this.allRuns (user opt-in) widens to every run
+            // in the session — the analyzer must not lose access to older
+            // runs just because the default payload is bounded.
             this.loading = true;
             this.selectedIter = null;
             this.selectedTool = null;
             try {
+                const limit = this.allRuns ? 0 : 5;
                 const r = await fetch(
-                    "/api/traces/session/" + encodeURIComponent(this.session) + "?cols=256"
+                    "/api/traces/session/" + encodeURIComponent(this.session) + "?cols=256&limit=" + limit
                 );
                 if (!r.ok) { this.summary = null; return; }
                 const d = await r.json();
@@ -1389,6 +1396,23 @@ function traceApp() {
         // tokens kept out of context by storing raw externally + observing.
         effSummary() {
             return (this.summary && this.summary.efficiency) || {};
+        },
+        // Ranked harness-suspects digest from build_summary (same block the
+        // trace tools return). Empty for clean runs -> section stays hidden.
+        suspectsList() {
+            return (this.summary && this.summary.suspects) || [];
+        },
+        // Jump from a suspect card to the evidence: map suspect -> panel.
+        // Compaction rows live in the compaction timeline; drift in the
+        // drift chart; everything else jumps to the first affected
+        // iteration recorded on the suspect itself.
+        suspectJump(s) {
+            const m = /iters? \[([0-9,\s]+)\]/.exec(s.next || "");
+            if (m) {
+                const first = m[1].split(",")[0].trim();
+                if (first) { this.selectIter(parseInt(first, 10)); return; }
+            }
+            window.scrollTo({ top: 0, behavior: "smooth" });
         },
         renderEfficiency() {
             const s = this._setupCanvas("effCanvas"); if (!s) return;

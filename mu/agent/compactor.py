@@ -34,14 +34,18 @@ def _compact_history(ctx: HookContext) -> Optional[HookResult]:
     if session is None:
         return None
     variables = getattr(session, "variables", None) or ctx.variables or {}
-    # Manual/model-directed `compact` is the default. Retain this hook only
-    # for deployments that explicitly choose automatic proactive trimming.
-    if not bool(variables.get("auto_compaction_enabled", False)):
-        return None
     session_manager = getattr(session, "session_manager", None)
     if session_manager is None or not hasattr(
         session_manager, "roll_history_summary_to_token_budget"
     ):
+        return None
+    # Opt-in gate (codex round-9 F3): proactive auto-compaction is an
+    # explicit deployment opt-in — `auto_compaction_enabled` gates the
+    # turn-start roll in loop_body, so it must gate this hook too, or a
+    # session with the flag off would still compact mid-turn once history
+    # crossed the watermark. Emergency preflight and reactive-overflow
+    # recovery do NOT go through this hook and stay unconditional.
+    if not variables.get("auto_compaction_enabled", False):
         return None
 
     # Once-per-turn proactive-compaction gate (Claude Code fires autocompact
@@ -80,7 +84,11 @@ def _compact_history(ctx: HookContext) -> Optional[HookResult]:
         # Do NOT multiply by `threshold` again here — the prior `* threshold`
         # double-applied it, collapsing the target from 85% to ~72% of the
         # residual window and triggering compaction far too often.
-        budget = int(session._compaction_token_budget())
+        # Zero capacity (non-L5 layers + reserve >= window) means compaction
+        # cannot help — the fixed prompt itself must shrink. Return None so
+        # the caller reports the condition instead of looping.
+        raw_budget = int(session._compaction_token_budget())
+        budget = raw_budget if raw_budget > 0 else None
     else:
         try:
             context_limit = max(

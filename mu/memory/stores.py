@@ -258,6 +258,76 @@ class BaseNoteStore:
             (entry for entry in self.entries if entry.id == entry_id), None
         )
 
+    def import_entries(self, items: List[Dict[str, Any]]) -> List[MemoryEntry]:
+        """Import serialized entries with collision-safe id remapping.
+
+        Used by the session-manager conflict path to restore entries a
+        turn captured locally. The numeric id space is session-local,
+        so an imported id may already exist (a concurrent surface
+        appended a different entry with the same counter value): such
+        items get a FRESH id. Cross-entry references (supersedes /
+        superseded_by) inside the batch are remapped to the fresh ids.
+        Returns the imported entries (new ids for remapped items).
+        """
+        if not items:
+            return []
+        existing_ids = {entry.id for entry in self.entries}
+        # Round-25 F2: allocate one id PER ITEM (a list keyed by item
+        # index), not per id. Duplicate ids within the batch — or two
+        # items both lacking an id — previously overwrote each other's
+        # id_map entry, so both entries landed on the same fresh id in
+        # the second pass.
+        item_ids: List[int] = []
+        assigned: List[int] = []
+
+        def _fresh() -> int:
+            fresh = max(existing_ids) + 1 if existing_ids else 1
+            existing_ids.add(fresh)
+            return fresh
+
+        for item in items:
+            try:
+                item_id = int(item.get("id", 0))
+            except (TypeError, ValueError):
+                item_id = 0
+            item_ids.append(item_id)
+            if item_id and item_id not in existing_ids:
+                assigned.append(item_id)
+                existing_ids.add(item_id)
+            else:
+                assigned.append(_fresh())
+        # Reference remap: first item claiming an id wins; a later
+        # item whose id collided got a fresh id, so refs to the
+        # ORIGINAL id resolve to the first claimant. Kept ids map to
+        # themselves; ids outside the batch fall through unchanged.
+        ref_map: Dict[int, int] = {}
+        for item_id, new_id in zip(item_ids, assigned):
+            if item_id and item_id not in ref_map:
+                ref_map[item_id] = new_id
+
+        def _remap(ref: Optional[int]) -> Optional[int]:
+            if ref is None:
+                return None
+            try:
+                return ref_map.get(int(ref), int(ref))
+            except (TypeError, ValueError):
+                return ref
+
+        imported: List[MemoryEntry] = []
+        for item, item_id, new_id in zip(items, item_ids, assigned):
+            entry = MemoryEntry.from_dict(item)
+            entry.id = new_id
+            entry.supersedes = _remap(entry.supersedes)
+            entry.superseded_by = _remap(entry.superseded_by)
+            imported.append(entry)
+            existing_ids.add(entry.id)
+        self.entries.extend(imported)
+        max_id = max(entry.id for entry in self.entries)
+        if self._next_id <= max_id:
+            self._next_id = max_id + 1
+        self._enforce_limit()
+        return imported
+
     def update_status(self, entry_id: int, status: str) -> Optional[MemoryEntry]:
         if status not in ALLOWED_STATUSES:
             return None

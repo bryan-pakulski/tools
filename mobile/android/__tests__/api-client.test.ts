@@ -104,7 +104,12 @@ describe('API client', () => {
       (fetch as jest.Mock).mockResolvedValue({ ok: true });
       const result = await checkHealth('http://test:8000');
       expect(result).toBe(true);
-      expect(fetch).toHaveBeenCalledWith('http://test:8000/healthz', { method: 'GET' });
+      // checkHealth passes an AbortSignal for its 5s timeout — assert URL and
+      // method, with the signal covered by expect.objectContaining.
+      expect(fetch).toHaveBeenCalledWith(
+        'http://test:8000/healthz',
+        expect.objectContaining({ method: 'GET' }),
+      );
     });
 
     it('returns false on fetch error', async () => {

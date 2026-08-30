@@ -15,6 +15,21 @@ import json
 from typing import Any, Dict, List, Tuple
 
 
+def _artifact_identifier(tool_name: str, args: Dict[str, Any], result: str) -> str:
+    """Stable opaque identifier for one deferred result.
+
+    Exposed to the model and trace. Derived from the tool name, args, and the
+    FULL raw result, so identical evidence keeps a stable id across turns.
+    """
+    payload = json.dumps([tool_name, args, result], default=str, sort_keys=True)
+    return "ctx_" + hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+def _result_byte_count(result: str) -> int:
+    """UTF-8 byte length of a deferred result (replacement-char safe)."""
+    return len(result.encode("utf-8", errors="replace"))
+
+
 class CollationBuffer:
     """Collects tool outputs until the user triggers a flush.
 
@@ -26,6 +41,14 @@ class CollationBuffer:
         # A deferred result is evidence, not a cache entry. Keep it until the
         # model explicitly delivers or discards it.
         self.entries: List[Tuple[str, Dict[str, Any], str]] = []
+        # Cached manifest rows, same order as self.entries. Each entry's
+        # artifact id (json serialize + sha256 over the FULL raw result) and
+        # UTF-8 byte count are computed exactly once — in add()/from_dict() —
+        # instead of being re-derived on every manifest() call. The loop calls
+        # manifest()[-1] after every add; recomputing identifiers there made
+        # cumulative manifest() cost Theta(N^2) and re-hashed megabyte-scale
+        # unchanged evidence on every turn.
+        self._manifest_cache: List[Dict[str, Any]] | None = None
 
     # ---------------------------------------------------------------------
     # Persistence helpers
@@ -54,6 +77,7 @@ class CollationBuffer:
                     entry.get("result", ""),
                 )
             )
+        buf._manifest_cache = buf._build_manifest()
         return buf
 
     # ---------------------------------------------------------------------
@@ -62,19 +86,56 @@ class CollationBuffer:
     def add(self, tool_name: str, args: Dict[str, Any], result: str) -> None:
         """Add a result; only explicit model cleanup removes it."""
         self.entries.append((tool_name, args, result))
+        if self._manifest_cache is not None:
+            self._manifest_cache.append(
+                {
+                    "id": _artifact_identifier(tool_name, args, result),
+                    "tool_name": tool_name,
+                    "args": args,
+                    "bytes": _result_byte_count(result),
+                }
+            )
+        else:
+            # Cache invalidated by a partial removal since the last build —
+            # stay invalidated; the next manifest() rebuilds once.
+            pass
+
+    def _build_manifest(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "id": _artifact_identifier(name, args, result),
+                "tool_name": name,
+                "args": args,
+                "bytes": _result_byte_count(result),
+            }
+            for name, args, result in self.entries
+        ]
 
     def artifact_id(self, index: int) -> str:
         """Stable opaque identifier exposed to the model and trace."""
+        if self._manifest_cache is not None:
+            return self._manifest_cache[index]["id"]
         name, args, result = self.entries[index]
-        payload = json.dumps([name, args, result], default=str, sort_keys=True)
-        return "ctx_" + hashlib.sha256(payload.encode()).hexdigest()[:12]
+        return _artifact_identifier(name, args, result)
 
     def manifest(self) -> List[Dict[str, Any]]:
-        return [
-            {"id": self.artifact_id(i), "tool_name": name, "args": args,
-             "bytes": len(result.encode("utf-8", errors="replace"))}
-            for i, (name, args, result) in enumerate(self.entries)
-        ]
+        if self._manifest_cache is None:
+            self._manifest_cache = self._build_manifest()
+        return self._manifest_cache
+
+    def last_manifest_entry(self) -> Dict[str, Any] | None:
+        """Newest manifest row without recomputing any identifiers.
+
+        Returns ``None`` when the buffer is empty. Callers that only need the
+        latest entry (e.g. the deferred-result announcement after ``add()``)
+        use this instead of ``manifest()[-1]`` so no per-entry metadata is
+        recomputed and no full list is copied.
+        """
+        if not self.entries:
+            return None
+        if self._manifest_cache is None:
+            self._manifest_cache = self._build_manifest()
+        return self._manifest_cache[-1]
 
     def flush_selected(self, artifact_ids: List[str] | None = None) -> List[Tuple[str, str]]:
         """Deliver selected artifacts (or all) and remove only those entries."""
@@ -89,7 +150,9 @@ class CollationBuffer:
                 selected.append((aid, header))
             else:
                 kept.append(entry)
-        self.entries = kept
+        if len(kept) != len(self.entries):
+            self.entries = kept
+            self._manifest_cache = None
         return selected
 
     def discard(self, artifact_ids: List[str]) -> List[str]:
@@ -102,5 +165,7 @@ class CollationBuffer:
                 removed.append(aid)
             else:
                 kept.append(entry)
-        self.entries = kept
+        if removed:
+            self.entries = kept
+            self._manifest_cache = None
         return removed

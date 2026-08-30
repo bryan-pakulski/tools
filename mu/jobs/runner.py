@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import copy
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict
 
+from mu.session.manager import RevisionConflict
 from mu.ui.exceptions import InteractionRequired
 from utils.model_pricing import estimate_model_cost
 
@@ -252,7 +254,26 @@ class SessionJobRunner:
             session.variables["durable_job_base_sha"] = job.base_sha
             if job.max_iterations is not None:
                 session.variables["max_iterations"] = int(job.max_iterations)
-            session.session_manager.save_history(session.folder_context)
+            # Round-16 F18: durable-job sessions live in the same sessions
+            # directory as user sessions — saving without expected_revision
+            # selects LWW and can silently overwrite a concurrent GUI/CLI
+            # write to this session document. CAS against the revision we
+            # loaded; on conflict SKIP this pre-run save (the job variables
+            # are already in memory for this run; the finally-block save
+            # persists them) instead of clobbering the newer document.
+            expected = int(
+                getattr(session.session_manager, "revision", 0) or 0
+            )
+            try:
+                session.session_manager.save_history(
+                    session.folder_context, expected_revision=expected
+                )
+            except RevisionConflict as exc:
+                logging.getLogger("mucli").warning(
+                    "Job %s: session revision conflict on initial save "
+                    "(disk=%s); skipping pre-run save",
+                    job.id, getattr(exc, "current", "?"),
+                )
             self.service.store.update_runtime_fields(
                 job.id, session_name=self.session_name(job)
             )
@@ -305,7 +326,22 @@ class SessionJobRunner:
         finally:
             if session is not None:
                 try:
-                    session.session_manager.save_history(session.folder_context)
+                    # Round-16 F18: CAS the final save too — same
+                    # last-writer-wins hazard as the pre-run save; on
+                    # conflict, the concurrent writer's newer document
+                    # wins and we log instead of clobbering it.
+                    expected = int(
+                        getattr(session.session_manager, "revision", 0) or 0
+                    )
+                    session.session_manager.save_history(
+                        session.folder_context, expected_revision=expected
+                    )
+                except RevisionConflict as exc:
+                    logging.getLogger("mucli").warning(
+                        "Job %s: session revision conflict on final save "
+                        "(disk=%s); concurrent writer wins",
+                        job.id, getattr(exc, "current", "?"),
+                    )
                 except Exception:
                     pass
                 try:
