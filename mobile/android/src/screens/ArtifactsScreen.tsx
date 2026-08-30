@@ -4,7 +4,6 @@ import {
   Alert,
   AppState,
   FlatList,
-  Linking,
   Modal,
   RefreshControl,
   StyleSheet,
@@ -13,10 +12,12 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { SafeAreaModal } from '../components/SafeAreaModal';
 import { Ionicons } from '@expo/vector-icons';
 import * as DocumentPicker from 'expo-document-picker';
 import { WebView } from 'react-native-webview';
 import { ArtifactDescriptor, artifactsApi } from '../api/artifacts';
+import { openExternalUrl } from '../api/urlSafety';
 import { attachmentsApi, type AttachmentDescriptor, type PickedDocument } from '../api/attachments';
 import { useConnectionStore } from '../store/connection';
 import { useTheme } from '../theme/ThemeContext';
@@ -45,6 +46,11 @@ export function ArtifactsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [viewingArtifact, setViewingArtifact] = useState<ArtifactDescriptor | null>(null);
+
+  // Stable exact URL the artifact WebView is allowed to load (nav gate).
+  const artifactUri = viewingArtifact
+    ? artifactsApi.viewUrl(sessionName as string, viewingArtifact.artifact_id)
+    : '';
 
   const load = useCallback(async () => {
     if (!sessionName) {
@@ -188,7 +194,7 @@ export function ArtifactsScreen() {
             </Text>
           </View>
           <TouchableOpacity
-            onPress={() => sessionName && Linking.openURL(artifactsApi.downloadUrl(sessionName, a.artifact_id))}
+            onPress={() => sessionName && openExternalUrl(artifactsApi.downloadUrl(sessionName, a.artifact_id))}
             style={styles.rowAction}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
             accessibilityRole="button"
@@ -211,7 +217,7 @@ export function ArtifactsScreen() {
       const a = item.artifact;
       return (
         <TouchableOpacity
-          onPress={() => sessionName && Linking.openURL(artifactsApi.downloadUrl(sessionName, a.artifact_id))}
+          onPress={() => sessionName && openExternalUrl(artifactsApi.downloadUrl(sessionName, a.artifact_id))}
           style={[styles.row, { borderBottomColor: colors.border }]}
           activeOpacity={0.7}
         >
@@ -227,7 +233,7 @@ export function ArtifactsScreen() {
             </Text>
           </View>
           <TouchableOpacity
-            onPress={() => sessionName && Linking.openURL(artifactsApi.downloadUrl(sessionName, a.artifact_id))}
+            onPress={() => sessionName && openExternalUrl(artifactsApi.downloadUrl(sessionName, a.artifact_id))}
             style={styles.rowAction}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
           >
@@ -248,7 +254,7 @@ export function ArtifactsScreen() {
     const u = item.attachment;
     return (
       <TouchableOpacity
-        onPress={() => sessionName && Linking.openURL(attachmentsApi.downloadUrl(sessionName, u.attachment_id))}
+        onPress={() => sessionName && openExternalUrl(attachmentsApi.downloadUrl(sessionName, u.attachment_id))}
         style={[styles.row, { borderBottomColor: colors.border }]}
         activeOpacity={0.7}
       >
@@ -264,7 +270,7 @@ export function ArtifactsScreen() {
           </Text>
         </View>
         <TouchableOpacity
-          onPress={() => sessionName && Linking.openURL(attachmentsApi.downloadUrl(sessionName, u.attachment_id))}
+          onPress={() => sessionName && openExternalUrl(attachmentsApi.downloadUrl(sessionName, u.attachment_id))}
           style={styles.rowAction}
           hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
         >
@@ -347,7 +353,7 @@ export function ArtifactsScreen() {
       />
 
       {/* In-app visualization viewer */}
-      <Modal
+      <SafeAreaModal
         visible={viewingArtifact !== null}
         animationType="fade"
         presentationStyle="fullScreen"
@@ -366,7 +372,7 @@ export function ArtifactsScreen() {
             </View>
             {sessionName && viewingArtifact && (
               <TouchableOpacity
-                onPress={() => Linking.openURL(artifactsApi.downloadUrl(sessionName, viewingArtifact.artifact_id))}
+                onPress={() => openExternalUrl(artifactsApi.downloadUrl(sessionName, viewingArtifact.artifact_id))}
                 style={[styles.iconButton, { backgroundColor: colors.bgHover }]}
                 accessibilityRole="button"
                 accessibilityLabel="Download visualization"
@@ -385,19 +391,38 @@ export function ArtifactsScreen() {
           </View>
           {sessionName && viewingArtifact && (
             <WebView
-              source={{ uri: artifactsApi.viewUrl(sessionName, viewingArtifact.artifact_id) }}
+              source={{ uri: artifactUri }}
               style={{ flex: 1, backgroundColor: '#ffffff' }}
+              originWhitelist={['http://*', 'https://*']}
               javaScriptEnabled
               domStorageEnabled
               cacheEnabled={false}
+              // Same hardening as VisualizationCard's InteractiveWebView: an
+              // artifact is untrusted active content — confine it to the exact
+              // backend URL, no cookies/file access, no mixed content.
+              incognito
+              sharedCookiesEnabled={false}
+              thirdPartyCookiesEnabled={false}
+              allowFileAccess={false}
+              allowUniversalAccessFromFileURLs={false}
+              javaScriptCanOpenWindowsAutomatically={false}
+              setSupportMultipleWindows={false}
+              mixedContentMode="never"
               scrollEnabled
               nestedScrollEnabled
               showsVerticalScrollIndicator
               showsHorizontalScrollIndicator
+              onShouldStartLoadWithRequest={(request) => {
+                if (request.url === artifactUri || request.url === 'about:blank') return true;
+                // Any other navigation attempt goes to the OS browser instead
+                // (http/https only — see openExternalUrl).
+                openExternalUrl(request.url);
+                return false;
+              }}
             />
           )}
         </SafeAreaView>
-      </Modal>
+      </SafeAreaModal>
     </SafeAreaView>
   );
 }

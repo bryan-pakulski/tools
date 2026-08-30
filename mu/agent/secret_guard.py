@@ -126,6 +126,20 @@ def _check_command(command: str) -> Optional[str]:
         if denied:
             return f"command references {why}: {token!r}"
 
+    # 1b. Round-28 F1: quoted strings — `python3 -c "open('/home/u/.ssh/
+    # id_rsa')"` hides the path inside a quoted program text where the
+    # tokenizer sees one giant token that matches nothing.
+    for quoted in re.findall(r"['\"]([^'\"]{4,})['\"]", command):
+        denied, why = is_denied_path(quoted)
+        if denied:
+            return f"command references {why}: {quoted!r}"
+        for fragment in re.split(r"['\"()\s]+", quoted):
+            if not fragment or "-" == fragment[:1]:
+                continue
+            denied, why = is_denied_path(fragment)
+            if denied:
+                return f"command references {why}: {fragment!r}"
+
     # 2. Risky-command patterns
     for label, pattern in _RISKY_COMMAND_PATTERNS:
         if pattern.search(command):

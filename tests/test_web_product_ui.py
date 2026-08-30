@@ -85,6 +85,7 @@ def test_rhs_panel_uses_exactly_two_dropdowns_not_scrollable_tabs():
 
 
 def test_product_css_covers_primary_web_surfaces():
+    product = PRODUCT_CSS.read_text(encoding="utf-8")
     combined = ''.join(path.read_text(encoding="utf-8") for path in (
         PRODUCT_CSS, CRYSTAL_CSS, CLARITY_CSS, REFINEMENT_CSS, POPOUT_CSS,
     ))
@@ -98,6 +99,7 @@ def test_product_css_covers_primary_web_surfaces():
     assert 'backdrop-filter' in combined
     assert '@media (max-width: 760px)' in combined
     assert '@media (prefers-reduced-motion: reduce)' in combined
+    assert 'padding: 0 !important;' in product
 
 
 def test_alpine_sunrise_is_atmospheric_not_css_scenery():
@@ -124,7 +126,7 @@ def test_alpine_sunrise_is_atmospheric_not_css_scenery():
 def test_product_javascript_positions_overlays_and_is_presentation_only():
     js = PRODUCT_JS.read_text(encoding="utf-8")
     assert 'installPresentationStylesheet' in js
-    assert "link.href = '/static/css/popouts.css'" in js
+    assert "installPresentationStylesheet('mucli-popouts-css', '/static/css/popouts.css')" in js
     assert 'polishWelcomeCopy' in js
     assert 'focusComposer' in js
     assert 'preserveOverlayGeometry' in js

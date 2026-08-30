@@ -8,7 +8,12 @@ minutes actively failing. Failure states are stopped/resident until retry.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
+
+# Round-42 F6: hard cap on events materialized for the detail layer
+# (mirrors mu/jobs/analysis.py _MAX_EVENTS).
+_MAX_EVENTS = 20_000
 
 from .models import JobEvent
 from .service import JobService
@@ -49,16 +54,25 @@ _ACTIVITY_EVENT_TYPES = {
 
 
 def _all_events(service: JobService, job_id: str) -> List[JobEvent]:
+    """Round-42 F6: bounded event snapshot (mirrors analysis.py cap). The
+    detail layer re-scanned the FULL event history on top of the raw
+    analysis — a long job paid the unbounded load twice. The newest
+    _MAX_EVENTS cover every interval detail (intervals are built from the
+    same tail window)."""
     values: List[JobEvent] = []
     after = 0
+    total_seen = 0
     while True:
         batch = service.events(job_id, after_id=after, limit=5000)
         if not batch:
             break
         values.extend(batch)
+        total_seen += len(batch)
         after = batch[-1].id
-        if len(batch) < 5000:
+        if len(batch) < 5000 or total_seen >= _MAX_EVENTS:
             break
+    if total_seen > _MAX_EVENTS:
+        values = values[-_MAX_EVENTS:]
     return values
 
 
@@ -76,6 +90,26 @@ def _classification(status: str) -> str:
     if status in _TERMINAL:
         return "terminal"
     return "other"
+
+
+def _bounded_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Round-42 F6: cap every preview payload — string fields to 400
+    chars, nested structures to a 2000-char JSON dump. Interval previews
+    previously embedded FULL payloads (agent messages, tool results,
+    trace blobs) for up to 250 events per interval, so the enriched
+    response for a long job serialized megabytes to the GUI."""
+    bounded: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, str):
+            bounded[key] = value[:400]
+        elif isinstance(value, (int, float, bool)) or value is None:
+            bounded[key] = value
+        else:
+            try:
+                bounded[key] = json.dumps(value, ensure_ascii=False, default=str)[:2000]
+            except (TypeError, ValueError):
+                bounded[key] = str(value)[:2000]
+    return bounded
 
 
 def _event_preview(event: JobEvent) -> Dict[str, Any]:
@@ -107,7 +141,9 @@ def _event_preview(event: JobEvent) -> Dict[str, Any]:
         "reason": event.reason,
         "from_status": event.from_status.value if event.from_status else None,
         "to_status": event.to_status.value if event.to_status else None,
-        "payload": payload,
+        # Round-42 F6: bounded payload — full payloads belonged in the
+        # detail drill-down, not 250-per-interval previews.
+        "payload": _bounded_payload(payload),
     }
 
 

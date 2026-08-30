@@ -179,6 +179,35 @@ def save_report(session_id: str, report: SecurityReport) -> SecurityReport:
     return report
 
 
+def _proof_from_dict(data: dict) -> SecurityProof | None:
+    """Round-28 F2: tolerate unknown/stale keys from newer or corrupt
+    reports instead of TypeError-crashing the whole load.
+
+    Round-29 F2: a dict that carries no usable proof (no command AND no
+    expected markers) deserializes to None — a default-constructed
+    proof would sail through verify_proof's empty-marker check and
+    verify a finding with zero evidence.
+    """
+    valid = {f for f in SecurityProof.__dataclass_fields__}
+    try:
+        proof = SecurityProof(**{k: v for k, v in data.items() if k in valid})
+    except (TypeError, ValueError):
+        return None
+    if not str(proof.command or "").strip():
+        return None
+    if not [m for m in (proof.expected_markers or []) if str(m).strip()]:
+        return None
+    return proof
+
+
+def _remediation_from_dict(data: dict) -> SecurityRemediation | None:
+    try:
+        valid = {f for f in SecurityRemediation.__dataclass_fields__}
+        return SecurityRemediation(**{k: v for k, v in data.items() if k in valid})
+    except (TypeError, ValueError):
+        return None
+
+
 def load_report(metadata_path: str) -> SecurityReport | None:
     if not metadata_path or not os.path.isfile(metadata_path):
         return None
@@ -202,9 +231,11 @@ def load_report(metadata_path: str) -> SecurityReport | None:
                 exploit_path=raw.get("exploit_path", ""),
                 references=list(raw.get("references", []) or []),
                 status=raw.get("status", "new"),
-                proof=SecurityProof(**proof) if isinstance(proof, dict) else None,
+                proof=(
+                    _proof_from_dict(proof) if isinstance(proof, dict) else None
+                ),
                 remediation=(
-                    SecurityRemediation(**remediation)
+                    _remediation_from_dict(remediation)
                     if isinstance(remediation, dict)
                     else None
                 ),
@@ -276,7 +307,15 @@ def create_security_report(
 
 
 def _allocate_finding_id(report: SecurityReport) -> str:
-    return f"f{len(report.findings) + 1:03d}"
+    """Round-28 F3: collision-free even after findings are removed —
+    allocate one past the highest existing numeric id, not len()+1
+    (len() re-allocates a removed id and breaks evidence paths)."""
+    highest = 0
+    for finding in report.findings:
+        match = re.fullmatch(r"f(\d+)", finding.finding_id or "")
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return f"f{highest + 1:03d}"
 
 
 def add_finding(
@@ -404,6 +443,12 @@ def verify_proof(
     if finding.proof is None:
         raise ValueError("attach a proof before verifying")
     proof = finding.proof
+    # Round-29 F2: an EMPTY marker list vacuously matches (`not missing`
+    # is True with zero markers) — refuse instead of verifying nothing.
+    if not [m for m in (proof.expected_markers or []) if str(m).strip()]:
+        raise ValueError(
+            "proof has no expected markers — verification would be vacuous"
+        )
     exit_code, stdout, stderr = run_proof_command(proof, cwd=cwd, timeout=timeout)
     combined = stdout + "\n" + stderr
     matched, missing = _markers_present(combined, proof.expected_markers)

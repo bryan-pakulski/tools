@@ -15,16 +15,20 @@ def test_mobile_requests_are_finite_and_cancellable():
 
 
 def test_mobile_sse_reconnects_after_transport_drop():
+    # Spec (test_mobile_streaming_perf Fix 1): pollingInterval must be 0 —
+    # push-based SSE with reconnection owned by the explicit backoff loop.
     source = read("mobile/android/src/api/sse.ts")
     assert "DEFAULT_RECONNECT_DELAY_MS = 2_500" in source
-    assert "pollingInterval: reconnectDelayMs" in source
-    assert "Zero disables reconnection entirely" in source
+    assert "pollingInterval: 0" in source
+    assert "SSE push is the primary transport" in source
 
 
 def test_mobile_history_is_bounded_and_stale_requests_abort():
     hook = read("mobile/android/src/hooks/useChatSession.ts")
     router = read("mu/gui/routers/sessions.py")
     assert "MOBILE_HISTORY_TURN_LIMIT = 80" in hook
+    assert "MOBILE_HISTORY_CHECKPOINT_BATCH = 5" in hook
+    assert "MOBILE_HISTORY_CHECKPOINT_SCAN_PAGES = 6" in hook
     assert "historyAbortRef.current?.abort()" in hook
     assert "stateAbortRef.current?.abort()" in hook
     assert "limit_turns: Optional[int]" in router

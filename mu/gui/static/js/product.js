@@ -7,7 +7,7 @@
     const FLOAT_MARGIN = 10;
     const FLOAT_GAP = 9;
 
-    function installStylesheet(id, href) {
+    function installPresentationStylesheet(id, href) {
         if (document.getElementById(id)) return;
         const link = document.createElement('link');
         link.id = id;
@@ -18,149 +18,8 @@
 
     // product.js is loaded synchronously by the main web shell, so install late
     // override sheets immediately and avoid first-open style flashes.
-    installStylesheet('mucli-popouts-css', '/static/css/popouts.css');
-    installStylesheet('mucli-pricing-settings-css', '/static/css/pricing_settings.css');
-
-    document.addEventListener('alpine:init', () => {
-        Alpine.store('pricingSettings', {
-            loaded: false,
-            loading: false,
-            saving: false,
-            dirty: false,
-            error: '',
-            provider: 'all',
-            version: '',
-            currency: 'USD',
-            unit: 'per_million_tokens',
-            models: [],
-            configPath: '',
-            activeConfigPath: '',
-            defaultConfigPath: '',
-            usingOverride: false,
-
-            _applyCatalog(data) {
-                const catalog = data && typeof data === 'object' ? data : {};
-                this.version = String(catalog.version || 'custom');
-                this.currency = String(catalog.currency || 'USD');
-                this.unit = String(catalog.unit || 'per_million_tokens');
-                this.models = Array.isArray(catalog.models)
-                    ? catalog.models.map(row => ({ ...row }))
-                    : [];
-                this.configPath = String(catalog.config_path || '');
-                this.activeConfigPath = String(catalog.active_config_path || '');
-                this.defaultConfigPath = String(catalog.default_config_path || '');
-                this.usingOverride = !!catalog.using_override;
-                this.loaded = true;
-                this.dirty = false;
-                this.error = '';
-            },
-
-            async load(force = false) {
-                if (this.loaded && !force) return;
-                this.loading = true;
-                this.error = '';
-                try {
-                    const response = await fetch('/api/providers/pricing', { cache: 'no-store' });
-                    const data = await response.json().catch(() => ({}));
-                    if (!response.ok) throw new Error(data.detail || `pricing load failed (${response.status})`);
-                    this._applyCatalog(data);
-                } catch (error) {
-                    this.error = String(error instanceof Error ? error.message : error);
-                } finally {
-                    this.loading = false;
-                }
-            },
-
-            filteredModels() {
-                const provider = String(this.provider || 'all').toLowerCase();
-                if (provider === 'all') return this.models;
-                return this.models.filter(row => String(row.provider || '').toLowerCase() === provider);
-            },
-
-            providerCount(provider) {
-                const target = String(provider || '').toLowerCase();
-                return this.models.filter(row => String(row.provider || '').toLowerCase() === target).length;
-            },
-
-            displayRate(value) {
-                return value === null || value === undefined ? '' : String(value);
-            },
-
-            setRate(row, field, raw) {
-                if (!row || !field) return;
-                const text = String(raw ?? '').trim();
-                if (!text) {
-                    row[field] = null;
-                    this.dirty = true;
-                    return;
-                }
-                const value = Number(text);
-                if (!Number.isFinite(value) || value < 0) {
-                    this.error = `${field} must be a non-negative number`;
-                    return;
-                }
-                row[field] = value;
-                this.error = '';
-                this.dirty = true;
-            },
-
-            setBilling(row, value) {
-                if (!row) return;
-                row.billing = String(value || 'unknown');
-                this.dirty = true;
-            },
-
-            sourceLabel() {
-                if (!this.loaded) return 'Pricing registry not loaded';
-                if (this.usingOverride) return `Operator override · ${this.activeConfigPath || this.configPath}`;
-                return `Packaged defaults · ${this.activeConfigPath || this.defaultConfigPath}`;
-            },
-
-            async save() {
-                if (this.saving) return;
-                this.saving = true;
-                this.error = '';
-                try {
-                    const response = await fetch('/api/providers/pricing', {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            version: this.version || 'operator',
-                            currency: this.currency || 'USD',
-                            unit: this.unit || 'per_million_tokens',
-                            models: this.models.map(row => ({ ...row })),
-                        }),
-                    });
-                    const data = await response.json().catch(() => ({}));
-                    if (!response.ok) throw new Error(data.detail || `pricing save failed (${response.status})`);
-                    this._applyCatalog(data);
-                    Alpine.store('toast').show('Model pricing saved', 'success');
-                } catch (error) {
-                    this.error = String(error instanceof Error ? error.message : error);
-                    Alpine.store('toast').show(this.error, 'error', 7000);
-                } finally {
-                    this.saving = false;
-                }
-            },
-
-            async reset() {
-                this.saving = true;
-                this.error = '';
-                try {
-                    const response = await fetch('/api/providers/pricing/reset', { method: 'POST' });
-                    const data = await response.json().catch(() => ({}));
-                    if (!response.ok) throw new Error(data.detail || `pricing reset failed (${response.status})`);
-                    this._applyCatalog(data);
-                    Alpine.store('toast').show('Model pricing reset to packaged defaults', 'success');
-                } catch (error) {
-                    this.error = String(error instanceof Error ? error.message : error);
-                    Alpine.store('toast').show(this.error, 'error', 7000);
-                } finally {
-                    this.saving = false;
-                }
-            },
-        });
-    });
+    installPresentationStylesheet('mucli-popouts-css', '/static/css/popouts.css');
+    installPresentationStylesheet('mucli-pricing-settings-css', '/static/css/pricing_settings.css');
 
     function setText(selector, value) {
         const node = document.querySelector(selector);
@@ -259,28 +118,37 @@
         const profile = floatingLayerProfile(layer);
         const anchorRect = anchor.getBoundingClientRect();
         const layerRect = layer.getBoundingClientRect();
-        const viewportMaxWidth = Math.max(220, window.innerWidth - FLOAT_MARGIN * 2);
+        const viewport = window.visualViewport;
+        const viewportLeft = viewport ? viewport.offsetLeft : 0;
+        const viewportTop = viewport ? viewport.offsetTop : 0;
+        const viewportWidth = viewport ? viewport.width : window.innerWidth;
+        const viewportHeight = viewport ? viewport.height : window.innerHeight;
+        const viewportRight = viewportLeft + viewportWidth;
+        const viewportBottom = viewportTop + viewportHeight;
+        const viewportMaxWidth = Math.max(220, viewportWidth - FLOAT_MARGIN * 2);
         const effectiveMaxWidth = Math.min(profile.maxWidth, viewportMaxWidth);
         const effectiveMinWidth = Math.min(profile.minWidth, effectiveMaxWidth);
         const naturalWidth = Math.max(layerRect.width || 0, layer.scrollWidth || 0, effectiveMinWidth);
         const width = clamp(naturalWidth, effectiveMinWidth, effectiveMaxWidth);
 
         const naturalHeight = Math.max(layerRect.height || 0, layer.scrollHeight || 0);
-        const roomAbove = anchorRect.top - FLOAT_MARGIN;
-        const roomBelow = window.innerHeight - anchorRect.bottom - FLOAT_MARGIN;
+        const roomAbove = anchorRect.top - viewportTop - FLOAT_MARGIN;
+        const roomBelow = viewportBottom - anchorRect.bottom - FLOAT_MARGIN;
         const preferAbove = roomAbove >= Math.min(naturalHeight + FLOAT_GAP, 340) || roomAbove > roomBelow;
-        const available = Math.max(170, (preferAbove ? roomAbove : roomBelow) - FLOAT_GAP);
+        // Never invent more space than the viewport actually has. The old
+        // 170px floor could force a short viewport's menu beyond an edge.
+        const available = Math.max(48, (preferAbove ? roomAbove : roomBelow) - FLOAT_GAP);
         const height = Math.min(naturalHeight, available);
 
         let top = preferAbove
             ? anchorRect.top - height - FLOAT_GAP
             : anchorRect.bottom + FLOAT_GAP;
-        top = clamp(top, FLOAT_MARGIN, window.innerHeight - height - FLOAT_MARGIN);
+        top = clamp(top, viewportTop + FLOAT_MARGIN, viewportBottom - height - FLOAT_MARGIN);
 
         let left = profile.align === 'end'
             ? anchorRect.right - width
             : anchorRect.left;
-        left = clamp(left, FLOAT_MARGIN, window.innerWidth - width - FLOAT_MARGIN);
+        left = clamp(left, viewportLeft + FLOAT_MARGIN, viewportRight - width - FLOAT_MARGIN);
 
         layer.style.width = `${Math.round(width)}px`;
         layer.style.maxHeight = `${Math.round(available)}px`;
@@ -301,6 +169,10 @@
         const reposition = () => requestAnimationFrame(() => positionFloatingLayer(layer, anchor));
         anchor.addEventListener('click', reposition);
         window.addEventListener('resize', reposition, { passive: true });
+        if (window.visualViewport) {
+            window.visualViewport.addEventListener('resize', reposition, { passive: true });
+            window.visualViewport.addEventListener('scroll', reposition, { passive: true });
+        }
         document.addEventListener('scroll', reposition, { passive: true, capture: true });
         if (typeof ResizeObserver !== 'undefined') new ResizeObserver(reposition).observe(layer);
     }
@@ -341,114 +213,6 @@
         });
     }
 
-    function installPricingSettings() {
-        const tabs = document.querySelector('.inspector-tabs');
-        const body = document.querySelector('.inspector-body');
-        if (!tabs || !body || document.getElementById('pricing-settings-pane')) return;
-
-        const tab = document.createElement('button');
-        tab.type = 'button';
-        tab.setAttribute(':class', "{ active: $store.inspector.tab === 'pricing' }");
-        tab.setAttribute('@click', "$store.inspector.setTab('pricing'); $store.pricingSettings.load()");
-        tab.setAttribute('role', 'tab');
-        tab.textContent = 'pricing';
-        const settingsTab = Array.from(tabs.querySelectorAll('button')).find(
-            button => button.textContent.trim().toLowerCase() === 'settings'
-        );
-        tabs.insertBefore(tab, settingsTab || null);
-
-        const pane = document.createElement('section');
-        pane.id = 'pricing-settings-pane';
-        pane.className = 'settings-pane pricing-settings-pane';
-        pane.setAttribute('x-show', "$store.inspector.tab === 'pricing'");
-        pane.innerHTML = `
-            <div class="pricing-settings-head">
-                <div>
-                    <h3 class="pricing-settings-title">Model pricing</h3>
-                    <p class="pricing-settings-copy">Edit the per-million token rates MuCLI uses for cost accounting. OpenAI, Gemini, and Ollama Cloud all use this registry. Local Ollama remains $0 attributable provider/API cost; host compute is intentionally separate.</p>
-                </div>
-                <a class="pricing-settings-advanced" href="/static/model_costs.html">Advanced registry</a>
-            </div>
-
-            <div class="pricing-settings-meta" x-show="$store.pricingSettings.loaded">
-                <span class="pricing-settings-source" x-text="$store.pricingSettings.sourceLabel()" :title="$store.pricingSettings.activeConfigPath || $store.pricingSettings.configPath"></span>
-                <span class="pricing-settings-state"
-                      :class="{ 'is-override': $store.pricingSettings.usingOverride }"
-                      x-text="$store.pricingSettings.usingOverride ? 'override active' : 'defaults'"></span>
-            </div>
-
-            <div class="pricing-provider-filter" x-show="$store.pricingSettings.loaded">
-                <button type="button" :class="{ active: $store.pricingSettings.provider === 'all' }" @click="$store.pricingSettings.provider = 'all'">all</button>
-                <button type="button" :class="{ active: $store.pricingSettings.provider === 'openai' }" @click="$store.pricingSettings.provider = 'openai'">OpenAI <span x-text="$store.pricingSettings.providerCount('openai')"></span></button>
-                <button type="button" :class="{ active: $store.pricingSettings.provider === 'gemini' }" @click="$store.pricingSettings.provider = 'gemini'">Gemini <span x-text="$store.pricingSettings.providerCount('gemini')"></span></button>
-                <button type="button" :class="{ active: $store.pricingSettings.provider === 'ollama' }" @click="$store.pricingSettings.provider = 'ollama'">Ollama <span x-text="$store.pricingSettings.providerCount('ollama')"></span></button>
-                <button type="button" @click="$store.pricingSettings.load(true)">refresh</button>
-            </div>
-
-            <div class="pricing-settings-error" x-show="$store.pricingSettings.error" x-text="$store.pricingSettings.error"></div>
-            <div class="pricing-settings-empty" x-show="$store.pricingSettings.loading">Loading model pricing…</div>
-
-            <div class="pricing-model-list" x-show="$store.pricingSettings.loaded && !$store.pricingSettings.loading">
-                <template x-for="row in $store.pricingSettings.filteredModels()" :key="row.provider + ':' + row.key">
-                    <article class="pricing-model-row">
-                        <div class="pricing-model-head">
-                            <span class="pricing-provider-badge" x-text="row.provider"></span>
-                            <span class="pricing-model-name" x-text="row.key" :title="row.key"></span>
-                            <select class="pricing-billing-select" :value="row.billing" @change="$store.pricingSettings.setBilling(row, $event.target.value)">
-                                <option value="token">token priced</option>
-                                <option value="estimated_token">estimated token</option>
-                                <option value="local">local / $0 API</option>
-                                <option value="unknown">unpriced</option>
-                            </select>
-                        </div>
-                        <div class="pricing-rate-grid">
-                            <label class="pricing-rate-field">
-                                <span>Input / 1M</span>
-                                <input type="number" min="0" step="0.001"
-                                       :disabled="row.billing === 'local' || row.billing === 'unknown'"
-                                       :value="$store.pricingSettings.displayRate(row.input_per_million)"
-                                       @input="$store.pricingSettings.setRate(row, 'input_per_million', $event.target.value)">
-                            </label>
-                            <label class="pricing-rate-field">
-                                <span>Cached input / 1M</span>
-                                <input type="number" min="0" step="0.001"
-                                       :disabled="row.billing === 'local' || row.billing === 'unknown'"
-                                       :value="$store.pricingSettings.displayRate(row.cached_input_per_million)"
-                                       @input="$store.pricingSettings.setRate(row, 'cached_input_per_million', $event.target.value)">
-                            </label>
-                            <label class="pricing-rate-field">
-                                <span>Output / 1M</span>
-                                <input type="number" min="0" step="0.001"
-                                       :disabled="row.billing === 'local' || row.billing === 'unknown'"
-                                       :value="$store.pricingSettings.displayRate(row.output_per_million)"
-                                       @input="$store.pricingSettings.setRate(row, 'output_per_million', $event.target.value)">
-                            </label>
-                        </div>
-                        <p class="pricing-model-note" x-show="row.billing === 'local'">Local Ollama provider/API cost is recorded as $0. Host GPU/CPU economics are not included.</p>
-                        <p class="pricing-model-note" x-show="row.billing === 'unknown'">This model remains unpriced until you select token pricing and enter rates.</p>
-                        <p class="pricing-model-note" x-show="row.notes && row.billing !== 'local' && row.billing !== 'unknown'" x-text="row.notes"></p>
-                    </article>
-                </template>
-            </div>
-
-            <div class="pricing-settings-empty" x-show="$store.pricingSettings.loaded && !$store.pricingSettings.loading && $store.pricingSettings.filteredModels().length === 0">No pricing rows for this provider.</div>
-
-            <div class="pricing-settings-actions" x-show="$store.pricingSettings.loaded">
-                <span class="pricing-settings-dirty" x-text="$store.pricingSettings.dirty ? 'Unsaved pricing changes' : ($store.pricingSettings.usingOverride ? 'Operator pricing override active' : 'Using packaged defaults')"></span>
-                <div class="pricing-settings-buttons">
-                    <button type="button" @click="$store.confirm.ask('Reset all model pricing to packaged defaults?', $event, () => $store.pricingSettings.reset(), {danger:true})">reset</button>
-                    <button type="button" class="primary" :disabled="!$store.pricingSettings.dirty || $store.pricingSettings.saving" @click="$store.pricingSettings.save()" x-text="$store.pricingSettings.saving ? 'saving…' : 'save pricing'"></button>
-                </div>
-            </div>
-        `;
-        body.appendChild(pane);
-
-        if (window.Alpine && typeof Alpine.initTree === 'function') {
-            Alpine.initTree(tab);
-            Alpine.initTree(pane);
-        }
-    }
-
     document.addEventListener('DOMContentLoaded', () => {
         document.documentElement.classList.add('mucli-product-ui');
         polishWelcomeCopy();
@@ -456,7 +220,6 @@
         refineComposerGeometry();
         installComposerFloatingLayers();
         installPanelTransitions();
-        installPricingSettings();
     });
 
     document.addEventListener('keydown', (event) => {

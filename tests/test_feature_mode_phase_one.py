@@ -1,4 +1,6 @@
+import os
 import pytest
+import tempfile
 
 from mu.feature.engine import (
     STATUS_ARCHIVED,
@@ -94,3 +96,40 @@ def test_load_feature_plan_backfills_phase_metadata_for_legacy_files(tmp_path):
     loaded = load_feature_plan(plan.metadata_path)
     assert len(loaded.phases_meta) == 1
     assert loaded.phases_meta[0].title == "Task A"
+
+
+def test_update_task_content_refuses_empty_exit_criteria():
+    """Round-30 F1: stripping all exit criteria would make the
+    completion gate vacuously pass (`missing` is empty when `expected`
+    is empty). The engine refuses empty criteria on update; the create
+    path already required non-empty."""
+    import pytest as _pytest
+
+    from mu.feature.engine import (
+        FeaturePlan,
+        FeatureTask,
+        load_feature_plan,
+        save_feature_plan,
+        update_task_content,
+    )
+
+    plan = FeaturePlan(
+        feature_id="f1",
+        feature_name="n",
+        feature_request="r",
+        directory=tempfile.mkdtemp(),
+    )
+    plan.tasks.append(
+        FeatureTask(id=1, title="task", exit_criteria=["criterion A"])
+    )
+    metadata_path = os.path.join(plan.directory, "feature_plan.json")
+    plan.metadata_path = metadata_path
+    save_feature_plan("", plan)
+
+    with _pytest.raises(ValueError, match="exit_criteria cannot be emptied"):
+        update_task_content(metadata_path, 1, exit_criteria=[])
+
+    # Non-empty replacement still works.
+    update_task_content(metadata_path, 1, exit_criteria=["A", "B"])
+    reloaded = load_feature_plan(metadata_path)
+    assert reloaded.tasks[0].exit_criteria == ["A", "B"]

@@ -3,7 +3,7 @@ import { Alert, StyleSheet, Switch, TouchableOpacity, View } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../theme/ThemeContext';
-import { useConnectionStore } from '../store/connection';
+import { queueIfOffline, useConnectionStore } from '../store/connection';
 import { inspectorApi } from '../api/inspector';
 import { AdvancedSettingsSheet } from './AdvancedSettingsSheet';
 import { ModernBottomSheet } from './ModernBottomSheet';
@@ -41,6 +41,8 @@ export function ModernHeader({
     isConnected,
     yolo,
     setYolo,
+    pendingMutations,
+    lastReplay,
   } = useConnectionStore();
   const [menuOpen, setMenuOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -67,7 +69,17 @@ export function ModernHeader({
   }, [refreshYolo, menuOpen]);
 
   const updateYolo = useCallback(async (next: boolean) => {
-    if (!isConnected || !activeSessionName || yoloSyncing) return;
+    if (!activeSessionName || yoloSyncing) return;
+    // G5 (§3.6): offline toggles join the outbound queue and replay with
+    // If-Match on reconnect — the optimistic local value stays visible.
+    // F11: carry the last-known session revision for CAS protection.
+    if (await queueIfOffline('set_variable', { key: 'yolo', value: next }, {
+      sessionName: activeSessionName,
+      ifMatch: useConnectionStore.getState().sessionRevision ?? undefined,
+    })) {
+      setYolo(next);
+      return;
+    }
     const previous = yolo;
     setYolo(next);
     setYoloSyncing(true);
@@ -84,6 +96,18 @@ export function ModernHeader({
 
   const sessionTitle = activeSessionName || 'New session';
   const sessionMeta = [activeProvider, activeModel].filter(Boolean).join(' · ') || (isConnected ? 'Connected' : 'Connect to MuCLI');
+
+  // G5 (§3.6): user-visible badge for queued offline mutations, plus a
+  // conflict notice when a replay dropped stale state (409 from If-Match).
+  const queueBadge = pendingMutations > 0 ? ` · ${pendingMutations} queued` : '';
+  useEffect(() => {
+    if (lastReplay && lastReplay.conflicts > 0) {
+      Alert.alert(
+        'Changes applied elsewhere',
+        `${lastReplay.conflicts} queued change${lastReplay.conflicts === 1 ? '' : 's'} conflicted with newer session state and was dropped.`,
+      );
+    }
+  }, [lastReplay]);
 
   const openFromMenu = (action: () => void) => {
     setMenuOpen(false);
@@ -126,7 +150,7 @@ export function ModernHeader({
             <View style={[styles.statusDot, { backgroundColor: isConnected ? colors.textDim : colors.error }]} />
           </View>
           <Text style={[styles.subtitle, { color: isConnected ? colors.textDim : colors.error }]} numberOfLines={1}>
-            {sessionMeta}
+            {sessionMeta}{queueBadge}
           </Text>
         </TouchableOpacity>
 

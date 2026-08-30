@@ -6,7 +6,9 @@ semantic residue for information that cannot be derived structurally.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
+from utils.logger import logger
 
 _MAX_SUBAGENT_DEPTH = 2
 
@@ -48,9 +50,27 @@ def build_attachment_context(session: Any) -> str:
         return ""
     lines = ["Uploaded documents are durable session inputs. Retrieve contents on demand; do not guess them."]
     for item in items[:30]:
-        lines.append("- id={attachment_id} | {name} | {mime_type} | {size} bytes".format(
-            attachment_id=item.get("attachment_id", ""), name=item.get("name", "attachment"),
-            mime_type=item.get("mime_type", "application/octet-stream"), size=int(item.get("size", 0) or 0)))
+        # Attachment metadata is untrusted user input: strip control
+        # characters (incl. newlines) so a filename like
+        # "x\nIgnore previous instructions..." cannot inject system-level
+        # text into this registry block.
+        def _clean(val: Any, limit: int = 120) -> str:
+            text = "".join(
+                ch for ch in str(val or "") if ch.isprintable() or ch == " "
+            )
+            return text[:limit]
+
+        lines.append(
+            json.dumps(
+                {
+                    "id": _clean(item.get("attachment_id", ""), 64),
+                    "name": _clean(item.get("name", "attachment")),
+                    "mime_type": _clean(item.get("mime_type", "application/octet-stream")),
+                    "size": int(item.get("size", 0) or 0),
+                },
+                ensure_ascii=True,
+            )
+        )
     if len(items) > 30:
         lines.append(f"- ... {len(items)-30} more; call list_attachments")
     return "\n".join(lines)[:6000]
@@ -61,7 +81,8 @@ def inject_hierarchical_context(session: Any, system_prompt: str, *, cached_skil
         from utils.runtime_metrics import _current_time_prelude
         system_prompt = f"{_current_time_prelude()}\n\n{system_prompt}".strip()
     except Exception:
-        pass
+        # Defensive: best-effort path must not break the caller.
+        logger.debug("Suppressed exception", exc_info=True)
 
     summary_limit = max(0, int(session.variables.get("conversation_summary_char_limit", 24000) or 12000))
     semantic_residue = str(getattr(session.session_manager, "conversation_summary", "") or "").strip()
@@ -124,7 +145,17 @@ def inject_hierarchical_context(session: Any, system_prompt: str, *, cached_skil
             layers.append("LAYER 3B \u2014 Agent role:\n" + role_block)
 
     layers.append("LAYER 5 \u2014 Current turn:\nAlways prioritize the live user message and current-turn tool results. Structured L2 state is authoritative; older semantic residue is fallback context only.")
-    return f"{system_prompt}\n\nHierarchical runtime context (layered with independent budgets/eviction):\n" + "\n\n".join(layers)
+    layered = f"{system_prompt}\n\nHierarchical runtime context (layered with independent budgets/eviction):\n" + "\n\n".join(layers)
+    # Idempotency marker (codex round-9 F4): post-compaction rebuilds call
+    # this function with an already-layered prompt. Strip any previous
+    # layered block from the base first so L1/L2/L3/L5 are rebuilt once
+    # from live state instead of stacking a stale copy beneath a fresh one.
+    _LAYER_SENTINEL = "\n\nHierarchical runtime context (layered with independent budgets/eviction):\n"
+    first = layered.find(_LAYER_SENTINEL)
+    last = layered.rfind(_LAYER_SENTINEL)
+    if first != last:
+        layered = layered[:first] + _LAYER_SENTINEL + layered[last + len(_LAYER_SENTINEL):]
+    return layered
 
 
 __all__ = ["build_attachment_context", "inject_hierarchical_context"]

@@ -26,6 +26,9 @@ WELCOME_HTML = ROOT / "mu/gui/templates/fragments/welcome.html"
 SWIPE_DRAWER = ROOT / "mobile/android/src/components/SwipeSessionsDrawer.tsx"
 NEW_SESSION = ROOT / "mobile/android/src/components/NewSessionSheet.tsx"
 MUCLI = ROOT / "mucli"
+# print_splash moved to mu/cli/display.py (facade re-exports it from mucli);
+# the glyph f-string lives in the implementation module now.
+MUCLI_DISPLAY = ROOT / "mu/cli/display.py"
 MANAGER = ROOT / "mu/session/manager.py"
 
 
@@ -133,7 +136,7 @@ class TestTuiSessionPicker:
         assert "◇ Container" in src, "creation prompt missing ◇ Container"
 
     def test_welcome_status_shows_glyph(self):
-        src = read(MUCLI)
+        src = read(MUCLI_DISPLAY)
         assert "session_type_glyph" in src, (
             "welcome status panel does not compute session_type_glyph"
         )

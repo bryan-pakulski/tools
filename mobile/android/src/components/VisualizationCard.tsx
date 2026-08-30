@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  Linking,
   Modal,
   StyleSheet,
   TouchableOpacity,
@@ -9,10 +8,12 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaModal } from './SafeAreaModal';
 import { Ionicons } from '@expo/vector-icons';
 import { WebView } from 'react-native-webview';
 import type { ArtifactDescriptor } from '../api/artifacts';
 import { artifactsApi } from '../api/artifacts';
+import { openExternalUrl } from '../api/urlSafety';
 import type { ThemeColors } from '../theme/tokens';
 import { useTheme } from '../theme/ThemeContext';
 import { Text } from './Text';
@@ -147,8 +148,7 @@ function VisualizationCardImpl({
   );
 
   const openExternal = (target: string = uri) => {
-    if (!/^https?:\/\//i.test(target)) return;
-    void Linking.openURL(target);
+    void openExternalUrl(target);
   };
 
   const hidePreview = () => {
@@ -242,7 +242,7 @@ function VisualizationCardImpl({
         )}
       </View>
 
-      <Modal
+      <SafeAreaModal
         visible={fullScreen}
         animationType="fade"
         presentationStyle="fullScreen"
@@ -282,7 +282,7 @@ function VisualizationCardImpl({
             />
           </View>
         </SafeAreaView>
-      </Modal>
+      </SafeAreaModal>
     </>
   );
 }

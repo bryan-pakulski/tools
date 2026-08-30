@@ -201,17 +201,32 @@ def _layer_text(session: Any, layer_id: str) -> str:
 # make a fresh session's first snapshot look "already churning").
 #
 # Structure: { session(obj): { (cols, rows): { <layer>: { "hashes": [...], "counts": [...] } } } }
+# Round-27 F4: provider hooks (agent threads) and REST snapshots (server
+# thread) mutate this structure concurrently — every access goes through
+# _FINGERPRINTS_LOCK. Round-27 F2: each resolution key holds up to
+# r*cols cell hashes; without a cap, requesting varying resolutions
+# grows the per-session map unboundedly — _MAX_RESOLUTIONS evicts the
+# least-recently-used resolution.
 _FINGERPRINTS: "weakref.WeakKeyDictionary[Any, Dict[str, Dict[str, List[Any]]]]" = (
     weakref.WeakKeyDictionary()
 )
+_FINGERPRINTS_LOCK = threading.Lock()
+_MAX_RESOLUTIONS = 16
 
 
 def _fingerprint(session: Any) -> Dict[str, Dict[str, List[Any]]]:
-    fp = _FINGERPRINTS.get(session)
-    if fp is None:
-        fp = {}
-        _FINGERPRINTS[session] = fp
-    return fp
+    with _FINGERPRINTS_LOCK:
+        fp = _FINGERPRINTS.get(session)
+        if fp is None:
+            fp = {}
+            _FINGERPRINTS[session] = fp
+        # Round-27 F2: LRU bound on resolutions per session. dict
+        # preserves insertion order; re-inserting on hit refreshes
+        # recency, popping from the front evicts the oldest use.
+        if len(fp) > _MAX_RESOLUTIONS:
+            while len(fp) > _MAX_RESOLUTIONS:
+                fp.pop(next(iter(fp)))
+        return fp
 
 
 def _heat_value(count: int) -> int:
@@ -669,11 +684,31 @@ def build_memory_snapshot(
     # row-major slices — one chunk per displayed cell), so changes light up
     # at cell granularity and you can see *which regions* of a layer churn.
     # Keyed by (cols, rows) so each resolution keeps its own change history.
-    layer_texts = {lid: _layer_text(session, lid) for lid in _LAYER_ORDER}
+    # Round-47 F11/F12: layer texts were materialized TWICE per provider call
+    # (once here for the grid, once in record_context_snapshot for the 64-
+    # slice timeline) — both walks are O(history). The hook now assembles
+    # them once and passes them via session._memory_layer_texts; only an
+    # explicit /state request without the precomputed texts re-materializes.
+    layer_texts = getattr(session, "_memory_layer_texts", None)
+    if not isinstance(layer_texts, dict) or set(layer_texts) < set(_LAYER_ORDER):
+        layer_texts = {lid: _layer_text(session, lid) for lid in _LAYER_ORDER}
     fp = _fingerprint(session)
-    res_fp = fp.setdefault((cols, rows), {})
+    with _FINGERPRINTS_LOCK:
+        # Refresh recency for the LRU bound (round-27 F2). Snapshot the
+        # current state + generation; the swap at the end is validated
+        # against the generation (round-48 F13) so a concurrent build
+        # cannot erase another's counts.
+        res_fp = fp.pop((cols, rows), {})
+        fp[(cols, rows)] = res_fp
+        base_generation = int(res_fp.get("__generation__", 0) or 0)
     layer_heat: Dict[str, List[int]] = {}  # per-cell heat (len == r*cols)
     layer_change_count: Dict[str, int] = {}
+    # Round-47 F12: compute the full replacement state locally, then swap
+    # each layer's entry under the lock — previously res_fp was read and
+    # mutated OUTSIDE the lock, so a concurrent /state request and the
+    # provider hook at the same resolution could interleave and lose or
+    # double-count changes.
+    new_state: Dict[str, Dict[str, Any]] = {}
     for lid in _LAYER_ORDER:
         r = band_rows.get(lid, 0)
         n = r * cols  # one chunk per band cell (row-major)
@@ -706,7 +741,7 @@ def build_memory_snapshot(
                         counts[i] = 1
         # else: first snapshot for this (resolution, layer) → counts stay 0.
 
-        res_fp[lid] = {"band_rows": r, "hashes": hashes, "counts": counts}
+        new_state[lid] = {"band_rows": r, "hashes": hashes, "counts": counts}
         # 0 = empty cell (no text in that slice); 1..255 = present, where the
         # magnitude encodes change frequency (1 = stable since first seen,
         # 255 = churning).
@@ -714,6 +749,16 @@ def build_memory_snapshot(
             (0 if not present[i] else 1 + _heat_value(counts[i])) for i in range(n)
         ]
         layer_change_count[lid] = sum(counts)
+
+    # Round-47 F12 + Round-48 F13: CAS swap — commit only if no other
+    # build advanced the generation while we computed. On mismatch the
+    # OTHER build's state wins (ours derives from a stale snapshot; the
+    # other one is at least as fresh).
+    with _FINGERPRINTS_LOCK:
+        current = fp.get((cols, rows)) or {}
+        fp[(cols, rows)] = {**current, **new_state, "__generation__": base_generation + 1}
+        while len(fp) > _MAX_RESOLUTIONS:
+            fp.pop(next(iter(fp)))
 
     # --- build the grid: each band cell carries its own per-cell heat
     # (row-major within the band), so changes show up as spatial regions,

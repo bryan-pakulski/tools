@@ -16,6 +16,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+# Round-50 F2: parse cache for registry reads — bounded by path count,
+# validated by (size, mtime_ns). Registries are append-mostly, so history
+# polling hits the cache instead of json.load-ing the file every time.
+_REGISTRY_CACHE: dict[str, dict[str, Any]] = {}
+_REGISTRY_CACHE_LOCK = threading.Lock()
+_REGISTRY_CACHE_CAP = 256
+
 
 class ArtifactError(ValueError):
     """Raised for invalid artifact inputs or registry operations."""
@@ -47,15 +54,43 @@ class ArtifactRegistry:
         return os.path.basename(self.session_dir.rstrip(os.sep))
 
     def _read(self) -> list[dict[str, Any]]:
+        # Round-50 F2: bounded listing was not bounded I/O — every list()
+        # json.load-ed the whole registry. Parse results are cached per
+        # (path, size, mtime_ns); an unchanged registry (the common case —
+        # registries are append-mostly) is a stat + dict hit. Bounded by
+        # path count; each cached value IS the entry list the caller may
+        # mutate copies of, so we return a shallow copy of the list shell.
+        try:
+            st = os.stat(self.registry_path)
+        except OSError:
+            _REGISTRY_CACHE.pop(self.registry_path, None)
+            return []
+        size, mtime_ns = st.st_size, st.st_mtime_ns
+        with _REGISTRY_CACHE_LOCK:
+            cached = _REGISTRY_CACHE.get(self.registry_path)
+        if cached and cached["size"] == size and cached["mtime_ns"] == mtime_ns:
+            return list(cached["entries"])
         try:
             with open(self.registry_path, "r", encoding="utf-8") as handle:
                 value = json.load(handle)
         except FileNotFoundError:
-            return []
+            value = []
         except (OSError, ValueError):
             # Keep the invalid file for forensic recovery; start a usable view.
-            return []
-        return value if isinstance(value, list) else []
+            value = []
+        entries = value if isinstance(value, list) else []
+        with _REGISTRY_CACHE_LOCK:
+            if (
+                len(_REGISTRY_CACHE) >= _REGISTRY_CACHE_CAP
+                and self.registry_path not in _REGISTRY_CACHE
+            ):
+                _REGISTRY_CACHE.pop(next(iter(_REGISTRY_CACHE)), None)
+            _REGISTRY_CACHE[self.registry_path] = {
+                "size": size,
+                "mtime_ns": mtime_ns,
+                "entries": entries,
+            }
+        return list(entries)
 
     def _write(self, entries: list[dict[str, Any]]) -> None:
         os.makedirs(self.artifacts_dir, exist_ok=True)
@@ -71,6 +106,10 @@ class ArtifactRegistry:
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+        # Round-50 F2: writes change (size, mtime) — drop the stale cache
+        # entry so the next read re-parses.
+        with _REGISTRY_CACHE_LOCK:
+            _REGISTRY_CACHE.pop(self.registry_path, None)
 
     def _descriptor(
         self,
@@ -232,11 +271,37 @@ class ArtifactRegistry:
                 shutil.rmtree(target_dir, ignore_errors=True)
                 raise
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        """Return descriptors newest-first.
+
+        Round-44 F2: ``limit`` bounds the work — the registry is sorted
+        newest-first and only the newest ``limit`` entries are stat()'d and
+        normalized. A history-page request that wants the 20 newest
+        visualizations no longer stats and rewrites a registry holding
+        thousands of artifacts. Only the unbounded variant performs the
+        prune/rewrite self-heal, because bounded reads cannot vouch for
+        entries they never examined.
+        """
         with self._lock:
             entries = []
             changed = False
-            for entry in self._read():
+            raw = self._read()
+            if limit is not None and limit >= 0:
+                # Round-45 F5: legacy entries can lack created_at — a bare
+                # created_at sort would drop them all into bucket 0 in file
+                # order (append order), which IS the recency order for
+                # legacy registries. Sort by (created_at, append_index) so
+                # missing timestamps keep append order instead of colliding.
+                indexed = list(enumerate(raw))
+                indexed.sort(
+                    key=lambda pair: (
+                        float(pair[1].get("created_at", 0) or 0),
+                        pair[0],
+                    ),
+                    reverse=True,
+                )
+                raw = [entry for _, entry in indexed[:limit]]
+            for entry in raw:
                 artifact_id = str(entry.get("artifact_id") or "")
                 path = self.resolve_path(artifact_id, _entry=entry)
                 if path and os.path.isfile(path):
@@ -247,8 +312,11 @@ class ArtifactRegistry:
                     entries.append(fresh)
                 else:
                     changed = True
-            if changed:
+            if changed and limit is None:
                 self._write(entries)
+            if limit is not None:
+                # Bounded reads are already newest-first from the pre-sort.
+                return entries
             return sorted(
                 entries, key=lambda item: float(item.get("created_at", 0) or 0), reverse=True
             )

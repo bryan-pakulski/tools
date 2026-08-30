@@ -467,20 +467,16 @@ done < <(compgen -cdfa -- "$prefix" 2>/dev/null | LC_ALL=C sort -u | head -200)
 @router.websocket("/api/containers/{name}/shell")
 async def managed_container_shell(websocket: WebSocket, name: str):
     # MUCLI_SHELL_QOL_V1
+    # Interactive shell is LOOPBACK-ONLY (codex round-6 F6): an
+    # unauthenticated private-network client must not get a bash inside
+    # the container. Empty host = uvicorn without client info (in-process
+    # tests / unix socket) — keep allowed; anything remote is rejected
+    # before accept().
     client = getattr(websocket, "client", None)
     host = str(getattr(client, "host", "") or "")
-    if not host or host in {"127.0.0.1", "::1", "localhost", "testclient"}:
-        pass
-    else:
-        try:
-            if ipaddress.ip_address(host).is_private:
-                pass
-            else:
-                await websocket.close(code=1008, reason="Container shell is restricted to localhost or a private network")
-                return
-        except ValueError:
-            await websocket.close(code=1008, reason="Container shell is restricted to localhost or a private network")
-            return
+    if host and host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        await websocket.close(code=1008, reason="Container shell is restricted to localhost")
+        return
     await websocket.accept()
     supervisor = websocket.app.state.container_supervisor
     try:
@@ -573,11 +569,13 @@ async def managed_container_shell(websocket: WebSocket, name: str):
 
 
 @router.get("/api/container-defaults")
-async def container_defaults(request: Request):
+async def container_defaults(request: Request = None):
     """Editable defaults and detected host hardware shared by all creation flows."""
-    hardware = await asyncio.to_thread(
-        request.app.state.container_supervisor.hardware_capabilities
-    )
+    hardware = None
+    if request is not None:
+        hardware = await asyncio.to_thread(
+            request.app.state.container_supervisor.hardware_capabilities
+        )
     return {
         "dockerfile": default_dockerfile(),
         "egress_allow": list(DEFAULT_EGRESS_ALLOW),

@@ -88,9 +88,11 @@ export function subscribeToEvents(
 
     const next = new EventSource(buildUrl(), {
       headers: { Accept: 'text/event-stream' },
-      // Disable the library's hidden retry loop. We recreate the source so a
-      // foreground resume or changed base URL cannot remain attached to a
-      // dead native connection.
+      // SSE push is the primary transport: pollingInterval: 0 disables the
+      // library's hidden polling/retry loop entirely. Reconnection is owned
+      // exclusively by our foreground-aware backoff loop below — a nonzero
+      // pollingInterval here meant two competing reconnect mechanisms racing
+      // on the same transport drop.
       pollingInterval: 0,
     });
     source = next;
@@ -103,11 +105,20 @@ export function subscribeToEvents(
 
     next.addEventListener('message', (event) => {
       if (closed || source !== next || !event.data) return;
+      // Parse and dispatch are separate concerns: a malformed server payload
+      // must not be conflated with (and swallow) a reducer exception.
+      let parsed: unknown;
       try {
-        handlers.onMessage?.(JSON.parse(event.data));
+        parsed = JSON.parse(event.data);
       } catch {
-        // Non-JSON message — ignore.
+        handlers.onError?.(new Error(`SSE: malformed JSON payload: ${String(event.data).slice(0, 120)}`));
+        return;
       }
+      if (!parsed || typeof parsed !== 'object' || typeof (parsed as { kind?: unknown }).kind !== 'string') {
+        handlers.onError?.(new Error('SSE: event missing string "kind" field'));
+        return;
+      }
+      handlers.onMessage?.(parsed as { kind: string; [key: string]: unknown });
     });
 
     next.addEventListener('error', (event) => {

@@ -12,7 +12,8 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
-import Markdown from 'react-native-markdown-display';
+import Markdown, { RenderRules } from 'react-native-markdown-display';
+import { openExternalUrl } from '../api/urlSafety';
 import { useTheme } from '../theme/ThemeContext';
 import { useConnectionStore } from '../store/connection';
 import { modesApi, ModeInfo } from '../api/modes';
@@ -29,6 +30,7 @@ import type { AttachmentDescriptor } from '../api/attachments';
 import { useChatSession, type ChatMessage } from '../hooks/useChatSession';
 import { useCommandCompletion, type CompletionItem } from '../hooks/useCommandCompletion';
 import { CommandSuggestionBar } from '../components/CommandSuggestionBar';
+import { ConflictBanner } from '../components/ConflictBanner';
 import { spacing } from '../theme/tokens';
 
 export function ChatScreen() {
@@ -95,22 +97,25 @@ export function ChatScreen() {
 
   // Follow streaming output only while the user remains parked near the
   // bottom. Coalesced scroll requests avoid fighting FlatList layout.
-  const scrollToBottom = useCallback((force = false) => {
-    if (force) followOutputRef.current = true;
+  // Doubles as the FlatList onContentSizeChange/onLayout handler: RN passes
+  // (width, height), which is not `true`, so it degrades to a follow scroll.
+  const scrollToBottom = useCallback((force?: boolean | number | unknown) => {
+    const isForce = force === true;
+    if (isForce) followOutputRef.current = true;
     if (
-      !force
+      !isForce
       && (!followOutputRef.current || userScrollActiveRef.current || momentumScrollRef.current)
     ) return;
     if (scrollThrottleRef.current) return;
     scrollThrottleRef.current = setTimeout(() => {
       scrollThrottleRef.current = null;
       if (
-        force
+        isForce
         || (followOutputRef.current && !userScrollActiveRef.current && !momentumScrollRef.current)
       ) {
         flatListRef.current?.scrollToEnd({ animated: false });
       }
-    }, force ? 0 : 32);
+    }, isForce ? 0 : 32);
   }, []);
 
   const cancelInitialScroll = useCallback(() => {
@@ -163,6 +168,7 @@ export function ChatScreen() {
         loadingOlderTriggeredRef.current = false;
       });
     }
+
   }, [hasMore, loadingOlder, loadOlderHistory, updateFollowFromDistance]);
 
   const onChatScrollBeginDrag = useCallback(() => {
@@ -332,11 +338,20 @@ export function ChatScreen() {
   // internal ScrollView with maxHeight, and Markdown handles long text
   // natively. No message-level truncation needed.
 
-  const markdownRules = useMemo(
+  // Safe link handler: only http(s) URLs reach the OS. Everything else is
+  // blocked (with an alert) instead of being handed to Linking.
+  const handleMarkdownLinkPress = useCallback((url: string) => {
+    void openExternalUrl(url);
+    return false;
+  }, []);
+
+  const markdownRules = useMemo<RenderRules>(
     () => ({
-      fence: (node: any) => {
+      fence: (node) => {
         const code = node.content;
-        const lang = (node.sourceInfo || '').trim();
+        // sourceInfo (fence language) is attached by tokensToAST but missing
+        // from the library's ASTNode type declaration.
+        const lang = ((node as { sourceInfo?: string }).sourceInfo || '').trim();
         return (
           <CodeBlock
             key={node.key}
@@ -346,7 +361,7 @@ export function ChatScreen() {
           />
         );
       },
-      code_block: (node: any) => {
+      code_block: (node) => {
         const code = node.content;
         return (
           <CodeBlock
@@ -356,7 +371,7 @@ export function ChatScreen() {
           />
         );
       },
-      code_inline: (node: any) => {
+      code_inline: (node) => {
         return (
           <Text key={node.key} style={{ color: colors.syntax.keyword, fontFamily: 'monospace', fontSize: 13, backgroundColor: colors.bgHover, borderRadius: 4, paddingHorizontal: 4 }}>
             {node.content}
@@ -430,7 +445,7 @@ export function ChatScreen() {
                           {child.text}
                         </Text>
                       ) : (
-                        <Markdown style={memoizedMarkdownStyles} rules={markdownRules}>
+                        <Markdown style={memoizedMarkdownStyles} rules={markdownRules} onLinkPress={handleMarkdownLinkPress}>
                           {child.text}
                         </Markdown>
                       )}
@@ -483,6 +498,7 @@ export function ChatScreen() {
             <Markdown
               style={memoizedMarkdownStyles}
               rules={markdownRules}
+              onLinkPress={handleMarkdownLinkPress}
             >
               {displayText}
             </Markdown>
@@ -528,7 +544,7 @@ export function ChatScreen() {
           updateCellsBatchingPeriod={32}
           windowSize={9}
           removeClippedSubviews={false}
-          maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+          maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 100 }}
           bounces={false}
           alwaysBounceVertical={false}
           overScrollMode="never"
@@ -545,8 +561,8 @@ export function ChatScreen() {
           onMomentumScrollBegin={onChatMomentumScrollBegin}
           onMomentumScrollEnd={onChatMomentumScrollEnd}
           scrollEventThrottle={16}
-          onContentSizeChange={onChatContentSizeChange}
-          onLayout={onChatLayout}
+          onContentSizeChange={scrollToBottom}
+          onLayout={scrollToBottom}
           ListHeaderComponent={
             <View>
               {loadingOlder ? (
@@ -594,6 +610,7 @@ export function ChatScreen() {
             </View>
           }
         />
+        <ConflictBanner style={{ marginHorizontal: spacing.base, marginBottom: spacing.sm }} />
         <ArtifactStrip sessionName={activeSessionName} refreshKey={artifactRevision} />
         <CommandSuggestionBar
           visible={completion.visible}

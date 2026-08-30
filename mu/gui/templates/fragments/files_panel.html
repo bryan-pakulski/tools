@@ -23,7 +23,7 @@
     <div class="files-error" x-show="$store.files.error" x-text="$store.files.error"></div>
 
     <div class="files-browser" x-show="$store.files.roots.length || $store.files.loading">
-        <div class="files-loading muted" x-show="$store.files.loading">Loading workspace…</div>
+        <div class="files-loading muted ui-loading-region" x-show="$store.files.loading">Loading workspace…</div>
         <div class="files-tree" x-show="!$store.files.loading">
             <template x-for="root in $store.files.roots" :key="root.path">
                 <section class="files-root">

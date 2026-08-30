@@ -12,6 +12,25 @@
      * clearing the query parameter ensures the old comparison fetch path never
      * runs while the list is loading.
      */
+    // Shared signed-delta formatter for comparison metrics. Exposed on
+    // window so job_trace.js (loaded before this deferred script) and any
+    // later renderers share one formatting contract:
+    // delta = primary - reference, signed, unit-aware.
+    window.formatSigned = function formatSigned(value, unit) {
+        if (value == null || Number.isNaN(Number(value))) return '\u2014';
+        const num = Number(value);
+        const sign = num > 0 ? '+' : num < 0 ? '\u2212' : '';
+        const abs = Math.abs(num);
+        // delta = primary - reference; the caller renders it next to the
+        // primary/reference pair so the signed direction is unambiguous.
+        const text = unit === 'seconds'
+            ? `${abs.toFixed(2)}s`
+            : `${abs.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+        return `${sign}${text}`;
+    };
+    // Documented contract: a positive delta means primary - reference > 0.
+    window.JT_DELTA_SEMANTICS = 'primary - reference';
+
     document.getElementById('jt-compare-select')?.remove();
     document.getElementById('jt-compare-section')?.remove();
 

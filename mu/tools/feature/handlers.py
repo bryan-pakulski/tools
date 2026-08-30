@@ -97,7 +97,7 @@ def _resolve_feature_state(session, requested_feature_id: str | None = None):
             session.session_manager.upsert_feature(feature_state)
         if session.session_manager.get_feature_state():
             session.session_manager.set_feature_state(feature_state)
-        session.session_manager.save_history()
+        session.session_manager.save_history_turn()
     return feature_state
 
 
@@ -200,7 +200,7 @@ def _handle_create_feature(args: dict, context: ToolExecutionContext) -> str:
     }
     session.session_manager.upsert_feature(feature_record)
     session.session_manager.activate_feature(plan.feature_id)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     return json.dumps(
         {
             "ok": True,
@@ -250,7 +250,7 @@ def _handle_create_phases(args: dict, context: ToolExecutionContext) -> str:
     feature_state["feature_plan"] = summary
     feature_state["updated_at"] = time.time()
     session.session_manager.upsert_feature(feature_state)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     return json.dumps(
         {
             "ok": True,
@@ -306,7 +306,7 @@ def _handle_create_task(args: dict, context: ToolExecutionContext) -> str:
     feature_state["feature_plan"] = summary
     feature_state["updated_at"] = time.time()
     session.session_manager.upsert_feature(feature_state)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     return json.dumps(
         {
             "ok": True,
@@ -371,7 +371,7 @@ def _handle_block_task(args: dict, context: ToolExecutionContext) -> str:
     feature_state["feature_plan"] = summary
     feature_state["updated_at"] = time.time()
     session.session_manager.upsert_feature(feature_state)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     return json.dumps(
         {
             "ok": True,
@@ -411,7 +411,7 @@ def _handle_resume_task(args: dict, context: ToolExecutionContext) -> str:
     feature_state["feature_plan"] = summary
     feature_state["updated_at"] = time.time()
     session.session_manager.upsert_feature(feature_state)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     return json.dumps(
         {
             "ok": True,
@@ -448,7 +448,7 @@ def _handle_review_completed_tasks(args: dict, context: ToolExecutionContext) ->
     feature_state["feature_plan"] = summary
     feature_state["updated_at"] = time.time()
     session.session_manager.upsert_feature(feature_state)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     return json.dumps(
         {
             "ok": True,
@@ -477,7 +477,7 @@ def _handle_review_all_completed_tasks(args: dict, context: ToolExecutionContext
     feature_state["feature_plan"] = summary
     feature_state["updated_at"] = time.time()
     session.session_manager.upsert_feature(feature_state)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     return json.dumps(
         {
             "ok": True,
@@ -513,7 +513,7 @@ def _handle_propose_task_diff(args: dict, context: ToolExecutionContext) -> str:
     feature_state["feature_plan"] = summary
     feature_state["updated_at"] = time.time()
     session.session_manager.upsert_feature(feature_state)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     return json.dumps(
         {"ok": True, "proposal": asdict(proposal), "plan": summary},
         indent=2,
@@ -544,7 +544,7 @@ def _handle_decide_task_diff(args: dict, context: ToolExecutionContext) -> str:
     feature_state["feature_plan"] = summary
     feature_state["updated_at"] = time.time()
     session.session_manager.upsert_feature(feature_state)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     return json.dumps(
         {"ok": True, "proposal": asdict(proposal), "plan": summary},
         indent=2,
@@ -569,7 +569,7 @@ def _handle_archive_task(args: dict, context: ToolExecutionContext) -> str:
     feature_state["feature_plan"] = summary
     feature_state["updated_at"] = time.time()
     session.session_manager.upsert_feature(feature_state)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     return json.dumps(
         {
             "ok": True,
@@ -687,7 +687,7 @@ def _handle_create_feature_task(args: dict, context: ToolExecutionContext) -> st
     }
     session.session_manager.upsert_feature(feature_record)
     session.session_manager.activate_feature(plan.feature_id)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
 
     if context.ui:
         context.ui.show_info(
@@ -956,6 +956,15 @@ def _handle_update_task_status(args: dict, context: ToolExecutionContext) -> str
         if target_task is None:
             return f"Error: Task {task_id} not found."
         expected = [str(item).strip() for item in target_task.exit_criteria if str(item).strip()]
+        # Round-30 F1: an empty expected list would make the missing
+        # check vacuously pass — completing a task with no verifiable
+        # criteria is refused (mirrors the engine-side guard).
+        if not expected:
+            return (
+                "Error: Task has no exit criteria to verify — it cannot "
+                "be marked completed on a vacuous basis. Add exit "
+                "criteria first."
+            )
         already_verified = {
             str(item).strip()
             for item in getattr(target_task, "verified_exit_criteria", []) or []

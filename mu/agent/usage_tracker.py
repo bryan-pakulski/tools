@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -31,8 +32,17 @@ from .hooks import HookContext, default_registry
 
 logger = logging.getLogger("mucli")
 
-
 _ARG_PREVIEW_LIMIT = 80
+
+# Round-20 F9: parallel tool execution (mu.agent.parallel.execute_calls)
+# runs post_tool hooks concurrently on the SAME session object. The
+# stats mutation below is a read-modify-write chain (setdefault,
+# `bucket["count"] += 1`, `total_ms +=`) — without a lock, concurrent
+# hooks lose increments. A single module-level lock is sufficient: the
+# critical section is microseconds, and the lock deliberately does NOT
+# live on the session because `tool_stats` is persisted with the
+# session document (a Lock is not picklable).
+_stats_lock = threading.Lock()
 
 
 def _arg_preview(args: Any) -> str:
@@ -88,6 +98,10 @@ def usage_tracker_pre(ctx: HookContext) -> Optional[object]:
         if ctx.tool_name == "invoke_skill":
             args = ctx.tool_args or {}
             skill_name = str(args.get("name") or "").strip()
+            # Round-20 F9: the banner write is a UI print, not a stats
+            # mutation — keep it OUTSIDE the lock (concurrent banners
+            # interleaving on the render queue are harmless, and
+            # announce_skill may do blocking I/O).
             _skill_banner(getattr(ctx.session, "ui", None), skill_name)
     except Exception:  # pragma: no cover — defensive
         logger.debug("usage_tracker_pre hook failed", exc_info=True)
@@ -101,15 +115,6 @@ def usage_tracker_post(ctx: HookContext) -> Optional[object]:
         session = ctx.session
         if session is None:
             return None
-        stats = _ensure_stats(session)
-        if stats is None:
-            return None
-
-        now = time.time()
-        if stats["first_call_at"] is None:
-            stats["first_call_at"] = now
-        stats["last_call_at"] = now
-
         tool_name = str(ctx.tool_name or "")
         if not tool_name:
             return None
@@ -128,40 +133,54 @@ def usage_tracker_post(ctx: HookContext) -> Optional[object]:
             if not ok:
                 error_code = str(result.get("error_code") or "unknown")
 
-        tools = stats.setdefault("tools", {})
-        bucket = tools.setdefault(
-            tool_name,
-            {
-                "count": 0,
-                "success": 0,
-                "failed": 0,
-                "total_ms": 0.0,
-                "last_used_at": None,
-                "last_args": "",
-            },
-        )
-        bucket["count"] += 1
-        bucket["total_ms"] += elapsed_ms
-        bucket["last_used_at"] = now
-        bucket["last_args"] = _arg_preview(ctx.tool_args)
-        if ok:
-            bucket["success"] += 1
-        else:
-            bucket["failed"] += 1
-            if error_code:
-                err_bucket = stats.setdefault("errors", {})
-                err_bucket[error_code] = err_bucket.get(error_code, 0) + 1
+        args_preview = _arg_preview(ctx.tool_args)
+        now = time.time()
+        with _stats_lock:
+            # Round-20 F9: entire read-modify-write of session.tool_stats
+            # is atomic — parallel tool execution runs this hook
+            # concurrently for the same session.
+            stats = _ensure_stats(session)
+            if stats is None:
+                return None
 
-        if tool_name == "invoke_skill":
-            args = ctx.tool_args or {}
-            skill_name = str(args.get("name") or "").strip()
-            if skill_name:
-                skills = stats.setdefault("skills", {})
-                sk_bucket = skills.setdefault(
-                    skill_name, {"invocations": 0, "last_used_at": None}
-                )
-                sk_bucket["invocations"] += 1
-                sk_bucket["last_used_at"] = now
+            if stats["first_call_at"] is None:
+                stats["first_call_at"] = now
+            stats["last_call_at"] = now
+
+            tools = stats.setdefault("tools", {})
+            bucket = tools.setdefault(
+                tool_name,
+                {
+                    "count": 0,
+                    "success": 0,
+                    "failed": 0,
+                    "total_ms": 0.0,
+                    "last_used_at": None,
+                    "last_args": "",
+                },
+            )
+            bucket["count"] += 1
+            bucket["total_ms"] += elapsed_ms
+            bucket["last_used_at"] = now
+            bucket["last_args"] = args_preview
+            if ok:
+                bucket["success"] += 1
+            else:
+                bucket["failed"] += 1
+                if error_code:
+                    err_bucket = stats.setdefault("errors", {})
+                    err_bucket[error_code] = err_bucket.get(error_code, 0) + 1
+
+            if tool_name == "invoke_skill":
+                args = ctx.tool_args or {}
+                skill_name = str(args.get("name") or "").strip()
+                if skill_name:
+                    skills = stats.setdefault("skills", {})
+                    sk_bucket = skills.setdefault(
+                        skill_name, {"invocations": 0, "last_used_at": None}
+                    )
+                    sk_bucket["invocations"] += 1
+                    sk_bucket["last_used_at"] = now
     except Exception:  # pragma: no cover — defensive
         logger.debug("usage_tracker_post hook failed", exc_info=True)
     return None

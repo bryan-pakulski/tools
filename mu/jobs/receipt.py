@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from typing import Any, Dict
 
 from utils.config import HISTORY_DIR
@@ -193,8 +194,23 @@ class JobReceiptBuilder:
         os.makedirs(job_dir, exist_ok=True)
         path = os.path.join(job_dir, "work-receipt.json")
         receipt = self.build(job_id)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(receipt, fh, ensure_ascii=False, indent=2, default=str)
+        # Round-35 F4: atomic write — serialize to a temp file in the same
+        # directory, fsync, then os.replace. A crash mid-dump or a
+        # concurrent reader previously saw a truncated receipt (and a
+        # failed rewrite destroyed the last valid one).
+        tmp_path = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(receipt, fh, ensure_ascii=False, indent=2, default=str)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         self.service.store.append_event(
             job_id,
             "work_receipt_updated",

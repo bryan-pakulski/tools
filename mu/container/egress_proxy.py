@@ -26,6 +26,23 @@ def _normalise_host(value: str) -> str:
     return host
 
 
+def _host_authority(host: str, port: int) -> str:
+    """RFC-correct Host header authority (codex round-9 F6).
+
+    IPv6 literals are bracketed; the port is included whenever it is not
+    the scheme default implied by the connection. Callers pass the port
+    they actually opened, so a non-default port survives synthesis instead
+    of silently routing to the origin's default vhost.
+    """
+    if ":" in host:  # bare IPv6 literal (already unbracketed by normalise)
+        authority = f"[{host}]"
+    else:
+        authority = host
+    if port not in (80, 443):
+        authority += f":{port}"
+    return authority
+
+
 def _normalise_rule(value: str) -> str:
     return _normalise_host(value)
 
@@ -271,9 +288,18 @@ async def _handle_client(
             path += f"?{parsed.query}"
         forwarded = [f"{method} {path} {version}"]
         for line in lines[1:]:
-            if line.lower().startswith("proxy-connection:"):
+            lowered = line.lower()
+            if lowered.startswith("proxy-connection:"):
+                continue
+            # Host header synthesis (codex round-8 F1): a client can send
+            # a Host header that differs from the allowlisted target,
+            # causing the origin (or an intermediary) to route the request
+            # to a vhost outside the allowlist. Drop incoming Host headers
+            # and synthesize one from the validated authority.
+            if lowered.startswith("host:"):
                 continue
             forwarded.append(line)
+        forwarded.append(f"Host: {_host_authority(host, port)}")
         remote_writer.write("\r\n".join(forwarded).encode("iso-8859-1"))
         await remote_writer.drain()
         print(f"allow {method_upper} {host}:{port} peer={peer}", flush=True)

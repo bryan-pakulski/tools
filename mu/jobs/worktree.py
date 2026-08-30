@@ -570,6 +570,57 @@ class JobWorktreeManager:
         )
         return sha
 
+    def _validate_removable_path(self, worktree: str, job: Job, repository: Any) -> str:
+        """Round-37 F2: identity checks for a worktree path before ANY
+        destructive action. A corrupted/imported DB row (or a stale path
+        reused by another job) must never let rmtree/--force erase an
+        unrelated directory. Rules (root-INDEPENDENT — the manager root is
+        per-instance configuration, so a persisted path created under a
+        different root is still this job's own checkout):
+        - the REALPATH must not be or live inside the repository itself;
+        - the final path component must be the job's id (this job's own
+          checkout directory name);
+        - git's porcelain worktree inventory of THIS repository must list
+          the path as a registered worktree."""
+        repo_real = os.path.realpath(os.path.abspath(repository.canonical_path))
+        real = os.path.realpath(os.path.abspath(worktree))
+        if real == repo_real:
+            # Never delete the repository itself.
+            raise WorktreeError(
+                f"refusing to remove {worktree!r}: path is the repository itself",
+                stage="worktree_remove",
+                context={"worktree": worktree},
+            )
+        if os.path.basename(real) != job.id:
+            raise WorktreeError(
+                f"refusing to remove {worktree!r}: not this job's checkout "
+                f"(expected directory name {job.id!r})",
+                stage="worktree_remove",
+                context={"worktree": worktree, "job_id": job.id},
+            )
+        listing = self._run(
+            repository.canonical_path,
+            "worktree",
+            "list",
+            "--porcelain",
+            stage="worktree_remove_inventory",
+            check=False,
+        )
+        registered = {
+            line[len("worktree "):].strip()
+            for line in (listing.stdout or "").splitlines()
+            if line.startswith("worktree ")
+        }
+        real_norm = os.path.normcase(real)
+        if not any(os.path.normcase(os.path.abspath(w)) == real_norm for w in registered):
+            raise WorktreeError(
+                f"refusing to remove {worktree!r}: not a registered worktree "
+                "of this job's repository",
+                stage="worktree_remove",
+                context={"worktree": worktree},
+            )
+        return real
+
     def remove(self, job: Job, *, force: bool = False) -> bool:
         try:
             repository = self.repositories.register(job.repository)
@@ -582,13 +633,44 @@ class JobWorktreeManager:
         worktree = str(job.worktree or self.worktree_path(job))
         if not os.path.exists(worktree):
             return False
+        real = self._validate_removable_path(worktree, job, repository)
         args: List[str] = ["worktree", "remove"]
         if force:
             args.append("--force")
         args.append(worktree)
         self._run(repository.canonical_path, *args, stage="worktree_remove")
         if os.path.exists(worktree) and force:
-            shutil.rmtree(worktree, ignore_errors=True)
+            # Round-40 F3/F5: capture the identity LOCALLY right here and
+            # re-lstat immediately before the delete — fail CLOSED. A
+            # same-pathname swap (original removed, unrelated directory
+            # created in between) has an identical realpath but a different
+            # (st_dev, st_ino); an unreadable path is refused rather than
+            # trusted. No instance cache — nothing to leak across jobs.
+            def _identity() -> tuple[int, int] | None:
+                try:
+                    st = os.lstat(worktree)
+                except OSError:
+                    return None
+                return (st.st_dev, st.st_ino)
+
+            pre_identity = _identity()
+            if pre_identity is None:
+                raise WorktreeError(
+                    f"refusing rmtree: {worktree!r} disappeared before fallback delete",
+                    stage="worktree_remove",
+                    context={"worktree": worktree},
+                )
+            shutil.rmtree(worktree, ignore_errors=False)
+            post_identity = _identity()
+            if post_identity is not None:
+                # The rmtree above already removed the tree; a surviving
+                # entry means the directory was swapped mid-delete — refuse
+                # loudly rather than silently accepting a replaced path.
+                raise WorktreeError(
+                    f"refusing rmtree: {worktree!r} was recreated during removal",
+                    stage="worktree_remove",
+                    context={"worktree": worktree},
+                )
         self._event(
             job.id,
             "worktree_removed",

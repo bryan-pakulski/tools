@@ -30,6 +30,8 @@
     <link id="hljs-dark" rel="stylesheet" href="/static/vendor/highlight-github-dark.min.css">
     <link id="hljs-light" rel="stylesheet" href="/static/vendor/highlight-github-light.min.css" disabled>
     <link rel="stylesheet" href="/static/css/app.css">
+    <link rel="stylesheet" href="/static/css/floating_popouts.css">
+    {% block page_styles %}{% endblock %}
     <!-- MathJax (vendored, SVG output, no external fonts needed).
          Config MUST precede the script load. startup.typeset=false
          so we drive typesetting manually after each render. -->
@@ -49,6 +51,7 @@
     <script src="/static/vendor/marked.min.js"></script>
     <script src="/static/vendor/highlight.min.js"></script>
     <script src="/static/js/app.js"></script>
+    <script src="/static/js/floating_popouts.js" defer></script>
     <script src="/static/vendor/htmx.min.js" defer></script>
     <script src="/static/vendor/alpine.min.js" defer></script>
 </head>

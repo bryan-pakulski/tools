@@ -4,6 +4,12 @@ export interface ChatSendResponse {
   accepted: boolean;
   kind: string;
   session_name: string;
+  /**
+   * Round-32b F4/F5: JS-safe session revision token from the send
+   * response. number for revisions <= 2^53-1, decimal string above —
+   * capture verbatim (never Number()-convert) as the next If-Match.
+   */
+  revision?: number | string;
 }
 
 export interface HistorySearchResult {

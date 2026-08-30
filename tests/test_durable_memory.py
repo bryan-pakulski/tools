@@ -143,13 +143,14 @@ def test_forget_purges_content_revisions_and_search_index(tmp_path):
     assert service.list_for_session(session, query="deployment") == []
     assert service.ledger.events(memory_id=item.id)[0]["type"] == "forgotten"
     forgotten_receipt = service.ledger.get_recall(receipt.id)
-    copied_memory = forgotten_receipt["included"][0]["memory"]
-    assert copied_memory == {
-        "id": item.id,
-        "version": forgotten.version,
-        "lifecycle": "forgotten",
-        "content_hash": item.content_hash,
-    }
+    # Round-49 F1: receipts are COMPACT — id/version/score/token_cost only,
+    # no memory body (statement etc. lives solely in the memories table).
+    # The redaction invariant is preserved: the receipt references the
+    # forgotten version without copying content.
+    copied_memory = forgotten_receipt["included"][0]
+    assert copied_memory["id"] == item.id
+    assert "statement" not in str(forgotten_receipt["included"])
+    assert "Use a green deployment." not in str(forgotten_receipt)
 
 
 def test_secret_like_memory_is_never_persisted(tmp_path):

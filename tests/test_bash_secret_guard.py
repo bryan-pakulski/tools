@@ -120,3 +120,13 @@ def test_override_accepts_string_values(registry, truthy):
         variables={"security_allow_secret_paths": truthy},
     )
     assert result is None
+
+
+def test_quoted_python_reader_blocked():
+    """Round-28 F1: paths hidden inside quoted program text
+    (`python3 -c "open('/home/u/.ssh/id_rsa')"`) must be caught by the
+    quoted-string scan."""
+    reason = guard._check_command(
+        'python3 -c "print(open(\'/home/u/.ssh/id_rsa\').read())"'
+    )
+    assert reason is not None and "denied" in reason

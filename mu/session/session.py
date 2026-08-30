@@ -82,8 +82,13 @@ class Session:
         self.debug = debug
         self.variables = session_manager.variables
         self.agentic = True
-        self.staged_files = []  # legacy provider-native staged parts
-        self.staged_attachments = []  # durable attachment descriptor parts
+        # Dual-registry contract — see run_turn in mu/agent/loop_body.py:
+        # staged_files = ephemeral provider-native payloads for THIS turn
+        # (image_input bytes / file_refs), cleared after the turn.
+        # staged_attachments = durable attachment descriptors that rehydrate
+        # as a tool-notice text part. add_file writes to both on purpose.
+        self.staged_files = []
+        self.staged_attachments = []
         self.disabled_tools = []  # list of tool names strings
         self.disabled_skills: list[str] = []  # names of skills to suppress
         self.retrieval_index = _RETRIEVAL_INDEX
@@ -163,12 +168,16 @@ class Session:
                     f"Restored folder context: {', '.join(self.folder_context.folders)}"
                 )
             logger.info(f"Restored folder context: {self.folder_context.folders}")
-            try:
-                os.chdir(self.folder_context.folders[0])
-                if self.ui:
-                    self.ui.show_info(f"Working directory set to: {os.getcwd()}")
-            except Exception:
-                pass
+            # Deliberately NOT calling os.chdir() here: the process cwd is
+            # global, and GUI/container mode runs multiple sessions in one
+            # process (one thread each) — a chdir would race sessions with
+            # different workspaces. Tool handlers resolve their working
+            # directory per-call via default_working_directory(), which
+            # already prefers folder_context.folders[0].
+            if self.ui:
+                self.ui.show_info(
+                    f"Workspace root: {self.folder_context.folders[0]}"
+                )
 
     def stage_attachment_ids(self, attachment_ids, *, replace=True):
         """Validate registry IDs and stage descriptor-only history parts."""
@@ -221,23 +230,14 @@ class Session:
                     os.path.basename(file_path), file_path, safe_mime
                 )
                 self.stage_attachment_ids([descriptor["attachment_id"]], replace=False)
-                if safe_mime.startswith("image/"):
-                    with open(file_path, "rb") as fh:
-                        raw = fh.read()
-                    import base64 as _b64
-                    self.staged_files.append({
-                        "type": "image_input",
-                        "image": {
-                            "data_b64": _b64.b64encode(raw).decode("ascii"),
-                            "mime_type": safe_mime,
-                            "source": descriptor["name"],
-                        },
-                    })
                 if self.ui:
                     self.ui.show_info(
                         f"Attached {descriptor['name']} ({descriptor['attachment_id'][:8]})"
                     )
-                return descriptor
+                # Fall through to the provider-native staging below so
+                # staged_files mirrors the legacy contract: images become
+                # image_input dicts with the full source path, other files
+                # keep flowing through provider.upload_file.
             except Exception as e:
                 if self.ui:
                     self.ui.show_error(f"Attachment failed: {e}")
@@ -326,7 +326,8 @@ class Session:
         try:
             self._subagent_registry.bind_parent(self)
         except Exception:
-            pass
+            # Defensive: best-effort path must not break the caller.
+            logger.debug("Suppressed exception", exc_info=True)
         try:
             from mu.attachment import AttachmentRegistry
             from utils.config import HISTORY_DIR
@@ -553,6 +554,9 @@ class Session:
         session_goal = str(self.variables.get("session_goal", "") or "").strip()
         if session_goal:
             sections.append(f"- session_goal (pinned): {session_goal}")
+            sections.append(
+                f"- Active Goal: {session_goal}"
+            )
             sections.append(
                 "- session_goal_policy: every meaningful action should advance "
                 "this goal. If a sub-task drifts off, pause and re-anchor. "
@@ -910,7 +914,8 @@ class Session:
                     sk_bucket.setdefault("last_used_at", None)
                     sk_bucket["auto_expansions"] = int(sk_bucket["auto_expansions"]) + 1
                 except Exception:
-                    pass
+                    # Defensive: best-effort path must not break the caller.
+                    logger.debug("Suppressed exception", exc_info=True)
 
     def _inject_hierarchical_context(
         self,
@@ -1185,7 +1190,8 @@ class Session:
                 try:
                     self.ui.show_info(f"⏹  Hook abort ({point}): {reason_str}")
                 except Exception:
-                    pass
+                    # Defensive: best-effort path must not break the caller.
+                    logger.debug("Suppressed exception", exc_info=True)
 
     def _execute_tool_with_memory(
         self,
@@ -1491,7 +1497,10 @@ class Session:
                 )
                 self._last_durable_writes = [item.to_dict() for item in durable_writes]
                 if durable_writes:
-                    self.session_manager.save_history(self.folder_context)
+                    # Phase-6 r22 F2: this capture still runs inside the
+                    # armed turn window — plain save_history would LWW a
+                    # concurrent surface write. Route through turn CAS.
+                    self.session_manager.save_history_turn(self.folder_context)
                     if (
                         self.ui
                         and self.variables.get("durable_memory_show_receipts", True)
@@ -1576,10 +1585,34 @@ class Session:
         """
         from mu.agent.loop_body import run_turn
 
+        # Phase-6 F47: arm turn-scoped CAS for the whole turn. Every
+        # save_history_turn during the run verifies the on-disk revision
+        # against the turn baseline; a concurrent surface write (GUI /
+        # mobile / CLI) is detected and merged instead of clobbered.
+        # Disarmed in the finally below — no path leaks the armed state.
+        try:
+            self.session_manager.begin_turn_cas()
+        except Exception:
+            logger.debug("begin_turn_cas failed", exc_info=True)
+        # Phase-6 r21 F4: bind this Session as the manager's runtime
+        # owner so a mid-turn winner reload (save_history_turn conflict
+        # path) can re-sync Session aliases to the adopted objects.
+        try:
+            self.session_manager._bind_runtime_owner(self)
+        except Exception:
+            logger.debug("bind_runtime_owner failed", exc_info=True)
         try:
             return run_turn(self, text)
         finally:
+            # Phase-6 r22 F3: persistence-bearing turn cleanup (goal
+            # strip saves) runs while turn CAS is STILL ARMED so its
+            # save merges against a concurrent surface write instead of
+            # clobbering it after the protective window closed.
             self._strip_session_goal_after_turn()
+            try:
+                self.session_manager.end_turn_cas()
+            except Exception:
+                logger.debug("end_turn_cas failed", exc_info=True)
             # Lazy LAYER 3B: clear the orchestrator role once no children are
             # active so a session that spawned sub-agents earlier doesn't keep
             # emitting ORCHESTRATOR guidance on unrelated future turns. The
@@ -1589,7 +1622,8 @@ class Session:
                     if str(self.variables.get("session_role", "") or "") == "parent":
                         self.variables["session_role"] = ""
             except Exception:
-                pass
+                # Defensive: best-effort path must not break the caller.
+                logger.debug("Suppressed exception", exc_info=True)
             # Clean up turn-prompt protection now that the turn is over.
             # The turn's starting prompt was protected during the active
             # turn; after the turn, unprotect it if it's not otherwise
@@ -1598,6 +1632,15 @@ class Session:
             if turn_idx is not None:
                 self.session_manager._cleanup_protected(turn_idx)
                 self._current_turn_start_index = None
+            # Cross-surface phase 2 (G6): if the CLI-side watcher deferred a
+            # reload because this turn was executing, apply it now — the turn
+            # boundary is the one safe point (own state already saved).
+            try:
+                sync = getattr(self, "_surface_sync", None)
+                if sync is not None:
+                    sync.apply_pending()
+            except Exception:
+                logger.debug("surface sync apply_pending failed", exc_info=True)
             # Run tracer: emit the turn_end line and flush+close the trace
             # file. Runs on every exit path (normal completion, hook abort,
             # sub-agent kill, exception) — telemetry must never be lost and
@@ -1704,10 +1747,15 @@ class Session:
         # Clear the explicit flag so future modes' defaults apply
         # cleanly on the next turn. (See
         # `show_thinking_explicit` for the same pattern.)
+        # Phase-6 r23 F1: this runs INSIDE the armed turn window (the
+        # finally calls it before end_turn_cas) — plain save_history
+        # would LWW-clobber a concurrent surface write; route through
+        # turn CAS so it merges.
         try:
-            self.session_manager.save_history(self.folder_context)
+            self.session_manager.save_history_turn(self.folder_context)
         except Exception:
-            pass
+            # Defensive: best-effort path must not break the caller.
+            logger.debug("Suppressed exception", exc_info=True)
         # Tell the UI so the user has a clear breadcrumb that the
         # pin auto-released — handy when /goal status surprises them.
         ui = getattr(self, "ui", None)
@@ -1718,7 +1766,8 @@ class Session:
                     "Use /goal <text> to pin a new one."
                 )
             except Exception:
-                pass
+                # Defensive: best-effort path must not break the caller.
+                logger.debug("Suppressed exception", exc_info=True)
 
     def shutdown(self) -> None:
         """Release resources held for the lifetime of the session.

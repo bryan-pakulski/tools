@@ -12,6 +12,12 @@ import time
 from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Optional
 
+# Round-42 F6: hard cap on events materialized for analysis. Long-running
+# jobs (200k+ events) previously loaded EVERYTHING — GUI analysis
+# requests blocked and RSS ballooned. The newest window is enough for
+# every consumer; full-history totals use COUNT queries instead.
+_MAX_EVENTS = 20_000
+
 from .models import Job, JobEvent, JobStatus
 from .receipt import JobReceiptBuilder
 from .service import JobService
@@ -68,17 +74,47 @@ _EVENT_CATEGORY = {
 
 
 def _all_events(service: JobService, job_id: str) -> List[JobEvent]:
+    """Round-42 F6: bounded event snapshot. The unbounded variant loaded
+    EVERY event of a long-running job into memory before any analysis —
+    a 200k-event job allocated all of it up front (GUI analysis requests
+    blocked the event loop, analyzer RSS ballooned). The newest
+    _MAX_EVENTS are enough for every consumer: phase intervals, attempt
+    scoping, tool/model counters, gates/failures, and the timeline all
+    slice from the tail."""
     values: List[JobEvent] = []
     after = 0
+    total_seen = 0
     while True:
         batch = service.events(job_id, after_id=after, limit=5000)
         if not batch:
             break
         values.extend(batch)
+        total_seen += len(batch)
         after = batch[-1].id
-        if len(batch) < 5000:
+        if len(batch) < 5000 or total_seen >= _MAX_EVENTS:
             break
+    if total_seen > _MAX_EVENTS:
+        # Keep the NEWEST window; totals that need the full count come
+        # from a lightweight COUNT query (timeline_total_events), not
+        # from materialized events.
+        values = values[-_MAX_EVENTS:]
     return values
+
+
+def _event_total(service: JobService, job_id: str) -> int:
+    """Round-42 F6: exact full-history event count without materializing
+    the events — keeps timeline_total_events truthful when the analysis
+    window is capped."""
+    store = service.store
+    conn = store._connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM job_events WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row["n"]) if row is not None else 0
 
 
 def _category(event: JobEvent) -> str:
@@ -179,9 +215,30 @@ def _phase_analysis(job: Job, events: List[JobEvent], end_at: float) -> tuple[Li
 def _attempt_rows(attempts: List[Any], events: List[JobEvent]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for attempt in attempts:
-        finish = float(attempt.finished_at or attempt.started_at or 0.0)
-        start = float(attempt.started_at or finish)
+        # Round-35 F5: an unfinished (running/interrupted) attempt has no
+        # finished_at — the old finish=started_at collapsed its event scope
+        # to a single timestamp, reporting zero tool calls/messages/duration
+        # for live execution. Scope it to the analysis snapshot instead,
+        # capped by the next attempt's start when one exists.
+        start = float(attempt.started_at or 0.0)
+        finish = float(attempt.finished_at or 0.0)
+        if finish <= start:
+            finish = float("inf")
         scoped = [event for event in events if start <= float(event.created_at) <= finish]
+        if not attempt.finished_at:
+            next_start = next(
+                (
+                    float(other.started_at)
+                    for other in attempts
+                    if other is not attempt
+                    and other.started_at
+                    and float(other.started_at) > start
+                ),
+                None,
+            )
+            if next_start is not None:
+                finish = next_start
+                scoped = [event for event in events if start <= float(event.created_at) <= finish]
         metadata = attempt.metadata if isinstance(attempt.metadata, dict) else {}
         result = metadata.get("agent_result") if isinstance(metadata.get("agent_result"), dict) else {}
         tokens = result.get("tokens") if isinstance(result.get("tokens"), dict) else {}
@@ -373,7 +430,10 @@ def build_job_analysis(service: JobService, job_id: str, *, timeline_limit: int 
         "human_gates": gates,
         "failures": failures[-100:],
         "timeline": timeline,
-        "timeline_total_events": len(timeline_all),
+        # Round-42 F6: exact full-history total via COUNT — the materialized
+        # window is capped, so len() would understate long jobs.
+        "timeline_total_events": _event_total(service, job_id),
+        "timeline_window_events": len(timeline_all),
         "series": {
             "cumulative_cost": cumulative_cost,
             "attempt_duration": [

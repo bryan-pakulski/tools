@@ -386,41 +386,39 @@ def test_app_js_has_files_store_and_panel_mode():
 
 
 def test_base_html_loads_codemirror_vendor():
+    """CodeMirror was removed from the web shell (971d101); pin the absence."""
     src = open(BASE_HTML, encoding="utf-8").read()
-    assert "codemirror.min.js" in src
-    assert "codemirror.min.css" in src
-    assert "codemirror-modes.min.js" in src
-    # CM must load before app.js (Alpine boot order: app.js before alpine)
-    assert src.index("codemirror.min.js") < src.index("/static/js/app.js")
+    assert "codemirror" not in src.lower()
+    assert "/static/js/app.js" in src
 
 
 def test_index_html_includes_files_panel_and_disabled_binding():
     src = open(INDEX_HTML, encoding="utf-8").read()
     assert "fragments/files_panel.html" in src
-    # the non-external tools button honors v.disabled
-    assert "v.disabled" in src
-    assert ":disabled=\"v.disabled\"" in src
+    # the non-external tools selector honors v.disabled — it lives in the
+    # panel_tabs fragment that index.html includes.
+    tabs = open(os.path.join(REPO, "mu", "gui", "templates", "fragments", "panel_tabs.html"), encoding="utf-8").read()
+    assert "v.disabled" in tabs
+    assert ":disabled=\"v.disabled\"" in tabs
 
 
 def test_files_panel_template_exists_with_cm_host_and_store():
+    """Lightweight browser panel (1b8ec71): no embedded CodeMirror editor."""
     src = open(FILES_PANEL, encoding="utf-8").read()
     assert 'data-mode="files"' in src
     assert "$store.files" in src
-    assert "filesPanel()" in src
-    assert "cmHost" in src
-    assert "CodeMirror(" in src
-    # The host is inserted by x-if only after a file is selected. Its x-init
-    # must mount and populate CodeMirror at that point.
-    assert "x-init=\"mountEditor()\"" in src
-    assert "mountEditor()" in src
+    assert "filesBrowserPanel()" in src
+    # The embedded editor stayed removed: no CM host, no CodeMirror calls.
+    assert "CodeMirror" not in src
+    assert "cmHost" not in src
+    assert "mountEditor" not in src
+    assert "Browse the attached workspace" in src
 
 
 def test_css_has_files_panel_and_codemirror_theme():
     src = open(APP_CSS, encoding="utf-8").read()
     assert ".files-panel" in src
     assert ".files-tree" in src
-    assert ".files-editor" in src
-    assert ".CodeMirror" in src
     assert "var(--bg)" in src
 
 
@@ -512,16 +510,6 @@ def test_session_controls_use_nonblocking_detach_and_show_unload_errors():
 
 
 def test_codemirror_vendor_files_present():
-    assert os.path.isfile(CM_JS) and os.path.getsize(CM_JS) > 100_000
-    assert os.path.isfile(CM_CSS) and os.path.getsize(CM_CSS) > 1000
-    assert os.path.isfile(CM_MODES) and os.path.getsize(CM_MODES) > 50_000
-    # the modes bundle registers the languages we use
-    modes_src = open(CM_MODES, encoding="utf-8").read()
-    for marker in (
-        'defineMIME("text/x-python"',
-        'defineMIME("application/json"',
-        'defineMIME("text/markdown"',
-        'defineMIME("text/x-sh"',
-        'defineMIME("text/html"',
-    ):
-        assert marker in modes_src, f"missing mode: {marker}"
+    """Vendor bundles were deleted with the embedded editor (1b8ec71)."""
+    for path in (CM_JS, CM_CSS, CM_MODES):
+        assert not os.path.isfile(path), f"CodeMirror vendor should stay removed: {path}"

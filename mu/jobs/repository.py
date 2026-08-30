@@ -178,6 +178,14 @@ class RepositoryRegistry:
         now = time.time()
         conn = self._connect()
         try:
+            # Round-41 F9: BEGIN IMMEDIATE BEFORE the read-merge — the old
+            # order (read + merge metadata, then lock) let two concurrent
+            # registrations of the same repository both read the same old
+            # metadata, merge different updates, and upsert sequentially:
+            # the later writer silently discarded the earlier one's
+            # metadata. Under the immediate lock the read-merge-upsert is
+            # one atomic critical section.
+            conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT * FROM job_repositories WHERE id = ?",
                 (info["id"],),
@@ -200,7 +208,6 @@ class RepositoryRegistry:
                 }
             )
             previous_metadata.update(metadata or {})
-            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 INSERT INTO job_repositories (
@@ -259,12 +266,33 @@ class RepositoryRegistry:
         )
 
     def list(self, *, limit: int = 200) -> List[RepositoryRecord]:
+        # Round-49 F8: this was an N+1 — ids fetched, then get() per row,
+        # each get() opening its own SQLite connection. One query, one
+        # connection; rows map directly to records.
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id FROM job_repositories ORDER BY updated_at DESC LIMIT ?",
+                "SELECT * FROM job_repositories ORDER BY updated_at DESC LIMIT ?",
                 (max(1, min(int(limit), 1000)),),
             ).fetchall()
         finally:
             conn.close()
-        return [self.get(row["id"]) for row in rows]
+        out: List[RepositoryRecord] = []
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+            out.append(
+                RepositoryRecord(
+                    id=row["id"],
+                    canonical_path=row["canonical_path"],
+                    git_common_dir=row["git_common_dir"],
+                    origin_url=row["origin_url"],
+                    default_branch=row["default_branch"],
+                    created_at=float(row["created_at"]),
+                    updated_at=float(row["updated_at"]),
+                    metadata=metadata,
+                )
+            )
+        return out

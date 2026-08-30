@@ -3,50 +3,85 @@
        x-show="$store.mode.active === 'artifacts'"
        x-transition.opacity.duration.200ms
        x-effect="$store.mode.active === 'artifacts' && ($store.artifacts.load($store.chat.currentName), $store.attachments.load($store.chat.currentName))">
-    <!-- MUCLI_UNIFIED_REGISTRIES_V1: agent outputs + user inputs share one panel. -->
+    <!-- MUCLI_UNIFIED_REGISTRIES_V1: agent outputs + user inputs share one panel.
+         MUCLI_VIZ_SUBSECTIONS_V1: visualizations + files split into separate registries. -->
     <div class="artifacts-panel-head">
         <div>
             <span class="label-mono">Session files</span>
-            <p>Agent outputs and your uploaded source files, kept in separate registries.</p>
+            <p x-show="$store.artifacts.current.length">Visualizations, files, and your uploads, kept in separate registries.</p>
+            <p x-show="!$store.artifacts.current.length">No artifacts yet — outputs the agent publishes will appear here.</p>
         </div>
         <button type="button" class="icon-btn"
                 @click="$store.artifacts.load($store.chat.currentName, true); $store.attachments.load($store.chat.currentName)"
                 :disabled="$store.artifacts.loading || $store.attachments.loading || $store.attachments.uploading"
-                title="Refresh session files" aria-label="Refresh session files">↻</button>
+                title="Refresh session files" aria-label="Refresh session files">&#8635;</button>
     </div>
 
     <div class="unified-registry-body">
+        <section class="registry-section visualizations-registry" aria-labelledby="visualizations-title">
+            <div class="registry-section-head">
+                <div>
+                    <strong id="visualizations-title">Visualizations</strong>
+                    <span>Charts and interactive views published by the agent.</span>
+                </div>
+                <span class="registry-count"
+                      x-text="$store.artifacts.visualizations().length"></span>
+            </div>
+
+            <div class="registry-section-status ui-loading-region" x-show="$store.artifacts.loading">Refreshing visualizations…</div>
+            <div class="registry-section-empty"
+                 x-show="!$store.artifacts.loading && !$store.artifacts.visualizations().length">
+                <strong>No visualizations</strong>
+                <span>Charts created with <code>publish_visualization</code> appear here.</span>
+            </div>
+
+            <div class="registry-section-list" x-show="$store.artifacts.visualizations().length">
+                <template x-for="a in $store.artifacts.visualizations()" :key="a.artifact_id">
+                    <div class="artifact-row">
+                        <a class="artifact-row-main" :href="a.view_url" target="_blank" rel="noopener noreferrer"
+                           :title="'Open ' + (a.title || a.name)">
+                            <span class="artifact-row-icon">&#8599;</span>
+                            <span class="artifact-row-copy">
+                                <strong x-text="a.title || a.name"></strong>
+                                <span x-text="$store.artifacts.formatSize(a.size) + ' · visualization'"></span>
+                            </span>
+                        </a>
+                        <button type="button" class="artifact-row-delete"
+                                title="Delete visualization" aria-label="Delete visualization"
+                                @click.stop="$store.confirm.ask(`Delete visualization '${a.name}'?`, $event, () => $store.artifacts.remove(a.artifact_id, $store.chat.currentName), {danger:true})">×</button>
+                    </div>
+                </template>
+            </div>
+        </section>
+
         <section class="registry-section model-artifacts-registry" aria-labelledby="model-artifacts-title">
             <div class="registry-section-head">
                 <div>
-                    <strong id="model-artifacts-title">Model artifacts</strong>
-                    <span>Files and visualizations published by the agent.</span>
+                    <strong id="model-artifacts-title">Files</strong>
+                    <span>Documents, data, and other outputs from the agent.</span>
                 </div>
                 <span class="registry-count"
-                      x-text="$store.artifacts.current.length"></span>
+                      x-text="$store.artifacts.files().length"></span>
             </div>
 
-            <div class="registry-section-status" x-show="$store.artifacts.loading">Refreshing model artifacts…</div>
+            <div class="registry-section-status ui-loading-region" x-show="$store.artifacts.loading">Refreshing files…</div>
             <div class="registry-section-empty"
-                 x-show="!$store.artifacts.loading && !$store.artifacts.current.length">
-                <strong>No model artifacts</strong>
+                 x-show="!$store.artifacts.loading && !$store.artifacts.files().length">
+                <strong>No files</strong>
                 <span>Outputs created with <code>upload_artifact</code> appear here.</span>
             </div>
 
-            <div class="registry-section-list" x-show="$store.artifacts.current.length">
-                <template x-for="a in $store.artifacts.current" :key="a.artifact_id">
+            <div class="registry-section-list" x-show="$store.artifacts.files().length">
+                <template x-for="a in $store.artifacts.files()" :key="a.artifact_id">
                     <div class="artifact-row">
                         <a class="artifact-row-main" :href="a.download_url" download
                            :title="'Download ' + a.name">
-                            <span class="artifact-row-icon">↓</span>
+                            <span class="artifact-row-icon">&#8595;</span>
                             <span class="artifact-row-copy">
                                 <strong x-text="a.title || a.name"></strong>
-                                <span x-text="$store.artifacts.formatSize(a.size) + ' · ' + (a.kind === 'visualization' ? 'visualization' : (a.mime_type || 'file'))"></span>
+                                <span x-text="$store.artifacts.formatSize(a.size) + ' · ' + (a.mime_type || 'file')"></span>
                             </span>
                         </a>
-                        <a class="artifact-row-download" x-show="a.kind === 'visualization'"
-                           :href="a.view_url" target="_blank" rel="noopener noreferrer"
-                           title="Open visualization" aria-label="Open visualization">↗</a>
                         <button type="button" class="artifact-row-delete"
                                 title="Delete artifact" aria-label="Delete artifact"
                                 @click.stop="$store.confirm.ask(`Delete artifact '${a.name}'?`, $event, () => $store.artifacts.remove(a.artifact_id, $store.chat.currentName), {danger:true})">×</button>
@@ -72,7 +107,7 @@
                 </div>
             </div>
 
-            <div class="registry-section-status" x-show="$store.attachments.loading">Refreshing file uploads…</div>
+            <div class="registry-section-status ui-loading-region" x-show="$store.attachments.loading">Refreshing file uploads…</div>
             <div class="registry-section-status selected-upload-status"
                  x-show="!$store.attachments.loading && $store.attachments.selectedIds().length"
                  x-text="$store.attachments.selectedIds().length + ($store.attachments.selectedIds().length === 1 ? ' file selected for the next message' : ' files selected for the next message')"></div>
@@ -98,7 +133,7 @@
                             </span>
                         </button>
                         <a class="artifact-row-download" :href="item.download_url" download
-                           :title="'Download ' + item.name" aria-label="Download uploaded file">↓</a>
+                           :title="'Download ' + item.name" aria-label="Download uploaded file">&#8595;</a>
                         <button type="button" class="artifact-row-delete"
                                 title="Delete uploaded file" aria-label="Delete uploaded file"
                                 @click.stop="$store.confirm.ask(`Delete uploaded file '${item.name}'?`, $event, () => $store.attachments.remove(item), {danger:true})">×</button>

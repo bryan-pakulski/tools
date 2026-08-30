@@ -127,6 +127,29 @@ def _apply_diff_review_gate(
                 "proposal_id must reference an approved diff proposal."
             ),
         )
+    if getattr(proposal, "applied_at", None) is not None:
+        return _build_tool_envelope(
+            tool_name=tool_name,
+            ok=False,
+            error_code="access_denied",
+            message=(
+                "Error: apply_diff blocked in review mode. "
+                f"proposal {proposal_id} has already been applied and is single-use."
+            ),
+        )
+    # The approved proposal's diff is the ONLY diff this proposal_id
+    # authorizes - reusing the id with different content must fail.
+    submitted_diff = str(args.get("diff", "") or "")
+    if submitted_diff != proposal.diff:
+        return _build_tool_envelope(
+            tool_name=tool_name,
+            ok=False,
+            error_code="access_denied",
+            message=(
+                "Error: apply_diff blocked in review mode. "
+                f"the submitted diff does not match approved proposal {proposal_id}."
+            ),
+        )
     return None
 
 
@@ -252,6 +275,29 @@ def dispatch(
                 manager.restore_research_sources()
         raw_result = handler(args, context)
         envelope = _envelope_from_handler_result(tool_name, raw_result)
+        # Review-mode single-use: after a SUCCESSFUL review-gated apply,
+        # mark the proposal applied so its id cannot be reused.
+        if tool_name == "apply_diff" and envelope.get("ok") and session is not None:
+            try:
+                manager = getattr(session, "session_manager", None)
+                feature_state = manager.get_feature_state() if manager else None
+                plan_meta = str(
+                    (feature_state or {}).get("metadata_path", "") or ""
+                ).strip()
+                proposal_id = str(args.get("proposal_id", "") or "").strip()
+                if plan_meta and proposal_id:
+                    from mu.feature.engine import mark_proposal_applied
+
+                    mark_proposal_applied(
+                        plan_meta,
+                        proposal_id=proposal_id,
+                        applied_file=str(args.get("filename", "") or ""),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "apply_diff: could not mark proposal %s applied: %s",
+                    args.get("proposal_id"), exc,
+                )
         if tool_name in _RESEARCH_SOURCE_TOOLS and session is not None:
             manager = getattr(session, "session_manager", None)
             if manager is not None and hasattr(manager, "snapshot_research_sources"):

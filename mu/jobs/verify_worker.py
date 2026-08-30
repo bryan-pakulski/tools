@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import threading
+from typing import Optional
 
 from .models import AttentionReason, JobStatus
 from .receipt import JobReceiptBuilder
@@ -14,13 +15,26 @@ from .verification import DeterministicVerifier, VerificationRun
 from .worktree import WorktreeError
 
 
-def _heartbeat(service, job_id: str, worker_id: str, ttl: int, stop: threading.Event) -> None:
+def _heartbeat(
+    service,
+    job_id: str,
+    worker_id: str,
+    ttl: int,
+    stop: threading.Event,
+    lease_lost: "Optional[threading.Event]" = None,
+) -> None:
     interval = max(3.0, float(ttl) / 3.0)
     while not stop.wait(interval):
         try:
             if not service.heartbeat(job_id, worker_id, ttl_seconds=ttl):
+                # Lease gone: signal the verifier to stop before it can
+                # apply results it no longer owns.
+                if lease_lost is not None:
+                    lease_lost.set()
                 return
         except Exception:
+            if lease_lost is not None:
+                lease_lost.set()
             return
 
 
@@ -40,6 +54,7 @@ def verification_feedback(run: VerificationRun) -> dict:
     return {
         "verification_id": run.id,
         "status": run.status,
+        "verified_head_sha": run.head_sha,
         "manifest_path": run.manifest_path,
         "summary": run.summary,
         "failed_checks": failed,
@@ -68,7 +83,11 @@ def _materialize_for_review(service, job_id: str, feedback: dict) -> tuple[bool,
     """
 
     try:
-        info = materialize_review_branch(service, job_id)
+        info = materialize_review_branch(
+            service,
+            job_id,
+            expected_head_sha=str(feedback.get("verified_head_sha") or "") or None,
+        )
         return True, {**feedback, "review_branch": info.to_dict()}
     except WorktreeError as exc:
         payload = {**feedback, "review_branch_error": exc.to_dict()}
@@ -178,9 +197,10 @@ def apply_verification_result(service, job_id: str, run: VerificationRun) -> int
 def run_verification(job_id: str, worker_id: str, *, lease_ttl_seconds: int = 45) -> int:
     service = get_default_job_service()
     heartbeat_stop = threading.Event()
+    lease_lost = threading.Event()
     heartbeat_thread = threading.Thread(
         target=_heartbeat,
-        args=(service, job_id, worker_id, lease_ttl_seconds, heartbeat_stop),
+        args=(service, job_id, worker_id, lease_ttl_seconds, heartbeat_stop, lease_lost),
         name=f"mucli-job-verify-heartbeat-{job_id[:8]}",
         daemon=True,
     )
@@ -198,6 +218,26 @@ def run_verification(job_id: str, worker_id: str, *, lease_ttl_seconds: int = 45
             return 0
         heartbeat_thread.start()
         run = DeterministicVerifier(service).verify(job)
+        if lease_lost.is_set():
+            # Lease expired mid-verification: a retried verifier will take
+            # over. Do not apply results this worker no longer owns.
+            service.store.append_event(
+                job_id,
+                "verification_lease_lost_midrun",
+                reason="heartbeat lost; verifier abandoning result",
+                payload={"worker_id": worker_id},
+            )
+            return 6
+        if not service.store.assert_lease(job_id, worker_id):
+            # Final transactional gate before apply_verification_result:
+            # closes the check-then-act window against takeover.
+            service.store.append_event(
+                job_id,
+                "verification_lease_lost_midrun",
+                reason="lease lost before result application",
+                payload={"worker_id": worker_id},
+            )
+            return 6
         return apply_verification_result(service, job_id, run)
 
     except JobStateError:

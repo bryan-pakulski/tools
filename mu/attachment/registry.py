@@ -160,11 +160,33 @@ class AttachmentRegistry:
                 shutil.rmtree(target_dir, ignore_errors=True)
                 raise
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        """Return attachment descriptors newest-first.
+
+        Round-44 F9: ``limit`` bounds the work — only the newest ``limit``
+        entries are stat()'d and normalized. Bounded reads skip the
+        prune/rewrite self-heal (they cannot vouch for entries they never
+        examined), mirroring ArtifactRegistry.list().
+        """
         with self._lock:
             entries: list[dict[str, Any]] = []
             changed = False
-            for entry in self._read():
+            raw = self._read()
+            if limit is not None and limit >= 0:
+                # Round-45 F5: legacy entries can lack created_at — sort by
+                # (created_at, append_index) so missing timestamps keep
+                # append order (the recency order for legacy registries)
+                # instead of colliding in bucket 0.
+                indexed = list(enumerate(raw))
+                indexed.sort(
+                    key=lambda pair: (
+                        float(pair[1].get("created_at", 0) or 0),
+                        pair[0],
+                    ),
+                    reverse=True,
+                )
+                raw = [entry for _, entry in indexed[:limit]]
+            for entry in raw:
                 attachment_id = str(entry.get("attachment_id") or "")
                 path = self.resolve_path(attachment_id, _entry=entry)
                 if path and os.path.isfile(path):
@@ -179,8 +201,10 @@ class AttachmentRegistry:
                     changed = changed or fresh != entry
                 else:
                     changed = True
-            if changed:
+            if changed and limit is None:
                 self._write(entries)
+            if limit is not None:
+                return entries  # pre-sorted newest-first
             return sorted(
                 entries,
                 key=lambda item: float(item.get("created_at", 0) or 0),

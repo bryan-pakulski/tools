@@ -562,9 +562,15 @@ def register_source(
     """
     Convenience function to register a source with the global citation manager.
 
+    Sources registered through this research-tools entry point carry a
+    conservative type-based prior credibility (half the type's hard cap) so
+    the /research status surface reflects provisional evidence quality
+    before an explicit assess_source() call. Unassessed sources added via
+    CitationManager.add_source directly remain 0.0.
+
     Args:
         title: The title of the source
-        url: The URL of the source
+        url: The url of the source
         source_type: The type of source
         authors: Optional list of authors
         date: Optional publication date
@@ -574,7 +580,7 @@ def register_source(
     Returns:
         The citation ID for this source
     """
-    return get_citation_manager().add_source(
+    citation_id = get_citation_manager().add_source(
         title=title,
         url=url,
         source_type=source_type,
@@ -583,6 +589,12 @@ def register_source(
         metadata=metadata,
         topic=topic,
     )
+    source = get_citation_manager().get_source(citation_id)
+    if source is not None and source.credibility_score == 0.0:
+        # Conservative prior: half the type's hard cap. assess_source()
+        # overrides this with the model's evidence assessment.
+        source.credibility_score = round(source_type_cap(source_type) / 2.0, 3)
+    return citation_id
 
 
 def get_citation(citation_id: int) -> str:

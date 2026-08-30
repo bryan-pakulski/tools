@@ -1,10 +1,13 @@
 {% extends "base.html" %}
 {% block title %}MuCLI{% if session_active %} — {{ session_name }}{% endif %}{% endblock %}
-{% block body %}
+{% block page_styles %}
 <link rel="stylesheet" href="/static/css/product.css">
 <link rel="stylesheet" href="/static/css/crystal.css">
 <link rel="stylesheet" href="/static/css/clarity.css">
 <link rel="stylesheet" href="/static/css/refinement.css">
+<link id="mucli-conversation-css" rel="stylesheet" href="/static/css/conversation.css">
+{% endblock %}
+{% block body %}
 <script src="/static/js/product.js"></script>
 <script src="/static/js/web_shell.js"></script>
 <script src="/static/js/history_hydration.js"></script>

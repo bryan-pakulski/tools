@@ -57,7 +57,21 @@ async def proxy_container_mode_request(
         if key != "session_name"
     ]
     query.append(("session_name", session_name))
+    # Round-27 F3: enforce the body limit BEFORE materializing it —
+    # await request.body() buffers the whole payload in memory, so a
+    # huge loopback request would be fully read only to be rejected by
+    # the supervisor's 2 MiB check afterwards.
+    _MAX_PROXY_BODY = 2 * 1024 * 1024
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > _MAX_PROXY_BODY:
+                return JSONResponse(status_code=413, content={"detail": "payload too large"})
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "invalid content-length"})
     body = await request.body()
+    if len(body) > _MAX_PROXY_BODY:
+        return JSONResponse(status_code=413, content={"detail": "payload too large"})
     provider = getattr(session, "provider", None)
     try:
         result = await asyncio.to_thread(

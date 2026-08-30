@@ -230,14 +230,14 @@ export function ShellScreen() {
   const send = useCallback(() => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const command = inputValueRef.current;
+    const command = input || inputValueRef.current;
     recordHistory(command);
     setFollow(true);
     appendOutput(`$ ${command}\n`, true);
     ws.send(command + '\n');
     setInput('');
     requestAnimationFrame(() => inputRef.current?.focus());
-  }, [appendOutput, recordHistory, setFollow, setInput]);
+  }, [input, appendOutput]);
 
   const cycleHistory = useCallback((direction: -1 | 1) => {
     const history = historyRef.current;

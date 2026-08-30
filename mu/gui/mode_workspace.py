@@ -135,6 +135,13 @@ def research_workspace(
                 detail="Typed claims with an explicit source reference.",
             ),
             _metric(
+                "credible",
+                "high-credibility",
+                high_credibility,
+                tone="good" if high_credibility else "neutral",
+                detail="Sources scoring 0.75+ credibility — the threshold for citing a claim as well-evidenced.",
+            ),
+            _metric(
                 "sources",
                 "sources",
                 len(sources),

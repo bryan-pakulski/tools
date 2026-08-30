@@ -133,11 +133,17 @@ class ResultStore:
                     if not key:
                         continue
                     idx[key] = entry
-                    self._current_bytes += int(entry.get("bytes", 0) or 0)
         except FileNotFoundError:
             pass
         except Exception:  # noqa: BLE001
             pass
+        # Byte accounting must reflect LIVE entries only (codex round-7
+        # F5): duplicate index records for the same key used to add every
+        # historical record's size, inflating _current_bytes and causing
+        # valid results to be evicted after restart.
+        self._current_bytes = sum(
+            int(entry.get("bytes", 0) or 0) for entry in idx.values()
+        )
         self._index = idx
         return idx
 
@@ -212,7 +218,29 @@ class ResultStore:
         self._append_index(idx[key])
         self.puts += 1
         self._enforce_bounds(idx)
+        # Index compaction (codex round-7 F4): index.jsonl is append-only
+        # and replacements keep appending records. Without periodic
+        # compaction the file grows unboundedly even when payload bytes
+        # stay within cap. Compact when the index itself outgrows a
+        # fraction of the payload cap.
+        self._maybe_compact_index(idx)
         return path
+
+    def _maybe_compact_index(self, idx: Dict[str, dict]) -> None:
+        """Rewrite index.jsonl with only live entries when it balloons."""
+        try:
+            if not os.path.exists(self._index_path):
+                return
+            index_bytes = os.path.getsize(self._index_path)
+            if index_bytes <= max(1 << 20, self.max_bytes // 4):
+                return
+            tmp_path = self._index_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                for entry in idx.values():
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            os.replace(tmp_path, self._index_path)
+        except Exception:  # noqa: BLE001 — compaction is best-effort
+            pass
 
     def _enforce_bounds(self, idx: Dict[str, dict]) -> None:
         """Prune oldest stored keys (by stored_at) until under the byte cap."""

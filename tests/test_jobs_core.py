@@ -132,6 +132,70 @@ def test_worker_lease_is_exclusive_and_expired_run_becomes_recovering(tmp_path):
     )
 
 
+def test_recovered_lease_that_renewed_is_left_alone(tmp_path):
+    """Round-36 F1: recovery must CLAIM the expired lease (CAS) BEFORE
+    transitioning/replaying. A worker that renewed between the
+    expired_leases() snapshot and the claim keeps its fresh lease and its
+    RUNNING job — the old act-then-release order yanked the job to
+    RECOVERING while the live worker kept going (two owners)."""
+    clock = Clock()
+    service = make_service(tmp_path, clock)
+    job = service.create(JobSpec(title="Renewer"))
+    service.transition(job.id, JobStatus.PREPARING)
+    service.transition(job.id, JobStatus.RUNNING)
+    assert service.acquire(job.id, "worker-a", ttl_seconds=10)
+    clock.advance(11)  # lease now expired from the snapshot's perspective
+    assert service.heartbeat(job.id, "worker-a", ttl_seconds=10)  # renewal
+    assert service.recover_expired_leases() == []
+    current = service.get(job.id)
+    assert current.status == JobStatus.RUNNING  # untouched
+    assert current.worker_id == "worker-a"  # fresh lease preserved
+
+
+def test_assert_lease_rejects_expired_lease(tmp_path):
+    """Round-36 F2: an expired lease is NOT ownership — a worker whose
+    heartbeat died must fail the final gate instead of applying results
+    to a job that recovery may already be reassigning."""
+    clock = Clock()
+    service = make_service(tmp_path, clock)
+    job = service.create(JobSpec(title="Lapsed"))
+    service.transition(job.id, JobStatus.PREPARING)
+    service.transition(job.id, JobStatus.RUNNING)
+    assert service.acquire(job.id, "worker-a", ttl_seconds=10)
+    assert service.store.assert_lease(job.id, "worker-a") is True
+    clock.advance(11)
+    assert service.store.assert_lease(job.id, "worker-a") is False
+    # finish_attempt_owned refuses to write under an expired lease.
+    attempt = service.start_attempt(job.id, worker_id="worker-a")
+    assert service.store.finish_attempt_owned(
+        attempt.id, worker_id="worker-a", status="completed"
+    ) is False
+    stored = service.store.get_attempt(attempt.id)
+    assert stored.status == "running"  # untouched
+
+
+def test_timed_out_reachable_from_all_worker_active_states(tmp_path):
+    """Round-38 F3: the whole-job runtime deadline must be enforceable in
+    EVERY worker-active phase — PREPARING, VERIFYING, and RECOVERING were
+    missing TIMED_OUT transitions, so a hung worktree prepare or verifier
+    could never be reaped."""
+    for setup in ("prepare", "verify", "recover"):
+        clock = Clock()
+        service = make_service(tmp_path / setup, clock)
+        job = service.create(JobSpec(title=f"Timeout {setup}"))
+        if setup == "prepare":
+            service.transition(job.id, JobStatus.PREPARING)
+        elif setup == "verify":
+            service.transition(job.id, JobStatus.PREPARING)
+            service.transition(job.id, JobStatus.RUNNING)
+            service.transition(job.id, JobStatus.VERIFYING)
+        else:
+            service.transition(job.id, JobStatus.PREPARING)
+            service.transition(job.id, JobStatus.RECOVERING)
+        current = service.transition(job.id, JobStatus.TIMED_OUT)
+        assert current.status == JobStatus.TIMED_OUT, setup
+
+
 def test_attempt_records_survive_and_are_numbered(tmp_path):
     service = make_service(tmp_path)
     job = service.create(JobSpec(title="Attempts"))

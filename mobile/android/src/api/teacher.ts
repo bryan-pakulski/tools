@@ -70,6 +70,11 @@ export const teacherApi = {
     api.get<{ lesson_id: string; content: string }>(`/api/teacher/lessons/${encodeURIComponent(lessonId)}/lecture`),
   getExercises: (lessonId: string) =>
     api.get<{ lesson_id: string; files: Array<{ path: string; content: string }> }>(`/api/teacher/lessons/${encodeURIComponent(lessonId)}/exercises`),
-  getExerciseFile: (lessonId: string, path: string) =>
-    api.get<{ lesson_id: string; path: string; content: string }>(`/api/teacher/lessons/${encodeURIComponent(lessonId)}/exercises/${path}`),
+  getExerciseFile: (lessonId: string, path: string) => {
+    // Server-provided path goes into a URL route segment: percent-encode each
+    // segment (keep '/' separators — backend route is {path:path}) so ?#, ../
+    // fragments or encoded separators can't alter routing semantics.
+    const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+    return api.get<{ lesson_id: string; path: string; content: string }>(`/api/teacher/lessons/${encodeURIComponent(lessonId)}/exercises/${encodedPath}`);
+  },
 };

@@ -4,9 +4,10 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useTheme } from '../theme/ThemeContext';
-import { useConnectionStore } from '../store/connection';
+import { refreshPendingMutations, useConnectionStore } from '../store/connection';
 import { Text, Input, Button, Card } from '../components';
 import { checkHealth } from '../api/client';
+import { validateBaseUrl } from '../api/urlSafety';
 import type { RootStackParamList } from '../navigation/AppNavigator';
 import { spacing } from '../theme/tokens';
 
@@ -24,6 +25,8 @@ export function ConnectionScreen() {
         loadFromStorage().then(() => {
           setUrl(useConnectionStore.getState().baseUrl);
           setLoaded(true);
+          // G5 (§3.6): hydrate the queued-mutations badge from storage.
+          void refreshPendingMutations();
         });
       }
     }, [loaded, loadFromStorage]),
@@ -31,11 +34,12 @@ export function ConnectionScreen() {
 
   const testConnection = async () => {
     if (testing) return;
-    const candidate = url.trim().replace(/\/+$/, '');
-    if (!/^https?:\/\//i.test(candidate)) {
-      Alert.alert('Invalid server URL', 'Use an http:// or https:// URL.');
+    const validated = validateBaseUrl(url);
+    if (!validated.ok) {
+      Alert.alert('Invalid server URL', validated.error);
       return;
     }
+    const candidate = validated.url;
 
     // MUCLI_MOBILE_RECONNECT_YOLO_V1: transactional host test. Do not replace
     // the persisted working host until the candidate has answered healthz.
@@ -45,7 +49,7 @@ export function ConnectionScreen() {
     let reachable = false;
     try {
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-        if (await checkHealth(candidate)) {
+        if (await checkHealth(candidate, { timeoutMs: 5_000 })) {
           reachable = true;
           break;
         }
@@ -64,6 +68,17 @@ export function ConnectionScreen() {
 
       setBaseUrl(candidate);
       setConnected(true);
+      // Round-19 F44: replay fired only from autoReconnect — an explicit
+      // user reconnection left queued offline mutations stranded until
+      // some later reconnect happened. Fire-and-report here too; the
+      // outcome surfaces through the queue badge on the next screen.
+      useConnectionStore
+        .getState()
+        .replayPending()
+        .catch(() => {
+          // Badge refresh inside replayPending already recorded the
+          // failure; never block navigation on it.
+        });
       if (navigation.canGoBack()) navigation.goBack();
       else navigation.navigate('Chat');
     } finally {

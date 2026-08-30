@@ -36,6 +36,13 @@ const MUCLI_SESSION_TYPE_ICON_CONTENT = Object.freeze({
     ].join(""),
 });
 
+// The rail represents user prompts (conversation checkpoints), not arbitrary
+// provider/tool messages. Scan bounded raw-turn pages until each explicit
+// history load has found a useful checkpoint batch.
+const WEB_HISTORY_PAGE_TURNS = 200;
+const WEB_HISTORY_CHECKPOINT_BATCH = 5;
+const WEB_HISTORY_CHECKPOINT_SCAN_PAGES = 6;
+
 window.sessionTypeIconName = function sessionTypeIconName(type) {
     const normalized = type === "container" || type === "chat" ? type : "workspace";
     return MUCLI_SESSION_TYPE_ICON_NAMES[normalized];
@@ -102,11 +109,28 @@ document.addEventListener("alpine:init", () => {
                 // response"). Defer the reload until the turn completes.
                 pendingReload: false,
                 historyHydrated: false,
+                historyLoading: false,
                 // A response hand-off waits for replacement text before
                 // retiring the previous readable response.  Keeping the
                 // timer per session prevents background sessions from
                 // disturbing the focused transcript.
                 handoffTimer: null,
+                // Round-44 F4: streaming deltas coalesce per slot. Text
+                // accumulates in pendingDelta and flushes to the turn at a
+                // fixed cadence (RAF + 32ms floor) instead of running the
+                // full O(history) turn lookup + re-markdown per token.
+                pendingDelta: null,
+                deltaTimer: null,
+                // Round-44 F3: backward pagination cursors. hasMore turns
+                // exist above start_index; olderLoading guards one request
+                // at a time. hasMoreTurns is exposed for the header button.
+                oldestLoadedIndex: null,
+                windowEndIndex: null,
+                totalHistoryTurns: 0,
+                hasMoreTurns: false,
+                olderLoading: false,
+                activeStageId: null,
+                suppressEdgeLoadUntil: 0,
             };
         },
         _slot(name) {
@@ -116,9 +140,18 @@ document.addEventListener("alpine:init", () => {
         },
         current() { return this._slot(); },
         focus(name) {
+            const prev = this.currentName;
             this.currentName = name || null;
             this._slot(name);   // ensure created
             this.followOutput = true;
+            // Round-48 F5: the SSE stream is server-filtered to the focused
+            // session (r47 F3) — switching focus MUST reconnect with the new
+            // filter, or the newly focused session silently receives no
+            // live events while the connection looks healthy. Guard: only
+            // reconnect on an actual session change.
+            if ((prev || null) !== (this.currentName || null)) {
+                reconnectWithFocus();
+            }
             // Double-RAF: first frame lets Alpine swap the x-for turns to the
             // new session, second frame lets the DOM layout with the new
             // content. A single RAF fires before Alpine renders → scrollHeight
@@ -139,6 +172,28 @@ document.addEventListener("alpine:init", () => {
         set externalActive(v){ this._slot().externalActive = v; },
         get clock()          { return this._slot().clock; },
         set clock(v)         { this._slot().clock = v; },
+        get activeStageId()  { return this._slot().activeStageId; },
+        set activeStageId(v) { this._slot().activeStageId = v; },
+        get historyLoading() { return this._slot().historyLoading; },
+        get stages() {
+            const seen = new Set();
+            return this.turns
+                .filter(turn => {
+                    if (turn.role !== "user") return false;
+                    const key = Number.isInteger(turn.historyIndex)
+                        ? `history:${turn.historyIndex}`
+                        : `live:${turn.id}`;
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                })
+                .map(turn => ({
+                    id: turn.id,
+                    historyIndex: turn.historyIndex,
+                    text: String(turn.text || "(attachment)")
+                        .replace(/\s+/g, " ").trim().slice(0, 72),
+                }));
+        },
 
         // ---------- helpers ------------------------------------------
 
@@ -403,7 +458,10 @@ document.addEventListener("alpine:init", () => {
                 return result;
             };
 
-            const turns = flatten(previous);
+            // `previousTurns` is UI-state input only. Hydration and paging
+            // replace slot.turns before calling this helper, so grouping the
+            // previous array silently discards the page that just arrived.
+            const turns = flatten(slot.turns);
             const grouped = [];
             let index = 0;
             while (index < turns.length) {
@@ -503,13 +561,27 @@ document.addEventListener("alpine:init", () => {
             }
             if (!name || name === this.currentName) this.scroll();
         },
-        appendDelta(turn_id, text, name) {
+        // Round-44 F4: streaming deltas coalesce per slot. Every SSE token
+        // used to run the O(history) turn lookup, mutate text, and schedule
+        // a full re-Markdown of the whole accumulated answer — O(n) per
+        // token and quadratic in answer length. Deltas now accumulate in
+        // slot.pendingDelta and flush at most once per 32ms window, so the
+        // per-token cost is O(1) amortized and re-render cost is bounded by
+        // the flush cadence rather than the provider's token rate.
+        flushPendingDelta(name) {
             const slot = this._slot(name);
-            let t = this._findById(slot, turn_id);
+            if (slot.deltaTimer) {
+                clearTimeout(slot.deltaTimer);
+                slot.deltaTimer = null;
+            }
+            const pending = slot.pendingDelta;
+            if (!pending) return;
+            slot.pendingDelta = null;
+            let t = this._findById(slot, pending.turnId);
             if (!t || t.role !== "assistant") {
                 t = this._lastByRole(slot, "assistant");
                 if (!t || !t.streaming) {
-                    this.startAssistant(turn_id, name);
+                    this.startAssistant(pending.turnId, name);
                     t = this._lastByRole(slot, "assistant");
                 }
             }
@@ -517,28 +589,61 @@ document.addEventListener("alpine:init", () => {
             this._closeStreamingAssistants(slot, t.id);
             t.streaming = true;
             const startsSuccessor = !t.text;
-            t.text += text;
+            t.text += pending.text;
             if (startsSuccessor && t.text) this._beginAssistantHandoff(slot, t, name);
             if (this._renderRaf) cancelAnimationFrame(this._renderRaf);
             const turnRef = t;
+            // Round-47 F13: renderMarkdown() over the ENTIRE accumulated
+            // text on every 32ms flush is quadratic in response length and
+            // blocks the main thread on long replies. While streaming, the
+            // rAF only refreshes a cheap plain-text mirror (the template
+            // shows .rawText for streaming turns); ONE full markdown render
+            // happens at endAssistant().
             this._renderRaf = requestAnimationFrame(() => {
-                turnRef.html = renderMarkdown(turnRef.text);
+                turnRef.rawText = turnRef.text;
                 this._renderRaf = 0;
             });
             if (!name || name === this.currentName) this.scroll();
         },
+        appendDelta(turn_id, text, name) {
+            if (!text) return;
+            const slot = this._slot(name);
+            const safeTurnId = turn_id || "__active__";
+            const pending = slot.pendingDelta;
+            if (pending && pending.turnId === safeTurnId) {
+                pending.text += text;
+            } else {
+                if (pending) this.flushPendingDelta(name);
+                slot.pendingDelta = { turnId: safeTurnId, text };
+            }
+            if (!slot.deltaTimer) {
+                slot.deltaTimer = setTimeout(() => {
+                    slot.deltaTimer = null;
+                    this.flushPendingDelta(name);
+                }, 32);
+            }
+        },
         endAssistant(turn_id, name) {
             const slot = this._slot(name);
+            // Round-44 F4: flush coalesced deltas BEFORE finalizing so the
+            // full streamed text is present when streaming is retired.
+            this.flushPendingDelta(name);
             const t = this._findById(slot, turn_id) || this._lastByRole(slot, "assistant");
             if (!t) return;
             if (this._renderRaf) { cancelAnimationFrame(this._renderRaf); this._renderRaf = 0; }
             if (this._scrollRaf) { cancelAnimationFrame(this._scrollRaf); this._scrollRaf = 0; }
             if (this._highlightRaf) { cancelAnimationFrame(this._highlightRaf); this._highlightRaf = 0; }
             t.streaming = false;
+            // Round-47 F13: the full markdown render happens exactly once
+            // here (was: every 32ms flush during streaming — quadratic).
+            // Clear the plain-text mirror so the template switches back to
+            // the rendered HTML.
+            t.rawText = null;
             t.html = renderMarkdown(t.text);
             if (!name || name === this.currentName) {
-                queueMicrotask(highlightAll);
-                queueMicrotask(() => typesetMathInScope(".msg.assistant .body"));
+                queueMicrotask(() => requestAnimationFrame(() => {
+                    enhanceRenderedTurns([t.id]);
+                }));
                 // Settle the view after the final reflow — but only if the
                 // user is already following at the bottom (see scroll()).
                 queueMicrotask(() => this.scroll());
@@ -1018,6 +1123,8 @@ document.addEventListener("alpine:init", () => {
 
         finishTurn(name) {
             const slot = this._slot(name);
+            // Round-44 F4: never drop pending coalesced deltas on turn end.
+            this.flushPendingDelta(name);
             if (slot.handoffTimer) {
                 clearTimeout(slot.handoffTimer);
                 slot.handoffTimer = null;
@@ -1067,6 +1174,455 @@ document.addEventListener("alpine:init", () => {
             const el = event && event.currentTarget;
             if (!el) return;
             this.followOutput = this._atBottom(el);
+            this._updateActiveStage(el);
+            const slot = this._slot();
+            // Programmatic stage/page jumps can land at an edge. Do not turn
+            // that synthetic scroll event into a second pagination request.
+            if (Date.now() < slot.suppressEdgeLoadUntil) return;
+            // Round-44 F3: auto-load older turns when the user scrolls near
+            // the top. Guarded: one request at a time, only when the cursor
+            // says more pages exist. Preserves scroll position — prepended
+            // turns push content down, so restore the previous offset after
+            // the DOM grows (same double-RAF settle as loadHistory).
+            if (el.scrollTop < 120) {
+                if (
+                    slot.hasMoreTurns
+                    && !slot.olderLoading
+                    && !slot.busy
+                    && slot.oldestLoadedIndex !== null
+                    && slot.oldestLoadedIndex > 0
+                ) {
+                    this.loadOlder();
+                }
+            }
+        },
+
+        _updateActiveStage(el) {
+            if (this._stageRaf) return;
+            this._stageRaf = requestAnimationFrame(() => {
+                this._stageRaf = 0;
+                if (!el || !el.isConnected) return;
+                // offsetTop is relative to each element's offsetParent, which
+                // changes across responsive/product layouts. Compare viewport
+                // rectangles instead: the active stage is the newest prompt
+                // above the reading line inside the actual scroll viewport.
+                const containerRect = el.getBoundingClientRect();
+                const readingLine = containerRect.top + Math.min(180, containerRect.height * 0.32);
+                let active = null;
+                const stages = this.stages;
+                const stageIds = new Set(stages.map(stage => stage.id));
+                for (const node of el.querySelectorAll('.turn-wrap[data-turn-id]')) {
+                    const id = node.dataset.turnId;
+                    if (!stageIds.has(id)) continue;
+                    const box = this._turnBox(node);
+                    if (box.getBoundingClientRect().top <= readingLine) active = id;
+                    else break;
+                }
+                this.activeStageId = active || (stages[0] && stages[0].id) || null;
+                queueMicrotask(() => {
+                    const selected = document.querySelector('.conversation-stage-link.active');
+                    const list = selected?.closest('.conversation-stage-list');
+                    if (!selected || !list) return;
+                    const selectedTop = selected.offsetTop;
+                    const selectedBottom = selectedTop + selected.offsetHeight;
+                    if (selectedTop < list.scrollTop) list.scrollTop = selectedTop;
+                    else if (selectedBottom > list.scrollTop + list.clientHeight) {
+                        list.scrollTop = selectedBottom - list.clientHeight;
+                    }
+                });
+            });
+        },
+
+        _turnBox(wrapper) {
+            if (!wrapper) return wrapper;
+            // .turn-wrap intentionally uses display:contents, so its own
+            // rectangle is always 0×0. Geometry and scroll operations must
+            // target the concrete element cloned by Alpine's x-if template.
+            for (const child of wrapper.children) {
+                if (child.tagName === 'TEMPLATE') continue;
+                const rect = child.getBoundingClientRect();
+                if (rect.width > 0 || rect.height > 0) return child;
+            }
+            return wrapper;
+        },
+
+        _setHistoryScrollTop(el, top) {
+            if (!el) return;
+            const slot = this._slot();
+            slot.suppressEdgeLoadUntil = Date.now() + 180;
+            // The base stylesheet historically enabled smooth scrolling for
+            // every scrollTop write. Cursor restoration and page navigation
+            // must be immediate or subsequent renders interrupt the motion.
+            const previousBehavior = el.style.scrollBehavior;
+            el.style.scrollBehavior = 'auto';
+            el.scrollTop = Math.max(0, top);
+            el.style.scrollBehavior = previousBehavior;
+        },
+
+        _afterHistoryRender(callback) {
+            return new Promise(resolve => {
+                queueMicrotask(() => requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        try {
+                            callback();
+                        } finally {
+                            resolve();
+                        }
+                    });
+                }));
+            });
+        },
+
+        _captureHistoryAnchor(el) {
+            if (!el) return null;
+            const containerTop = el.getBoundingClientRect().top;
+            const wrapper = Array.from(el.querySelectorAll('.turn-wrap[data-turn-id]'))
+                .find(item => this._turnBox(item).getBoundingClientRect().bottom >= containerTop);
+            const node = this._turnBox(wrapper);
+            return {
+                id: wrapper?.dataset.turnId || null,
+                top: node ? node.getBoundingClientRect().top : containerTop,
+                scrollTop: el.scrollTop,
+                scrollHeight: el.scrollHeight,
+            };
+        },
+
+        _restoreHistoryAnchor(el, anchor, { accountForPrependedHeight = false } = {}) {
+            if (!el || !anchor) return;
+            const wrapper = anchor.id
+                ? Array.from(el.querySelectorAll('.turn-wrap[data-turn-id]'))
+                    .find(item => item.dataset.turnId === anchor.id)
+                : null;
+            const node = this._turnBox(wrapper);
+            if (node) {
+                // Use the browser's CURRENT scrollTop. Chromium may have
+                // partially applied native overflow anchoring before this
+                // callback; adding the visual delta is correct either way.
+                this._setHistoryScrollTop(
+                    el,
+                    el.scrollTop + node.getBoundingClientRect().top - anchor.top,
+                );
+                return;
+            }
+            const heightDelta = accountForPrependedHeight
+                ? Math.max(0, el.scrollHeight - anchor.scrollHeight)
+                : 0;
+            this._setHistoryScrollTop(
+                el,
+                Math.min(
+                    anchor.scrollTop + heightDelta,
+                    Math.max(0, el.scrollHeight - el.clientHeight),
+                ),
+            );
+        },
+
+        _scrollToRenderedTurn(el, id) {
+            if (!el || !id) return false;
+            const wrapper = Array.from(el.querySelectorAll('.turn-wrap[data-turn-id]'))
+                .find(item => item.dataset.turnId === id);
+            if (!wrapper) return false;
+            const node = this._turnBox(wrapper);
+            const slot = this._slot();
+            slot.suppressEdgeLoadUntil = Date.now() + 180;
+            const previousBehavior = el.style.scrollBehavior;
+            el.style.scrollBehavior = 'auto';
+            // Let the browser resolve the actual nested scroll container,
+            // then apply the timeline's reading offset. This is more robust
+            // than reconstructing scrollTop from viewport rectangles across
+            // the responsive/product layouts.
+            node.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
+            el.scrollTop = Math.max(0, el.scrollTop - 28);
+            el.style.scrollBehavior = previousBehavior;
+            return true;
+        },
+
+        jumpToStage(id) {
+            const el = document.querySelector('.chat-history');
+            if (!this._scrollToRenderedTurn(el, id)) return;
+            this.followOutput = false;
+            this.activeStageId = id;
+            this._updateActiveStage(el);
+            // Alpine/MathJax may finish a pending layout pass in the same
+            // frame. Re-assert the selected checkpoint once after layout.
+            requestAnimationFrame(() => {
+                if (this.activeStageId === id) this._scrollToRenderedTurn(el, id);
+            });
+        },
+
+        _flattenTimeline(items) {
+            const flattened = [];
+            for (const item of items || []) {
+                if (item && item.role === "collapse") {
+                    flattened.push(...this._flattenTimeline(item.childTurns || []));
+                } else if (item) {
+                    flattened.push(item);
+                }
+            }
+            return flattened;
+        },
+
+        _timelineRange(items, startIndex, endIndex) {
+            return this._flattenTimeline(items).filter(item => (
+                !Number.isInteger(item.historyIndex)
+                || (item.historyIndex >= startIndex && item.historyIndex < endIndex)
+            ));
+        },
+
+        async _fetchCheckpointBatch(target, beforeIndex = null) {
+            let cursor = Number.isInteger(beforeIndex) ? beforeIndex : null;
+            let firstResponse = null;
+            let lastResponse = null;
+            let turns = [];
+            const checkpointIndexes = new Set();
+
+            for (
+                let page = 0;
+                page < WEB_HISTORY_CHECKPOINT_SCAN_PAGES
+                    && checkpointIndexes.size < WEB_HISTORY_CHECKPOINT_BATCH;
+                page += 1
+            ) {
+                const remaining = WEB_HISTORY_CHECKPOINT_BATCH - checkpointIndexes.size;
+                const params = new URLSearchParams({
+                    limit_turns: String(WEB_HISTORY_PAGE_TURNS),
+                    checkpoint_count: String(remaining),
+                });
+                if (cursor !== null) params.set("before_index", String(cursor));
+                if (target) params.set("session_name", target);
+                const response = await fetch(`/api/sessions/current/history?${params}`);
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.detail || `history request failed (${response.status})`);
+                }
+                if (!firstResponse) firstResponse = data;
+                lastResponse = data;
+                const pageTurns = Array.isArray(data.turns) ? data.turns : [];
+                turns = [...pageTurns, ...turns];
+                for (const turn of pageTurns) {
+                    if (turn.role === "user" && Number.isInteger(turn.index)) {
+                        checkpointIndexes.add(turn.index);
+                    }
+                }
+                const nextCursor = data.start_index ?? 0;
+                if (!pageTurns.length || nextCursor <= 0 || nextCursor === cursor) {
+                    cursor = nextCursor;
+                    break;
+                }
+                cursor = nextCursor;
+            }
+
+            const base = firstResponse || lastResponse || {};
+            return {
+                ...base,
+                turns,
+                start_index: lastResponse?.start_index ?? base.start_index ?? 0,
+                window_end: firstResponse?.window_end ?? base.window_end ?? 0,
+            };
+        },
+
+        async _historyTurnsToTimeline(historyTurns, sessionKey) {
+            const rebuiltTurns = [];
+            let historyChunkIndex = 0;
+            for (const turn of historyTurns || []) {
+                // Markdown/JSON conversion is CPU-heavy. Yield between small
+                // batches so navigation, input, interrupts, and SSE stay live.
+                if (historyChunkIndex > 0 && historyChunkIndex % 8 === 0) {
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+                historyChunkIndex += 1;
+                let traceForTurn = null;
+                let partIndex = 0;
+                const ensureHistoryTrace = () => {
+                    if (traceForTurn) return traceForTurn;
+                    traceForTurn = {
+                        id: `h-tr-${turn.index}-${partIndex}`,
+                        role: "trace",
+                        events: [],
+                        open: false,
+                        running: false,
+                        startedAt: 0,
+                        elapsed: null,
+                        historyIndex: turn.index,
+                    };
+                    rebuiltTurns.push(traceForTurn);
+                    return traceForTurn;
+                };
+
+                for (const part of turn.parts || []) {
+                    const stablePartIndex = partIndex++;
+                    if (
+                        part.type === "text"
+                        && (turn.role === "user" || turn.role === "assistant")
+                    ) {
+                        traceForTurn = null;
+                        rebuiltTurns.push({
+                            id: `h-${turn.index}-${stablePartIndex}`,
+                            role: turn.role,
+                            text: part.text,
+                            html: renderMarkdown(part.text),
+                            streaming: false,
+                            attachments: [],
+                            historyIndex: turn.index,
+                        });
+                    } else if (part.type === "attachment" && turn.role === "user") {
+                        let targetMessage = null;
+                        for (let i = rebuiltTurns.length - 1; i >= 0; i -= 1) {
+                            const candidate = rebuiltTurns[i];
+                            if (candidate.role === "user" && candidate.historyIndex === turn.index) {
+                                targetMessage = candidate;
+                                break;
+                            }
+                        }
+                        if (!targetMessage) {
+                            targetMessage = {
+                                id: `h-${turn.index}-${stablePartIndex}`,
+                                role: "user",
+                                text: "",
+                                html: "",
+                                streaming: false,
+                                attachments: [],
+                                historyIndex: turn.index,
+                            };
+                            rebuiltTurns.push(targetMessage);
+                        }
+                        if (part.attachment && part.attachment.attachment_id) {
+                            targetMessage.attachments.push(part.attachment);
+                        }
+                    } else if (part.type === "thinking") {
+                        ensureHistoryTrace().events.push({
+                            id: `h-ev-${turn.index}-${stablePartIndex}`,
+                            kind: "thinking",
+                            text: String(part.text || ""),
+                            at: 0,
+                        });
+                    } else if (part.type === "tool_call") {
+                        ensureHistoryTrace().events.push({
+                            id: `h-ev-${turn.index}-${stablePartIndex}`,
+                            kind: "tool_call",
+                            name: part.tool_name || "(unknown)",
+                            jsonHtml: renderJSON(part.tool_args),
+                            at: 0,
+                        });
+                    } else if (part.type === "visualization") {
+                        traceForTurn = null;
+                        const visualization = this._visualizationTurn(part.artifact, sessionKey);
+                        if (visualization && !rebuiltTurns.some(item =>
+                            item.role === "visualization"
+                            && item.artifact?.artifact_id === visualization.artifact.artifact_id
+                        )) {
+                            rebuiltTurns.push({ ...visualization, historyIndex: turn.index });
+                        }
+                    } else if (part.type === "tool_result") {
+                        ensureHistoryTrace().events.push({
+                            id: `h-ev-${turn.index}-${stablePartIndex}`,
+                            kind: "tool_result",
+                            name: part.tool_name || "",
+                            jsonHtml: renderJSON(part.preview),
+                            rawText: typeof part.preview === "string" ? part.preview : null,
+                            at: 0,
+                        });
+                        const visualization = this._visualizationTurn(part.artifact, sessionKey);
+                        if (visualization && !rebuiltTurns.some(item =>
+                            item.role === "visualization"
+                            && item.artifact?.artifact_id === visualization.artifact.artifact_id
+                        )) {
+                            rebuiltTurns.push({ ...visualization, historyIndex: turn.index });
+                        }
+                    } else if (part.type === "subagent_panel") {
+                        traceForTurn = null;
+                        const panel = this._historySubagentPanel(part);
+                        if (panel && !rebuiltTurns.some(item =>
+                            item.role === "subagent_panel" && item.batch_id === panel.batch_id
+                        )) {
+                            rebuiltTurns.push({ ...panel, historyIndex: turn.index });
+                        }
+                    }
+                }
+            }
+            return rebuiltTurns;
+        },
+
+        // Fetch enough bounded raw pages to discover five older user prompts,
+        // then prepend them as one checkpoint batch. A long tool-heavy agent
+        // run can span many raw messages; stopping after one raw page made the
+        // first ^ click appear to do nothing.
+        async loadOlder(name, { navigate = false } = {}) {
+            const target = name || this.currentName;
+            const slot = this._slot(target);
+            if (
+                slot.olderLoading
+                || !slot.hasMoreTurns
+                || slot.busy
+                || slot.oldestLoadedIndex === null
+                || slot.oldestLoadedIndex <= 0
+            ) return;
+            slot.olderLoading = true;
+            // Round-45 F2: capture the reload generation AND the cursor at
+            // request time. A loadHistory() that completes while this page
+            // is in flight bumps historyFetchGen and resets the timeline to
+            // the newest tail — a late older-page response must not commit
+            // against that replaced timeline or mutate the reset cursors.
+            const fetchGen = slot.historyFetchGen || 0;
+            const beforeIndex = slot.oldestLoadedIndex;
+            try {
+                const data = await this._fetchCheckpointBatch(target, beforeIndex);
+                const skey = target || data.name || null;
+                // Session changed while in flight — drop the page.
+                if ((skey || "__default__") !== (target || this.currentName || "__default__")) return;
+                const dst = this._slot(skey);
+                if (!dst.historyHydrated) return;
+                // Round-45 F2: a full reload started/finished while this
+                // page was in flight — the timeline it would prepend to no
+                // longer exists. Drop the stale page wholesale.
+                if ((dst.historyFetchGen || 0) !== fetchGen) return;
+                // The cursor moved (another older page landed first) — this
+                // response is stale; drop it.
+                if (dst.oldestLoadedIndex !== beforeIndex) return;
+                const el = document.querySelector(".chat-history");
+                const anchor = this._captureHistoryAnchor(el);
+                const olderTurns = await this._historyTurnsToTimeline(data.turns, skey);
+                // Cooperative yields allow a reload or another page request
+                // to win while this page is being converted. Revalidate both
+                // guards before mutating cursors or the rendered timeline.
+                if ((dst.historyFetchGen || 0) !== fetchGen) return;
+                if (dst.oldestLoadedIndex !== beforeIndex) return;
+                const previousTurns = dst.turns;
+                const newStart = data.start_index ?? beforeIndex;
+                const combinedEnd = dst.windowEndIndex ?? beforeIndex;
+                const merged = [...olderTurns, ...this._flattenTimeline(previousTurns)];
+                const navigationTarget = [...olderTurns].reverse().find(
+                    turn => turn.role === 'user',
+                );
+                // Keep every explicitly loaded checkpoint available so every
+                // dot remains a real backward/forward navigation target.
+                dst.turns = this._timelineRange(merged, newStart, combinedEnd);
+                this._groupIntermediateTurns(dst, previousTurns);
+                dst.oldestLoadedIndex = newStart;
+                dst.windowEndIndex = combinedEnd;
+                dst.totalHistoryTurns = data.total_turns ?? dst.totalHistoryTurns;
+                dst.hasMoreTurns = newStart > 0;
+                if (!target || target === this.currentName) {
+                    await this._afterHistoryRender(() => {
+                        if ((dst.historyFetchGen || 0) !== fetchGen) return;
+                        if (dst.oldestLoadedIndex !== newStart) return;
+                        const historyEl = document.querySelector(".chat-history");
+                        if (!historyEl) return;
+                        if (!navigate || !this._scrollToRenderedTurn(
+                            historyEl,
+                            navigationTarget?.id,
+                        )) {
+                            this._restoreHistoryAnchor(historyEl, anchor, {
+                                accountForPrependedHeight: true,
+                            });
+                        }
+                        this._updateActiveStage(historyEl);
+                        enhanceHistoryRange(newStart, beforeIndex);
+                    });
+                }
+            } catch (err) {
+                console.error("history-older", err);
+            } finally {
+                slot.olderLoading = false;
+            }
         },
         isSlashCommand(text) {
             return /^\/[A-Za-z][\w-]*/.test((text || "").trim());
@@ -1164,156 +1720,79 @@ document.addEventListener("alpine:init", () => {
                 slot.pendingReload = true;
                 return;
             }
+            // Round-16 F21: per-slot fetch generation. Reconnect, SSE
+            // session_updated, and panel refreshes can each start a history
+            // fetch; network reordering can then let a SLOWER older
+            // response commit over a newer reload and regress the visible
+            // transcript. Each new request bumps the counter; a response
+            // whose generation is no longer current is dropped.
+            slot.historyFetchGen = (slot.historyFetchGen || 0) + 1;
+            const fetchGen = slot.historyFetchGen;
+            slot.historyLoading = true;
+            let spinnerSlot = slot;
             try {
-                const url = target
-                    ? `/api/sessions/current/history?session_name=${encodeURIComponent(target)}`
-                    : "/api/sessions/current/history";
-                const r = await fetch(url);
-                const data = await r.json();
+                const data = await this._fetchCheckpointBatch(target);
+                // Round-16 F21: a newer request for this slot started while
+                // we were in flight — drop this stale response wholesale.
+                if (slot.historyFetchGen !== fetchGen) return;
                 // At boot, target may be null (currentName is unset until
                 // sessions.load() runs). Re-key by the server's returned
                 // name so the history lands where the proxy getters will
                 // look once sessions.load syncs currentName.
                 const skey = target || data.name || null;
                 const dst = this._slot(skey);
-                if (!this.currentName && data.name) this.currentName = data.name;
-                dst.pendingReload = false;
-
-                // Build the complete timeline outside Alpine reactivity, then
-                // replace it once. Incremental clear/push cycles can invalidate
-                // keyed x-for anchors during polling and page restoration.
-                const rebuiltTurns = [];
-                for (const turn of data.turns || []) {
-                    let traceForTurn = null;
-                    let partIndex = 0;
-                    const ensureHistoryTrace = () => {
-                        if (traceForTurn) return traceForTurn;
-                        traceForTurn = {
-                            id: `h-tr-${turn.index}-${partIndex}`,
-                            role: "trace",
-                            events: [],
-                            open: false,
-                            running: false,
-                            startedAt: 0,
-                            elapsed: null,
-                        };
-                        rebuiltTurns.push(traceForTurn);
-                        return traceForTurn;
-                    };
-
-                    for (const part of turn.parts || []) {
-                        const stablePartIndex = partIndex++;
-                        if (
-                            part.type === "text" &&
-                            (turn.role === "user" || turn.role === "assistant")
-                        ) {
-                            traceForTurn = null;
-                            rebuiltTurns.push({
-                                id: `h-${turn.index}-${stablePartIndex}`,
-                                role: turn.role,
-                                text: part.text,
-                                html: renderMarkdown(part.text),
-                                streaming: false,
-                                attachments: [],
-                            });
-                        } else if (part.type === "attachment" && turn.role === "user") {
-                            let targetMessage = null;
-                            for (let i = rebuiltTurns.length - 1; i >= 0; i--) {
-                                const candidate = rebuiltTurns[i];
-                                if (candidate.role === "user" && candidate.id.startsWith(`h-${turn.index}-`)) {
-                                    targetMessage = candidate;
-                                    break;
-                                }
-                            }
-                            if (!targetMessage) {
-                                targetMessage = {
-                                    id: `h-${turn.index}-${stablePartIndex}`,
-                                    role: "user",
-                                    text: "",
-                                    html: "",
-                                    streaming: false,
-                                    attachments: [],
-                                };
-                                rebuiltTurns.push(targetMessage);
-                            }
-                            if (part.attachment && part.attachment.attachment_id) {
-                                targetMessage.attachments.push(part.attachment);
-                            }
-                        } else if (part.type === "thinking") {
-                            ensureHistoryTrace().events.push({
-                                id: `h-ev-${turn.index}-${stablePartIndex}`,
-                                kind: "thinking",
-                                text: String(part.text || ""),
-                                at: 0,
-                            });
-                        } else if (part.type === "tool_call") {
-                            ensureHistoryTrace().events.push({
-                                id: `h-ev-${turn.index}-${stablePartIndex}`,
-                                kind: "tool_call",
-                                name: part.tool_name || "(unknown)",
-                                jsonHtml: renderJSON(part.tool_args),
-                                at: 0,
-                            });
-                        } else if (part.type === "visualization") {
-                            traceForTurn = null;
-                            const visualization = this._visualizationTurn(part.artifact, skey);
-                            if (visualization && !rebuiltTurns.some((item) =>
-                                item.role === "visualization" &&
-                                item.artifact?.artifact_id === visualization.artifact.artifact_id
-                            )) {
-                                rebuiltTurns.push(visualization);
-                            }
-                        } else if (part.type === "tool_result") {
-                            ensureHistoryTrace().events.push({
-                                id: `h-ev-${turn.index}-${stablePartIndex}`,
-                                kind: "tool_result",
-                                name: part.tool_name || "",
-                                jsonHtml: renderJSON(part.preview),
-                                rawText: typeof part.preview === "string" ? part.preview : null,
-                                at: 0,
-                            });
-                            const visualization = this._visualizationTurn(part.artifact, skey);
-                            if (visualization && !rebuiltTurns.some((item) =>
-                                item.role === "visualization" &&
-                                item.artifact?.artifact_id === visualization.artifact.artifact_id
-                            )) {
-                                rebuiltTurns.push(visualization);
-                            }
-                        } else if (part.type === "subagent_panel") {
-                            traceForTurn = null;
-                            const panel = this._historySubagentPanel(part);
-                            if (panel && !rebuiltTurns.some((item) =>
-                                item.role === "subagent_panel" && item.batch_id === panel.batch_id
-                            )) {
-                                rebuiltTurns.push(panel);
-                            }
-                        }
-                    }
+                if (dst !== slot) {
+                    dst.historyLoading = true;
+                    spinnerSlot = dst;
                 }
+                if (!this.currentName && data.name) this.currentName = data.name;
+                // Build the page outside Alpine reactivity and replace it once.
+                const rebuiltTurns = await this._historyTurnsToTimeline(data.turns, skey);
+                // The cooperative yields above permit a newer refresh to
+                // start. Never let this older conversion overwrite it.
+                if (slot.historyFetchGen !== fetchGen) return;
+                dst.pendingReload = false;
+                // Round-44 F3: a full reload holds the newest tail again.
+                dst.oldestLoadedIndex = data.start_index ?? null;
+                dst.windowEndIndex = data.window_end ?? null;
+                dst.totalHistoryTurns = data.total_turns ?? 0;
+                dst.hasMoreTurns = (data.start_index ?? 0) > 0;
                 const liveHistoryElement = (!name || name === this.currentName)
                     ? document.querySelector(".chat-history")
                     : null;
                 const shouldFollowHistory = !dst.historyHydrated
                     || (liveHistoryElement ? this._atBottom(liveHistoryElement) : true);
-                const previousScrollTop = liveHistoryElement ? liveHistoryElement.scrollTop : 0;
+                const anchor = this._captureHistoryAnchor(liveHistoryElement);
                 const previousTurns = dst.turns;
                 dst.turns = rebuiltTurns;
                 this._groupIntermediateTurns(dst, previousTurns);
                 dst.historyHydrated = true;
                 if (!name || name === this.currentName) {
-                    queueMicrotask(() => requestAnimationFrame(() => {
-                        requestAnimationFrame(() => {
-                            const el = document.querySelector(".chat-history");
-                            if (!el) return;
-                            if (shouldFollowHistory) this.scroll(true);
-                            else el.scrollTop = Math.min(previousScrollTop, Math.max(0, el.scrollHeight - el.clientHeight));
-                        });
-                    }));
-                    queueMicrotask(highlightAll);
-                    queueMicrotask(() => typesetMathInScope(".msg.assistant .body"));
+                    await this._afterHistoryRender(() => {
+                        if (slot.historyFetchGen !== fetchGen) return;
+                        const el = document.querySelector(".chat-history");
+                        if (!el) return;
+                        if (shouldFollowHistory) {
+                            this._setHistoryScrollTop(el, el.scrollHeight);
+                        } else {
+                            this._restoreHistoryAnchor(el, anchor);
+                        }
+                        this._updateActiveStage(el);
+                        enhanceHistoryRange(
+                            data.start_index ?? 0,
+                            data.window_end ?? data.total_turns ?? 0,
+                        );
+                    });
                 }
             } catch (err) {
                 console.error("history", err);
+            } finally {
+                // A stale request must not hide the spinner owned by a newer
+                // refresh for this session.
+                if (slot.historyFetchGen === fetchGen) slot.historyLoading = false;
+                if (spinnerSlot !== slot && slot.historyFetchGen === fetchGen) {
+                    spinnerSlot.historyLoading = false;
+                }
             }
         },
     });
@@ -1543,6 +2022,12 @@ ${problem.text}`, "error", 16000);
         get current() {
             const name = Alpine.store("chat").currentName;
             return (name && this.bySession[name]) || [];
+        },
+        visualizations() {
+            return this.current.filter(a => a.kind === "visualization");
+        },
+        files() {
+            return this.current.filter(a => a.kind !== "visualization");
         },
         async load(name, force = false) {
             const target = name || Alpine.store("chat").currentName;
@@ -5569,6 +6054,56 @@ function highlightInScope(selector) {
     });
 }
 
+function enhanceHistoryRoots(roots) {
+    const safeRoots = Array.from(roots || []).filter(Boolean);
+    if (!safeRoots.length) return Promise.resolve();
+
+    if (typeof hljs !== "undefined") {
+        const codeNodes = new Set();
+        for (const root of safeRoots) {
+            root.querySelectorAll("pre code").forEach(node => codeNodes.add(node));
+        }
+        for (const node of codeNodes) {
+            if (node.dataset.highlighted) continue;
+            try {
+                hljs.highlightElement(node);
+                node.dataset.highlighted = "1";
+            } catch {}
+        }
+    }
+
+    const mathNodes = new Set();
+    for (const root of safeRoots) {
+        if (root.matches(".msg.assistant .body")) mathNodes.add(root);
+        root.querySelectorAll(".msg.assistant .body").forEach(node => mathNodes.add(node));
+    }
+    return typesetMath(Array.from(mathNodes));
+}
+
+function enhanceRenderedTurns(turnIds) {
+    const ids = new Set(Array.from(turnIds || [], value => String(value)));
+    if (!ids.size) return Promise.resolve();
+    const roots = Array.from(
+        document.querySelectorAll(".chat-history .turn-wrap[data-turn-id]"),
+    ).filter(node => ids.has(String(node.dataset.turnId || "")));
+    return enhanceHistoryRoots(roots);
+}
+
+function enhanceHistoryRange(startIndex, endIndex) {
+    const start = Number(startIndex);
+    const end = Number(endIndex);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        return Promise.resolve();
+    }
+    const roots = Array.from(
+        document.querySelectorAll(".chat-history .turn-wrap[data-history-index]"),
+    ).filter(node => {
+        const index = Number(node.dataset.historyIndex);
+        return Number.isInteger(index) && index >= start && index < end;
+    });
+    return enhanceHistoryRoots(roots);
+}
+
 // --- MathJax math typesetting ---------------------------------------------
 // MathJax is loaded (vendored) in base.html with startup.typeset=false, so
 // the only place math gets typeset is where we ask it to. We scope each
@@ -5582,8 +6117,8 @@ function highlightInScope(selector) {
 let _mathjaxBusy = Promise.resolve();
 function typesetMath(elements) {
     const mj = window.MathJax;
-    if (!mj || typeof mj.typesetPromise !== "function") return;
-    if (!elements || !elements.length) return;
+    if (!mj || typeof mj.typesetPromise !== "function") return Promise.resolve();
+    if (!elements || !elements.length) return Promise.resolve();
     // Serialize calls so a streaming delta doesn't kick off overlapping
     // typesets on the same node (MathJax chokes if a node is mid-typeset
     // when another typeset starts on it).
@@ -5594,6 +6129,7 @@ function typesetMath(elements) {
             console.warn("typesetMath", e);
         }
     });
+    return _mathjaxBusy;
 }
 // Convenience: typeset everything inside a selector. Used after a full
 // history reload or modal mount where we don't have a node ref handy.
@@ -5608,6 +6144,36 @@ function bootSSE() {
     let source = null;
     let reconnectTimer = null;
     let pingTimer = null;
+    // Round-16 F22: exponential backoff with jitter for SSE reconnects.
+    // The fixed 2s retry made every open browser reconnect in synchrony
+    // after an outage and stampede the server with reconciliation fetches.
+    let reconnectAttempt = 0;
+    let stabilityTimer = null;
+    // Round-48 F5: set while connect() deliberately replaces the stream
+    // (focus change) so onerror doesn't schedule a retry loop.
+    let reconnectIntentional = false;
+    const RECONNECT_BASE_MS = 1000;
+    const RECONNECT_MAX_MS = 30000;
+    // Round-17 F27: the ladder resets only after the connection has STAYED
+    // open for this long — a proxy that completes the handshake then drops
+    // the stream would otherwise keep resetting to base forever.
+    const RECONNECT_STABLE_MS = 10000;
+
+    // Round-48 F5: focus-driven SSE reconnection. The stream is
+    // server-filtered to the focused session (r47 F3) — switching focus
+    // must replace the stream with the new filter. Deliberate close: the
+    // backoff ladder is NOT advanced (the onerror retry path treats an
+    // intentional close as a failure otherwise).
+    function reconnectWithFocus() {
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        reconnectIntentional = true;
+        try {
+            connect();
+        } finally {
+            reconnectIntentional = false;
+        }
+        reconnectAttempt = 0;
+    }
 
     function connect() {
         if (source) { try { source.close(); } catch {} source = null; }
@@ -5623,11 +6189,25 @@ function bootSSE() {
                 if (source) source.dispatchEvent(new Event("error"));
             }, 45000);
         }
-        source = new EventSource("/api/events");
+        // Round-47 F3: when a tab is focused on one session, ask the bus to
+        // filter server-side — the tab no longer parses/routes every other
+        // session's events (at scale, background loops would tax every tab).
+        const focused = Alpine.store("chat").currentName;
+        source = new EventSource("/api/events" + (focused ? ("?session=" + encodeURIComponent(focused)) : ""));
         source.onopen = () => {
             const chat = Alpine.store("chat");
             chat.connected = true;
             chat.lastOpenAt = Date.now();
+            // Round-16 F22 / Round-17 F27: reset the backoff ladder only
+            // after the connection STAYS open for RECONNECT_STABLE_MS —
+            // a flapping proxy that handshakes then drops must not keep
+            // resetting the ladder to base. onerror cancels the pending
+            // reset.
+            if (stabilityTimer) clearTimeout(stabilityTimer);
+            stabilityTimer = setTimeout(() => {
+                stabilityTimer = null;
+                reconnectAttempt = 0;
+            }, RECONNECT_STABLE_MS);
             bumpWatchdog();
             // On reconnect (not initial boot), re-sync state in case we
             // missed events while the connection was down.
@@ -5673,8 +6253,23 @@ function bootSSE() {
             try { source.close(); } catch {}
             source = null;
             if (pingTimer) { clearTimeout(pingTimer); pingTimer = null; }
+            // Round-17 F27: an error before the stability window elapsed
+            // cancels the pending ladder reset — flapping connections
+            // keep climbing the backoff instead of resetting to base.
+            if (stabilityTimer) { clearTimeout(stabilityTimer); stabilityTimer = null; }
             if (reconnectTimer) clearTimeout(reconnectTimer);
-            reconnectTimer = setTimeout(connect, 2000);
+            // Round-16 F22: exponential backoff + jitter, capped, so a
+            // server outage doesn't synchronize every open browser into a
+            // reconnect stampede. Reset to base on stable open (onopen).
+            reconnectAttempt = Math.min(reconnectAttempt + 1, 8);
+            const backoffMs = Math.min(
+                RECONNECT_BASE_MS * Math.pow(2, reconnectAttempt - 1),
+                RECONNECT_MAX_MS
+            );
+            const jitteredMs = Math.round(
+                backoffMs * (0.5 + Math.random() * 0.5)
+            );
+            reconnectTimer = setTimeout(connect, jitteredMs);
         };
     }
     connect();
@@ -5737,6 +6332,15 @@ function routeEvent(ev) {
         }
         case "assistant_start": chat.startAssistant(ev.turn_id, name); break;
         case "assistant_delta": chat.appendDelta(ev.turn_id, ev.text || "", name); break;
+        case "external_write_lost":
+            // Round-48 F9: an external surface's write was overwritten by a
+            // local save before the watcher could adopt it. Surface the
+            // conflict visibly — silent edit loss was the r48 finding.
+            try {
+                const chatStore = Alpine.store("chat");
+                chatStore.pushInfo(`⚠ External edit to ${ev.name || "session"} (rev ${ev.lost_revision}) was overwritten before it could be loaded — reload the session to reconcile.`);
+            } catch (e) { console.warn("external_write_lost notify failed", e); }
+            break;
         case "assistant_end":
             chat.endAssistant(ev.turn_id, name);
             // Keep busy=true until turn_complete (more tool calls may follow).
@@ -6380,4 +6984,260 @@ document.addEventListener("DOMContentLoaded", () => {
         // Touching `clock` (the focused-slot getter) is harmless if not busy.
         if (anyBusy) { /* re-render already triggered above */ }
     }, 500);
+});
+
+/* ==== Model pricing settings (moved from product.js: runtime store + API calls are not presentation-layer) ==== */
+    document.addEventListener('alpine:init', () => {
+        Alpine.store('pricingSettings', {
+            loaded: false,
+            loading: false,
+            saving: false,
+            dirty: false,
+            error: '',
+            provider: 'all',
+            version: '',
+            currency: 'USD',
+            unit: 'per_million_tokens',
+            models: [],
+            configPath: '',
+            activeConfigPath: '',
+            defaultConfigPath: '',
+            usingOverride: false,
+
+            _applyCatalog(data) {
+                const catalog = data && typeof data === 'object' ? data : {};
+                this.version = String(catalog.version || 'custom');
+                this.currency = String(catalog.currency || 'USD');
+                this.unit = String(catalog.unit || 'per_million_tokens');
+                this.models = Array.isArray(catalog.models)
+                    ? catalog.models.map(row => ({ ...row }))
+                    : [];
+                this.configPath = String(catalog.config_path || '');
+                this.activeConfigPath = String(catalog.active_config_path || '');
+                this.defaultConfigPath = String(catalog.default_config_path || '');
+                this.usingOverride = !!catalog.using_override;
+                this.loaded = true;
+                this.dirty = false;
+                this.error = '';
+            },
+
+            async load(force = false) {
+                if (this.loaded && !force) return;
+                this.loading = true;
+                this.error = '';
+                try {
+                    const response = await fetch('/api/providers/pricing', { cache: 'no-store' });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data.detail || `pricing load failed (${response.status})`);
+                    this._applyCatalog(data);
+                } catch (error) {
+                    this.error = String(error instanceof Error ? error.message : error);
+                } finally {
+                    this.loading = false;
+                }
+            },
+
+            filteredModels() {
+                const provider = String(this.provider || 'all').toLowerCase();
+                if (provider === 'all') return this.models;
+                return this.models.filter(row => String(row.provider || '').toLowerCase() === provider);
+            },
+
+            providerCount(provider) {
+                const target = String(provider || '').toLowerCase();
+                return this.models.filter(row => String(row.provider || '').toLowerCase() === target).length;
+            },
+
+            displayRate(value) {
+                return value === null || value === undefined ? '' : String(value);
+            },
+
+            setRate(row, field, raw) {
+                if (!row || !field) return;
+                const text = String(raw ?? '').trim();
+                if (!text) {
+                    row[field] = null;
+                    this.dirty = true;
+                    return;
+                }
+                const value = Number(text);
+                if (!Number.isFinite(value) || value < 0) {
+                    this.error = `${field} must be a non-negative number`;
+                    return;
+                }
+                row[field] = value;
+                this.error = '';
+                this.dirty = true;
+            },
+
+            setBilling(row, value) {
+                if (!row) return;
+                row.billing = String(value || 'unknown');
+                this.dirty = true;
+            },
+
+            sourceLabel() {
+                if (!this.loaded) return 'Pricing registry not loaded';
+                if (this.usingOverride) return `Operator override · ${this.activeConfigPath || this.configPath}`;
+                return `Packaged defaults · ${this.activeConfigPath || this.defaultConfigPath}`;
+            },
+
+            async save() {
+                if (this.saving) return;
+                this.saving = true;
+                this.error = '';
+                try {
+                    const response = await fetch('/api/providers/pricing', {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            version: this.version || 'operator',
+                            currency: this.currency || 'USD',
+                            unit: this.unit || 'per_million_tokens',
+                            models: this.models.map(row => ({ ...row })),
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data.detail || `pricing save failed (${response.status})`);
+                    this._applyCatalog(data);
+                    Alpine.store('toast').show('Model pricing saved', 'success');
+                } catch (error) {
+                    this.error = String(error instanceof Error ? error.message : error);
+                    Alpine.store('toast').show(this.error, 'error', 7000);
+                } finally {
+                    this.saving = false;
+                }
+            },
+
+            async reset() {
+                this.saving = true;
+                this.error = '';
+                try {
+                    const response = await fetch('/api/providers/pricing/reset', { method: 'POST' });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data.detail || `pricing reset failed (${response.status})`);
+                    this._applyCatalog(data);
+                    Alpine.store('toast').show('Model pricing reset to packaged defaults', 'success');
+                } catch (error) {
+                    this.error = String(error instanceof Error ? error.message : error);
+                    Alpine.store('toast').show(this.error, 'error', 7000);
+                } finally {
+                    this.saving = false;
+                }
+            },
+        });
+    });
+
+
+    function installPricingSettings() {
+        const tabs = document.querySelector('.inspector-tabs');
+        const body = document.querySelector('.inspector-body');
+        if (!tabs || !body || document.getElementById('pricing-settings-pane')) return;
+
+        const tab = document.createElement('button');
+        tab.type = 'button';
+        tab.setAttribute(':class', "{ active: $store.inspector.tab === 'pricing' }");
+        tab.setAttribute('@click', "$store.inspector.setTab('pricing'); $store.pricingSettings.load()");
+        tab.setAttribute('role', 'tab');
+        tab.textContent = 'pricing';
+        const settingsTab = Array.from(tabs.querySelectorAll('button')).find(
+            button => button.textContent.trim().toLowerCase() === 'settings'
+        );
+        tabs.insertBefore(tab, settingsTab || null);
+
+        const pane = document.createElement('section');
+        pane.id = 'pricing-settings-pane';
+        pane.className = 'settings-pane pricing-settings-pane';
+        pane.setAttribute('x-show', "$store.inspector.tab === 'pricing'");
+        pane.innerHTML = `
+            <div class="pricing-settings-head">
+                <div>
+                    <h3 class="pricing-settings-title">Model pricing</h3>
+                    <p class="pricing-settings-copy">Edit the per-million token rates MuCLI uses for cost accounting. OpenAI, Gemini, and Ollama Cloud all use this registry. Local Ollama remains $0 attributable provider/API cost; host compute is intentionally separate.</p>
+                </div>
+                <a class="pricing-settings-advanced" href="/static/model_costs.html">Advanced registry</a>
+            </div>
+
+            <div class="pricing-settings-meta" x-show="$store.pricingSettings.loaded">
+                <span class="pricing-settings-source" x-text="$store.pricingSettings.sourceLabel()" :title="$store.pricingSettings.activeConfigPath || $store.pricingSettings.configPath"></span>
+                <span class="pricing-settings-state"
+                      :class="{ 'is-override': $store.pricingSettings.usingOverride }"
+                      x-text="$store.pricingSettings.usingOverride ? 'override active' : 'defaults'"></span>
+            </div>
+
+            <div class="pricing-provider-filter" x-show="$store.pricingSettings.loaded">
+                <button type="button" :class="{ active: $store.pricingSettings.provider === 'all' }" @click="$store.pricingSettings.provider = 'all'">all</button>
+                <button type="button" :class="{ active: $store.pricingSettings.provider === 'openai' }" @click="$store.pricingSettings.provider = 'openai'">OpenAI <span x-text="$store.pricingSettings.providerCount('openai')"></span></button>
+                <button type="button" :class="{ active: $store.pricingSettings.provider === 'gemini' }" @click="$store.pricingSettings.provider = 'gemini'">Gemini <span x-text="$store.pricingSettings.providerCount('gemini')"></span></button>
+                <button type="button" :class="{ active: $store.pricingSettings.provider === 'ollama' }" @click="$store.pricingSettings.provider = 'ollama'">Ollama <span x-text="$store.pricingSettings.providerCount('ollama')"></span></button>
+                <button type="button" @click="$store.pricingSettings.load(true)">refresh</button>
+            </div>
+
+            <div class="pricing-settings-error" x-show="$store.pricingSettings.error" x-text="$store.pricingSettings.error"></div>
+            <div class="pricing-settings-empty" x-show="$store.pricingSettings.loading">Loading model pricing…</div>
+
+            <div class="pricing-model-list" x-show="$store.pricingSettings.loaded && !$store.pricingSettings.loading">
+                <template x-for="row in $store.pricingSettings.filteredModels()" :key="row.provider + ':' + row.key">
+                    <article class="pricing-model-row">
+                        <div class="pricing-model-head">
+                            <span class="pricing-provider-badge" x-text="row.provider"></span>
+                            <span class="pricing-model-name" x-text="row.key" :title="row.key"></span>
+                            <select class="pricing-billing-select" :value="row.billing" @change="$store.pricingSettings.setBilling(row, $event.target.value)">
+                                <option value="token">token priced</option>
+                                <option value="estimated_token">estimated token</option>
+                                <option value="local">local / $0 API</option>
+                                <option value="unknown">unpriced</option>
+                            </select>
+                        </div>
+                        <div class="pricing-rate-grid">
+                            <label class="pricing-rate-field">
+                                <span>Input / 1M</span>
+                                <input type="number" min="0" step="0.001"
+                                       :disabled="row.billing === 'local' || row.billing === 'unknown'"
+                                       :value="$store.pricingSettings.displayRate(row.input_per_million)"
+                                       @input="$store.pricingSettings.setRate(row, 'input_per_million', $event.target.value)">
+                            </label>
+                            <label class="pricing-rate-field">
+                                <span>Cached input / 1M</span>
+                                <input type="number" min="0" step="0.001"
+                                       :disabled="row.billing === 'local' || row.billing === 'unknown'"
+                                       :value="$store.pricingSettings.displayRate(row.cached_input_per_million)"
+                                       @input="$store.pricingSettings.setRate(row, 'cached_input_per_million', $event.target.value)">
+                            </label>
+                            <label class="pricing-rate-field">
+                                <span>Output / 1M</span>
+                                <input type="number" min="0" step="0.001"
+                                       :disabled="row.billing === 'local' || row.billing === 'unknown'"
+                                       :value="$store.pricingSettings.displayRate(row.output_per_million)"
+                                       @input="$store.pricingSettings.setRate(row, 'output_per_million', $event.target.value)">
+                            </label>
+                        </div>
+                        <p class="pricing-model-note" x-show="row.billing === 'local'">Local Ollama provider/API cost is recorded as $0. Host GPU/CPU economics are not included.</p>
+                        <p class="pricing-model-note" x-show="row.billing === 'unknown'">This model remains unpriced until you select token pricing and enter rates.</p>
+                        <p class="pricing-model-note" x-show="row.notes && row.billing !== 'local' && row.billing !== 'unknown'" x-text="row.notes"></p>
+                    </article>
+                </template>
+            </div>
+
+            <div class="pricing-settings-empty" x-show="$store.pricingSettings.loaded && !$store.pricingSettings.loading && $store.pricingSettings.filteredModels().length === 0">No pricing rows for this provider.</div>
+
+            <div class="pricing-settings-actions" x-show="$store.pricingSettings.loaded">
+                <span class="pricing-settings-dirty" x-text="$store.pricingSettings.dirty ? 'Unsaved pricing changes' : ($store.pricingSettings.usingOverride ? 'Operator pricing override active' : 'Using packaged defaults')"></span>
+                <div class="pricing-settings-buttons">
+                    <button type="button" @click="$store.confirm.ask('Reset all model pricing to packaged defaults?', $event, () => $store.pricingSettings.reset(), {danger:true})">reset</button>
+                    <button type="button" class="primary" :disabled="!$store.pricingSettings.dirty || $store.pricingSettings.saving" @click="$store.pricingSettings.save()" x-text="$store.pricingSettings.saving ? 'saving…' : 'save pricing'"></button>
+                </div>
+            </div>
+        `;
+        body.appendChild(pane);
+
+        if (window.Alpine && typeof Alpine.initTree === 'function') {
+            Alpine.initTree(tab);
+            Alpine.initTree(pane);
+        }
+    }
+
+
+document.addEventListener('DOMContentLoaded', () => {
+    if (typeof installPricingSettings === 'function') installPricingSettings();
 });

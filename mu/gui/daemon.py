@@ -42,6 +42,24 @@ def log_file() -> Path:
     return _home() / "logs" / "gui.log"
 
 
+def _cmdline_is_mucli(pid: int) -> bool | None:
+    """Round-27 F1: does the target's command line look like mucli?
+
+    Reads the process command line from procfs (Linux). Returns
+    True/False when readable, None when unreadable (EPERM, or the
+    process exited between the liveness check and the read). Used to
+    avoid SIGTERM/SIGKILL-ing an unrelated process after PID reuse or
+    when the port fallback resolves a foreign listener.
+    """
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            raw = fh.read()
+    except (OSError, ValueError):
+        return None
+    argv = raw.split(b"\0")
+    return any(b"mucli" in arg for arg in argv)
+
+
 def is_running() -> int | None:
     """Return the PID of the existing daemon, or None if not running."""
     path = pid_file()
@@ -56,7 +74,6 @@ def is_running() -> int | None:
     try:
         # signal 0 → ESRCH if process gone, EPERM if not ours but alive.
         os.kill(pid, 0)
-        return pid
     except OSError as exc:
         if exc.errno == errno.ESRCH:
             # Stale pid file; remove it.
@@ -67,6 +84,19 @@ def is_running() -> int | None:
             return None
         # EPERM means it's alive but we can't signal it — still running.
         return pid
+    # Round-27 F1: PID reuse guard — the pid file may name a recycled
+    # PID now owned by an unrelated process. Verify the cmdline looks
+    # like mucli before reporting it as "the daemon"; an unreadable
+    # cmdline keeps the conservative old behavior (the pid file is
+    # high-trust: we wrote it on launch).
+    identity = _cmdline_is_mucli(pid)
+    if identity is False:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    return pid
 
 
 def _listener_inodes(port: int) -> set[str]:
@@ -155,16 +185,25 @@ def spawn_detached(args: list[str], *, port: int) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = open(log_path, "wb", buffering=0)
 
-    # start_new_session=True detaches the child from the controlling
-    # terminal. stdio → log file. Parent exits independently.
-    child = subprocess.Popen(
-        args,
-        stdin=subprocess.DEVNULL,
-        stdout=log_handle,
-        stderr=log_handle,
-        start_new_session=True,
-        close_fds=True,
-    )
+    # Round-27 F7: the child inherits (dups) the descriptor via
+    # stdout/stderr — the parent's own copy must be closed (including
+    # on Popen failure) or repeated programmatic launches leak fds.
+    try:
+        # start_new_session=True detaches the child from the controlling
+        # terminal. stdio → log file. Parent exits independently.
+        child = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        try:
+            log_handle.close()
+        except OSError:
+            pass
     return child.pid
 
 
@@ -187,8 +226,13 @@ def stop(timeout: float = 5.0, port: int = 30311) -> tuple[bool, str]:
     pid = is_running()
     source = "pid file"
     if pid is None:
-        pid = pid_for_port(port)
-        source = f"port {port}"
+        candidate = pid_for_port(port)
+        # Round-27 F1: a port-derived PID is low-trust — only signal it
+        # when its cmdline identifies it as mucli (never kill a foreign
+        # process that happens to hold the port).
+        if candidate is not None and _cmdline_is_mucli(candidate) is True:
+            pid = candidate
+            source = f"port {port}"
     if pid is None:
         return False, "no GUI server is running"
     try:

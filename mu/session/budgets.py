@@ -219,14 +219,29 @@ def drift_corrected_context_limit(session: Any) -> int:
 
     For providers with no safety factor (OpenAI/Gemini) this is a no-op.
     """
-    limit = resolve_context_limit(session)  # already / static_sf
     static = _static_safety_factor(session)
     if static <= 1.0:
-        return limit
+        return resolve_context_limit(session)
+    # Derive the base from the RAW window, not the user-set token limit:
+    # the whole point of drift correction is to retire the static safety
+    # factor when measurement says the tokenizer tracks real tokens, so the
+    # corrected ceiling recovers the provider's physical window (bounded by
+    # it) rather than an arbitrarily smaller user default.
+    try:
+        raw_window = int(session.provider.effective_context_window())
+    except Exception:
+        raw_window = None
+    if raw_window and raw_window > 0:
+        base = max(1024, int(raw_window / static))
+    else:
+        base = resolve_context_limit(session)
     eff = effective_drift_ratio(session)
     if eff <= 0:
-        return limit
-    return max(1024, int(limit * static / eff))
+        return resolve_context_limit(session)
+    corrected = int(base * static / eff)
+    if raw_window and raw_window > 0:
+        corrected = min(corrected, raw_window)
+    return max(1024, corrected)
 
 
 def update_observed_drift(session: Any, observed: float) -> None:
@@ -312,7 +327,16 @@ def compaction_token_budget(session: Any) -> int:
     except Exception:
         non_l5_tokens = 0
 
-    usable = max(1024, context_limit - response_reserve - non_l5_tokens)
+    usable = context_limit - response_reserve - non_l5_tokens
+    if usable <= 0:
+        # No real capacity for history (codex round-7 F6): the old
+        # max(1024, ...) floor returned tokens that don't exist, letting
+        # compaction declare history "within budget" while the assembled
+        # request was already over the provider window — producing
+        # avoidable overflow/retry cycles. Zero means callers must
+        # shrink non-L5 layers / reserve, or report the fixed prompt
+        # cannot fit.
+        return 0
     return max(512, int(usable * trim_threshold))
 
 

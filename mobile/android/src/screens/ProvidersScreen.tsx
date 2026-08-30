@@ -3,7 +3,7 @@ import { FlatList, View, RefreshControl, Alert, TouchableOpacity } from 'react-n
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
 import { useTheme } from '../theme/ThemeContext';
-import { useConnectionStore } from '../store/connection';
+import { queueIfOffline, useConnectionStore } from '../store/connection';
 import { Text, Card, Button, Skeleton, ErrorState, EmptyState, Badge } from '../components';
 import { providersApi, ProviderInfo } from '../api/providers';
 import { spacing } from '../theme/tokens';
@@ -61,6 +61,16 @@ export function ProvidersScreen() {
   const selectModel = async (model: string) => {
     if (!selectedProvider) return;
     setSelectedModel(model);
+    // G5 (§3.6): offline switches join the outbound queue and replay on
+    // reconnect; the local selection stays optimistic.
+    if (await queueIfOffline('provider_switch', {
+      provider: selectedProvider,
+      model,
+    })) {
+      setActiveProviderModel(selectedProvider, model);
+      Alert.alert('Queued (offline)', `Switch to ${selectedProvider} · ${model} replays on reconnect`);
+      return;
+    }
     try {
       await providersApi.switch(selectedProvider, model);
       setActiveProviderModel(selectedProvider, model);

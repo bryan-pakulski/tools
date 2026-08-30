@@ -41,6 +41,7 @@ import re
 import time
 import traceback
 import uuid
+from collections import deque
 from typing import Any
 
 from mu.agent.approval import ApprovalPlan, build_approval_prompt, collect_approval_plans
@@ -79,639 +80,17 @@ from mu.session.helpers import (
 )
 
 
-def _estimate_messages_tokens(messages) -> int:
-    """Cheap token estimate for a list of Message objects."""
-    total = 0
-    for msg in messages:
-        for part in msg.parts:
-            if part.text:
-                total += estimate_tokens(part.text)
-            elif part.tool_result is not None:
-                total += estimate_tokens(str(part.tool_result))
-            elif part.tool_args is not None:
-                total += estimate_tokens(json.dumps(part.tool_args))
-    return total
-
-
-def _estimate_tools_tokens(tools) -> int:
-    """Estimate tool definitions, which are part of every agentic request."""
-    if not tools:
-        return 0
-    payload = [
-        {
-            "name": getattr(tool, "name", ""),
-            "description": getattr(tool, "description", ""),
-            "parameters": getattr(tool, "parameters", {}) or {},
-        }
-        for tool in tools
-    ]
-    return estimate_tokens(json.dumps(payload, sort_keys=True, default=str))
-
-
-def _preflight_context_check(
-    session, system_prompt, messages, turn_start_index=None, tools=None
-):
-    """Emergency-compact history if the assembled prompt exceeds the
-    provider's context window.
-
-    The normal compaction pass (``roll_history_summary_to_token_budget``)
-    fires *before* the system prompt is finalized — resumption briefings,
-    hierarchical context injection, and per-iteration memory/scratchpad
-    layers all grow the prompt after that pass.  This pre-flight check
-    runs right before the provider call with the *actual* prompt and
-    messages, and triggers a second compaction if the total would
-    overflow.
-
-    ``turn_start_index`` is forwarded to ``_prepare_runtime_history`` so
-    that tool-window compression applies the same pair-grouping logic
-    used during normal (non-emergency) calls.  Without it the early-exit
-    at ``turn_start_index is None`` skips compression and sends more
-    tokens than necessary — which can cascade into repeated emergency
-    compaction attempts.
-
-    Returns (system_prompt, messages) — unchanged if within budget,
-    or with rebuilt messages after emergency compaction.
-    """
-    from mu.session.budgets import (
-        drift_corrected_context_limit,
-        resolve_response_reserve,
-        resolve_keep_recent,
-        resolve_tool_result_floor,
-    )
-
-    # Use the drift-corrected limit so the last-line proactive defense fires
-    # at the right point once real-token drift has been learned (see
-    # budgets.effective_drift_ratio). Falls back to resolve_context_limit's
-    # static safety factor when no drift has been observed yet.
-    context_limit = drift_corrected_context_limit(session)
-    response_reserve = resolve_response_reserve(session)
-    max_prompt = context_limit - response_reserve
-
-    prompt_tokens = estimate_tokens(system_prompt)
-    msg_tokens = _estimate_messages_tokens(messages)
-    tool_tokens = _estimate_tools_tokens(tools)
-    total = prompt_tokens + msg_tokens + tool_tokens
-    # Stash the cl100k estimate of the assembled prompt for the cold-cache
-    # drift calibration in the response handler: when Ollama's
-    # prompt_eval_count is a strong full-prompt signal (>= half the cl100k
-    # estimate), we can learn the real/cl100k drift ratio from it.
-    try:
-        session._last_prompt_cl100k_est = int(total)
-    except Exception:
-        pass
-
-    if total <= max_prompt:
-        return system_prompt, messages
-
-    overshoot = total - max_prompt
-    logger.warning(
-        "Pre-flight context check: estimated %d tokens "
-        "(limit %d, reserve %d, max_prompt %d) — %d over. "
-        "Emergency compaction triggered.",
-        total, context_limit, response_reserve, max_prompt, overshoot,
-    )
-    emergency_budget = max(512, max_prompt - prompt_tokens - tool_tokens)
-    base_keep_recent = resolve_keep_recent(session, emergency=True)
-    # R3 / FM-8: even emergency compaction must respect the per-turn
-    # tool-result floor so tool results just received stay verbatim.
-    session.session_manager._tool_result_floor = resolve_tool_result_floor(session)
-
-    # Escalating loop: compact, rebuild, re-estimate. If the first pass
-    # doesn't reach the budget (the cl100k estimate under-counts Ollama's
-    # real BPE ~2.2x, and a large recent tool result can keep the tail
-    # fat), shrink keep_recent and compact again — up to 3 rounds. The
-    # reactive overflow recovery in `_generate_with_overflow_recovery`
-    # is the estimation-independent backstop if this still isn't enough.
-    for round_idx in range(3):
-        _before_anchor = int(getattr(session.session_manager, "summary_anchor", 0) or 0)
-        try:
-            session.session_manager._pending_compaction_kind = "emergency_preflight"
-            session.session_manager._pending_compaction_iter = int(
-                getattr(session, "_trace_current_iter", 0) or 0
-            )
-            session.session_manager.roll_history_summary_to_token_budget(
-                int(emergency_budget * 0.85),
-                keep_recent=max(2, base_keep_recent - round_idx * 2),
-                max_passes=6,
-                provider=session.provider,
-            )
-            session._compaction_watermark = len(session.session_manager.history)
-            _after_anchor = int(getattr(session.session_manager, "summary_anchor", 0) or 0)
-            if _after_anchor > _before_anchor:
-                try:
-                    from mu.trace.emitter import emit_context_artifact
-                    emit_context_artifact(session,
-                        iteration=int(getattr(session, "_trace_current_iter", 0) or 0),
-                        artifact_id=f"history:{_before_anchor}-{_after_anchor}",
-                        state="compacted", reason="hard_context_preflight")
-                except Exception:
-                    pass
-        except Exception as exc:
-            logger.warning("Emergency compaction failed: %s", exc)
-            return system_prompt, messages
-
-        recent_history = session._prepare_runtime_history(
-            turn_start_index=turn_start_index,
-        )
-        messages = session._build_messages_from_history(
-            recent_history,
-            {"role": "system", "parts": []},
-        )[:-1]
-
-        new_msg_tokens = _estimate_messages_tokens(messages)
-        new_total = prompt_tokens + new_msg_tokens + tool_tokens
-        if new_total <= max_prompt:
-            logger.info(
-                "Emergency compaction round %d complete: messages %d -> %d tokens.",
-                round_idx + 1, msg_tokens, new_msg_tokens,
-            )
-            return system_prompt, messages
-        logger.warning(
-            "Emergency compaction round %d: still %d over (est %d vs max_prompt %d); "
-            "escalating keep_recent.",
-            round_idx + 1, new_total - max_prompt, new_total, max_prompt,
-        )
-
-    # Couldn't get under budget in 3 rounds — return the most-compacted
-    # state; the provider call may still overflow, at which point reactive
-    # overflow recovery catches it. This avoids throwing pre-emptively.
-    logger.warning(
-        "Emergency compaction exhausted 3 rounds; est %d still over max_prompt %d. "
-        "Reactive overflow recovery will backstop the provider call.",
-        prompt_tokens + _estimate_messages_tokens(messages), max_prompt,
-    )
-    return system_prompt, messages
-
-
-# Per-turn cap on reactive overflow recoveries. Each recovery aggressively
-# compacts history (keep_recent=4) and retries the provider call once. A
-# later iteration in the same turn can overflow again as tool results
-# accumulate — that's a *different* overflowing prompt and deserves its own
-# recovery, so this is a count (not a boolean): each overflow gets a
-# compaction attempt up to this many times per turn. The cap prevents a
-# compact-fail loop when compaction genuinely can't shrink the prompt (e.g.
-# a single active-turn tool result larger than the window, which the floor
-# protects from degradation).
-_MAX_OVERFLOW_RECOVERIES_PER_TURN = 3
-
-
-def _resolve_real_context_window(session) -> int:
-    """The provider's *real* (un-safety-factored) input-context ceiling.
-
-    Reactive overflow recovery targets this number, not the safety-factored
-    `resolve_context_limit`, because the wire-level "prompt too long" 400 is
-    ground truth about the real window — the safety factor is only a
-    pre-flight hint. Falls back to the factored limit + a default if the
-    provider doesn't expose one.
-    """
-    try:
-        window = session.provider.effective_context_window(
-            session.provider.model_name
-        )
-    except Exception:
-        window = None
-    if window and window > 0:
-        return int(window)
-    from mu.session.budgets import resolve_context_limit
-    return int(resolve_context_limit(session) or 200_000)
-
-
-def _overflow_drift_ratio(session, system_prompt, messages, overflow_error) -> float:
-    """Real-tokens / cl100k-tokens for the prompt that just overflowed.
-
-    Ground truth from the error (the daemon's own BPE count of the prompt)
-    divided by the harness's cl100k estimate of the same prompt. Clamped to
-    a sane [1.0, 6.0] band so a mis-parsed error can't blow up the budget.
-    Falls back to the provider's static `compaction_safety_factor` (2.5 for
-    Ollama, 1.0 otherwise) when the error body doesn't carry real counts.
-    """
-    cl100k_full = estimate_tokens(system_prompt) + _estimate_messages_tokens(messages)
-    real_prompt, _real_max = parse_overflow_token_counts(overflow_error)
-    if real_prompt and cl100k_full and cl100k_full > 0:
-        drift = real_prompt / cl100k_full
-        # Clamp: drift < 1.0 is impossible (cl100k never over-counts Ollama by
-        # that much) and means a parse error; > 6.0 is pathological content.
-        return max(1.0, min(6.0, drift))
-    try:
-        factor = float(session.provider.compaction_safety_factor())
-    except Exception:
-        factor = 1.0
-    return max(1.0, factor or 1.0)
-
-
-def _calibrate_drift_from_response(session, response) -> None:
-    """EWMA-update ``session._observed_drift_ratio`` from a cold-cache
-    provider response, if the response's ``input_tokens`` is a strong
-    full-prompt signal.
-
-    For Ollama, ``response.input_tokens`` is the streamed
-    ``prompt_eval_count`` — normally only the non-cached delta (near-zero in
-    a warm loop, useless for drift). But on a cold cache (first call of a
-    session, or after the prompt changed substantially) it reflects (close
-    to) the FULL prompt, so ``real_tokens / cl100k_tokens`` is learnable from
-    it. The guard rejects the warm-cache near-zero delta: only calibrate when
-    the reported count is >= half the stashed cl100k estimate AND > 500
-    tokens AND that estimate is itself substantial (> 1000). Never raises.
-    """
-    try:
-        cl100k_est = int(getattr(session, "_last_prompt_cl100k_est", 0) or 0)
-        reported_in = int(getattr(response, "input_tokens", 0) or 0)
-        if cl100k_est > 1000 and reported_in > 500 and reported_in >= cl100k_est // 2:
-            from mu.session.budgets import update_observed_drift
-
-            update_observed_drift(session, reported_in / float(cl100k_est))
-    except Exception:  # noqa: BLE001 — telemetry must not break the loop
-        pass
-
-
-def _aggressive_compact_for_overflow(
-    session, system_prompt, messages, *,
-    overflow_error=None,
-    tools=None,
-    keep_recent: int = 4,
-    margin: float = 0.20,
-    lift_floor: bool = False,
-):
-    """Claude Code Tier 5-style reactive compaction: keep only the last
-    ``keep_recent`` messages verbatim and summarize everything older into
-    the rolling summary, then degrade oversized payloads left in the tail.
-
-    Estimation-independent: the budget is derived from the wire-level
-    overflow's ground-truth real token count (parsed from the error) paired
-    with the harness cl100k estimate of the same prompt — giving the real
-    per-content drift ratio — so the retry targets a *real* token count the
-    daemon will accept. The static `compaction_safety_factor` alone can't:
-    drift varies ~2.2–3.2x by content, so targeting "half the safety-factored
-    limit" in cl100k still overflows on the wire when drift outruns the
-    factor.
-
-    Escalation is driven by the caller (`_generate_with_overflow_recovery`),
-    which raises the aggression per still-overflowing retry:
-      * ``keep_recent`` shrinks (4 → 2 → 1) so more history is summarized,
-      * ``margin`` grows (0.20 → 0.30 → 0.40) so the target real-token budget
-        drops further below the window,
-      * ``lift_floor`` (from the 2nd attempt on) forces the per-turn
-        tool-result floor to 0 so the protected recent tool results that
-        alone exceed the budget can be degraded — the lesser evil vs
-        crashing the turn with a hard overflow. The floor is restored in
-        the `finally` so later in-turn compaction keeps FM-8 protection.
-    """
-    from mu.session.budgets import (
-        resolve_response_reserve,
-        resolve_tool_result_floor,
-        update_observed_drift,
-    )
-
-    real_max = _resolve_real_context_window(session)
-    response_reserve = resolve_response_reserve(session)
-    drift = _overflow_drift_ratio(session, system_prompt, messages, overflow_error)
-    # Persist the measured real/cl100k drift so the NEXT turn's proactive
-    # compaction gates (turn-start roll, auto-hook, preflight) fire at the
-    # right point instead of relying on the static safety factor. This is the
-    # fix for the repeat overflow: after one 400, every subsequent turn sees
-    # the learned drift via budgets.effective_drift_ratio.
-    update_observed_drift(session, drift)
-
-    # Target (1 - margin) of the real window so drift variance across the
-    # compacted content + tool schemas (not in the cl100k estimate) + the
-    # response reserve all fit under the wire limit. margin escalates with
-    # each recovery attempt (0.20 → 0.30 → 0.40).
-    target_real = max(1024, int((real_max - response_reserve) * (1.0 - margin)))
-    target_full_cl100k = max(512, int(target_real / drift))
-    # The system prompt already carries L1–L4 (inject_hierarchical_context),
-    # so the non-history cl100k cost is just the system prompt; the rest of
-    # the budget is the L5 history ceiling the compaction loop gates on.
-    non_history_cl100k = estimate_tokens(system_prompt) + _estimate_tools_tokens(tools)
-    budget = max(512, target_full_cl100k - non_history_cl100k)
-
-    logger.warning(
-        "Reactive overflow compaction: real_max=%d reserve=%d drift=%.2f "
-        "margin=%.2f keep_recent=%d lift_floor=%s target_real=%d "
-        "target_full_cl100k=%d non_history=%d L5_budget=%d (cl100k_full~%d).",
-        real_max, response_reserve, drift, margin, keep_recent, lift_floor,
-        target_real, target_full_cl100k, non_history_cl100k, budget,
-        non_history_cl100k + _estimate_messages_tokens(messages),
-    )
-
-    floor_value = resolve_tool_result_floor(session)
-    # lift_floor: let `_degrade_oldest_runtime_payload` reach the protected
-    # recent tool results that alone exceed the budget. Restored in `finally`.
-    session.session_manager._tool_result_floor = 0 if lift_floor else floor_value
-    if lift_floor:
-        session.session_manager._pending_compaction_kind = (
-            "reactive_overflow_floor_lift"
-        )
-    else:
-        session.session_manager._pending_compaction_kind = "reactive_overflow"
-    try:
-        session.session_manager._pending_compaction_iter = int(
-            getattr(session, "_trace_current_iter", 0) or 0
-        )
-        session.session_manager._compact_focus = (
-            session.variables.get("compact_focus") or ""
-        )
-        # max_passes is generous (12) so a tight drift-corrected budget is
-        # actually reached — each pass rolls a summary segment OR degrades
-        # one oversized payload, and a fat recent tail needs several
-        # degradation passes to get under.
-        session.session_manager.roll_history_summary_to_token_budget(
-            budget, keep_recent=keep_recent, max_passes=12,
-            provider=session.provider,
-        )
-
-        session._compaction_watermark = len(session.session_manager.history)
-    except Exception as exc:
-        logger.warning("Aggressive overflow compaction failed: %s", exc)
-    finally:
-        # Restore the floor so later in-turn compaction keeps FM-8 protection.
-        session.session_manager._tool_result_floor = floor_value
-
-
-def _generate_with_overflow_recovery(
-    session, *, messages, system_prompt, thinking, tools, turn_start_index,
-):
-    """Provider generate with reactive context-overflow recovery.
-
-    Mirrors Claude Code's Tier 5 reactive compaction: if the provider
-    rejects the prompt as too long (a non-transient 400/413), instead of
-    surfacing a hard error we aggressively compact history, rebuild the
-    prompt, and retry — and if the retry *still* overflows, compact harder
-    and retry again, up to `_MAX_OVERFLOW_RECOVERIES_PER_TURN` times per
-    turn. The retry lives inside the same try (it's the next loop
-    iteration), so a too-generous compaction budget that overflows on the
-    retry is caught and re-compacted instead of surfacing as "API Error
-    during agentic loop" (the old code returned the retry outside the try).
-
-    Escalation per still-overflowing attempt: shrink `keep_recent`
-    (4 → 2 → 1), grow the drift margin (0.20 → 0.30 → 0.40), and from the
-    2nd recovery on lift the per-turn tool-result floor so protected
-    recent tool results that alone exceed the budget can be degraded. A
-    per-turn count (`_overflow_recoveries_this_turn`, capped at
-    `_MAX_OVERFLOW_RECOVERIES_PER_TURN`) is the circuit breaker — it's a
-    count, not a boolean, so a *later* iteration that overflows again still
-    gets its own recovery.
-
-    This is the estimation-independent backstop behind the cl100k-based
-    pre-flight check: when the cheap token estimate under-counts the
-    model's real BPE (Ollama drifts ~2.2x), the wire-level 400 is the
-    ground truth, and we recover from it rather than crashing the turn.
-    The compaction budget is drift-corrected from that ground truth (see
-    `_aggressive_compact_for_overflow`), so each retry targets a *real*
-    token count the daemon accepts.
-    """
-    # Escalation ladder: each still-overflowing attempt compacts harder
-    # before retrying. The retry is the next loop iteration — it sits
-    # INSIDE the try, so a retry that still overflows is caught and
-    # re-compacted instead of surfacing as "API Error during agentic loop"
-    # (the old code returned the retry outside the try, so a too-generous
-    # compaction budget blew context on the retry with no recovery).
-    _KEEP_RECENT_LADDER = (4, 2, 1)
-    _MARGIN_LADDER = (0.20, 0.30, 0.40)
-
-    first_attempt = True
-    while True:
-        try:
-            return session._provider_generate_with_retry(
-                messages=messages,
-                system_prompt=system_prompt,
-                thinking=thinking,
-                tools=tools,
-            )
-        except Exception as exc:
-            if not is_context_overflow_error(exc):
-                raise
-            recoveries = int(getattr(session, "_overflow_recoveries_this_turn", 0) or 0)
-            if recoveries >= _MAX_OVERFLOW_RECOVERIES_PER_TURN:
-                logger.error(
-                    "Context overflow persisted after %d reactive compactions this "
-                    "turn; re-raising (circuit breaker): %s",
-                    recoveries, str(exc)[:300],
-                )
-                raise
-            session._overflow_recoveries_this_turn = recoveries + 1
-            # Escalate per recovery: shrink keep_recent, grow the margin,
-            # and (from the 2nd recovery on) lift the tool-result floor so
-            # protected recent tool results that alone exceed the budget
-            # can be degraded. Clamp the ladder index to its last rung.
-            level = min(recoveries, len(_KEEP_RECENT_LADDER) - 1)
-            keep_recent = _KEEP_RECENT_LADDER[level]
-            margin = _MARGIN_LADDER[min(level, len(_MARGIN_LADDER) - 1)]
-            lift_floor = level >= 1
-            if first_attempt or session.ui:
-                if session.ui:
-                    session.ui.show_info(
-                        "Context overflow from the model — compacting older "
-                        "history into a summary and retrying (no data lost)."
-                    )
-                first_attempt = False
-            logger.warning(
-                "Reactive overflow recovery #%d: provider rejected prompt as "
-                "too long. Compacting (keep_recent=%d, margin=%.2f, lift_floor=%s) "
-                "and retrying. Error: %s",
-                recoveries + 1, keep_recent, margin, lift_floor, str(exc)[:300],
-            )
-            _aggressive_compact_for_overflow(
-                session, system_prompt, messages, overflow_error=exc,
-                keep_recent=keep_recent, margin=margin, lift_floor=lift_floor,
-                tools=tools,
-            )
-            recent_history = session._prepare_runtime_history(
-                turn_start_index=turn_start_index,
-            )
-            messages = session._build_messages_from_history(
-                recent_history,
-                {"role": "system", "parts": []},
-            )[:-1]
-            # Final pre-flight (re-checks + may compact more) before the retry.
-            system_prompt, messages = _preflight_context_check(
-                session, system_prompt, messages, turn_start_index=turn_start_index,
-                tools=tools,
-            )
-
-
-def _active_teacher_lesson(session):
-    """Return ``(course, lesson_id)`` if teacher mode has a lesson the
-    watcher should classify against; ``(None, None)`` otherwise.
-
-    Eligible iff there's a teacher_state with a current_lesson_id whose
-    lesson is in presenting/lecturing status. Other states are skipped
-    so we don't fabricate transcript entries for completed lessons or
-    off-topic chatter.
-    """
-    state = getattr(session.session_manager, "teacher_state", None)
-    if not isinstance(state, dict):
-        return None, None
-    lesson_id = state.get("current_lesson_id")
-    if not lesson_id:
-        return None, None
-    try:
-        from dataclasses import is_dataclass
-
-        from mu.teacher.engine import Course
-        from mu.teacher.watcher import is_watcher_eligible
-
-        # The session_manager stores the course as a dict; the engine
-        # functions take a Course dataclass. Hydrate one lazily.
-        course = Course(**{k: v for k, v in state.items() if k in Course.__dataclass_fields__})  # type: ignore[arg-type]
-    except Exception as exc:
-        logger.debug("watcher: could not hydrate course: %s", exc)
-        return None, None
-    if not is_watcher_eligible(course, lesson_id):
-        return None, None
-    return course, lesson_id
-
-
-def _run_teacher_watcher_user(session, user_text: str) -> None:
-    course, lesson_id = _active_teacher_lesson(session)
-    if course is None:
-        return
-    try:
-        from mu.teacher.engine import find_lesson
-        from mu.teacher.watcher import (
-            apply_learner_classification,
-            classify_user_message,
-        )
-
-        lesson = find_lesson(course, lesson_id)
-        classification = classify_user_message(
-            session.provider, user_text, lesson=lesson
-        )
-        if not classification:
-            return
-        result = apply_learner_classification(course, lesson_id, classification)
-        _persist_teacher_course(session, course)
-        if result.events_applied and session.ui:
-            session.ui.show_info(
-                f"📚 watcher: recorded {len(result.events_applied)} "
-                f"learner turn{'s' if len(result.events_applied) != 1 else ''}"
-            )
-    except Exception as exc:
-        logger.warning("watcher (user): %s", exc)
-
-
-def _run_teacher_watcher_assistant(session, assistant_text: str) -> None:
-    course, lesson_id = _active_teacher_lesson(session)
-    if course is None:
-        return
-    try:
-        from mu.teacher.engine import find_lesson
-        from mu.teacher.watcher import (
-            apply_assistant_classification,
-            classify_assistant_message,
-        )
-
-        lesson = find_lesson(course, lesson_id)
-        classification = classify_assistant_message(
-            session.provider, assistant_text, lesson=lesson
-        )
-        if not classification:
-            return
-        result = apply_assistant_classification(course, lesson_id, classification)
-        _persist_teacher_course(session, course)
-        if result.agent_feedback and session.ui:
-            session.ui.show_info(f"📚 {result.agent_feedback}")
-        if result.events_applied and session.ui:
-            kinds = ", ".join(e["kind"] for e in result.events_applied)
-            session.ui.show_info(f"📚 watcher: recorded {kinds}")
-        if result.auto_concluded_lecture and session.ui:
-            session.ui.show_info("📚 lecture auto-concluded by watcher")
-    except Exception as exc:
-        logger.warning("watcher (assistant): %s", exc)
-
-
-def _persist_teacher_course(session, course) -> None:
-    """Mirror engine course state back onto session_manager so the
-    next iteration's prompt + L3 reflect the watcher's updates.
-
-    Uses the same persistence path the existing tool handlers use
-    (`_persist` in `mu/tools/teacher/handlers.py`) by going through
-    `session_manager.upsert_teacher_course`.
-    """
-    try:
-        from dataclasses import asdict
-
-        from mu.teacher.engine import save_course
-
-        record = asdict(course)
-        # Write course.json to disk so subsequent reads see the new
-        # lecture turns.
-        save_course(course)
-        session.session_manager.upsert_teacher_course(record)
-        # Make sure teacher_state mirrors registry so L3 injection
-        # picks up the new lecture turns.
-        session.session_manager.teacher_state = record
-        session.session_manager.active_course_id = course.course_id
-        session.session_manager.save_history(session.folder_context)
-    except Exception as exc:
-        logger.warning("watcher: persist course failed: %s", exc)
-
-
-def _render_learner_profile_block(session) -> str:
-    """Compact LEARNER PROFILE block for the teacher-mode system prompt.
-
-    Read from the active course's `learner_profile`. Returns "" when no
-    course is active OR when the profile has no usable fields yet
-    (pre-diagnostic), which is the right behavior — the model shouldn't
-    confabulate context the diagnostic hasn't established.
-    """
-    state = getattr(session.session_manager, "teacher_state", None)
-    if not isinstance(state, dict):
-        return ""
-    profile = state.get("learner_profile") or {}
-    if not isinstance(profile, dict):
-        return ""
-
-    def _list(key: str) -> list[str]:
-        val = profile.get(key)
-        return [str(x).strip() for x in val if str(x).strip()] if isinstance(val, list) else []
-
-    def _scalar(key: str) -> str:
-        return str(profile.get(key, "") or "").strip()
-
-    sections: list[str] = []
-    if _list("strengths"):
-        sections.append(f"- Strengths: {', '.join(_list('strengths'))}")
-    if _list("gaps"):
-        sections.append(f"- Gaps: {', '.join(_list('gaps'))}")
-    if _list("goals"):
-        sections.append(f"- Goals: {', '.join(_list('goals'))}")
-    if _list("modality"):
-        sections.append(f"- Preferred modalities: {', '.join(_list('modality'))}")
-    if _scalar("pace"):
-        sections.append(f"- Pace: {_scalar('pace')}")
-    if _scalar("jargon_tolerance"):
-        sections.append(f"- Jargon tolerance: {_scalar('jargon_tolerance')}")
-    if _scalar("motivation"):
-        sections.append(f"- Motivation: {_scalar('motivation')}")
-    if _list("background"):
-        sections.append(
-            f"- Background (use as analogy anchors): {', '.join(_list('background'))}"
-        )
-    if _scalar("personality"):
-        sections.append(f"- Personality / voice cues: {_scalar('personality')}")
-    if _list("anchors"):
-        sections.append(f"- Known concepts (anchor new ideas here): {', '.join(_list('anchors'))}")
-    if _list("stumbling_blocks"):
-        sections.append(
-            f"- Recurring stumbling blocks (slow down + re-anchor): "
-            f"{', '.join(_list('stumbling_blocks'))}"
-        )
-    if _scalar("notes"):
-        sections.append(f"- Notes: {_scalar('notes')}")
-
-    if not sections:
-        return ""
-
-    body = "\n".join(sections)
-    return (
-        "\n\nLEARNER PROFILE (active course — consult on EVERY teaching turn):\n"
-        f"{body}\n"
-        "Voice, examples, analogies, exercise difficulty, and pace MUST reflect this profile. "
-        "If you observe a new pattern (an analogy lands, a stumbling block surfaces, pace is "
-        "wrong, etc.), call `update_learner_profile` with a one-line `observation` and the "
-        "delta — the profile is a living document."
-    )
-
+from mu.agent.context_guard import (  # noqa: F401
+    _MAX_OVERFLOW_RECOVERIES_PER_TURN,
+    _estimate_messages_tokens,
+    _estimate_tools_tokens,
+    _preflight_context_check,
+    _resolve_real_context_window,
+    _overflow_drift_ratio,
+    _calibrate_drift_from_response,
+    _aggressive_compact_for_overflow,
+    _generate_with_overflow_recovery,
+)
 
 def run_turn(session, text):
     logger.info(f"Sending message: {text[:100]}...")
@@ -793,6 +172,13 @@ def run_turn(session, text):
                 if session.ui and _removed:
                     session.ui.show_info(_notice)
 
+    # Dual-registry contract (documented, not a bug): staged_files carries
+    # THIS-turn provider-native payloads (image_input bytes, file_refs —
+    # cleared after the turn), while staged_attachments carries durable
+    # descriptors that rehydrate as a text notice pointing the model at
+    # read_attachment/download_attachment tools. A file added via add_file
+    # intentionally lands in both: the model sees the content now AND
+    # retains a durable handle after compaction.
     parts = list(session.staged_files) + list(getattr(session, "staged_attachments", []) or [])
     effective_text = text
     if text and active_mode == "feature":
@@ -801,17 +187,19 @@ def run_turn(session, text):
         effective_text = session._build_loop_mode_prompt(text)
     if active_mode == "loop":
         session._ensure_loop_goal_persistence()
-    # Mode-agnostic: every turn, mirror the pinned session_goal into
-    # task_memory so it survives history compaction.
-    session._ensure_session_goal_persistence()
     # Auto-pin session_goal if unset and text is a substantial user
     # message (not a slash command, not empty, >10 chars).
     # This ensures L3 always has a goal anchor from the first meaningful
     # user message without requiring /goal to be set manually.
+    # Pin BEFORE persistence so the first meaningful request gets its
+    # task-memory audit entry (codex review finding #6).
     if not str(session.variables.get("session_goal", "") or "").strip():
         raw_text = str(text or "").strip()
         if raw_text and len(raw_text) > 10 and not raw_text.startswith("/"):
             session.variables["session_goal"] = raw_text
+    # Mode-agnostic: every turn, mirror the pinned session_goal into
+    # task_memory so it survives history compaction.
+    session._ensure_session_goal_persistence()
     if effective_text:
         parts.append({"type": "text", "text": effective_text})
 
@@ -959,7 +347,8 @@ def run_turn(session, text):
         session.tool_result_cache.max_entries = _tc_entries
         session.tool_result_cache.max_bytes = _tc_bytes
     except Exception:
-        pass
+        # Defensive: best-effort path must not break the caller.
+        logger.debug("Suppressed exception", exc_info=True)
     # Reset per-turn efficiency accumulators (spec #12) so each turn's
     # metrics reflect that turn only.
     try:
@@ -1034,12 +423,14 @@ def run_turn(session, text):
                 }
             )
     except Exception:
-        pass
+        # Defensive: best-effort path must not break the caller.
+        logger.debug("Suppressed exception", exc_info=True)
     try:
         session.session_manager._pending_compaction_kind = "turn_start"
         session.session_manager._pending_compaction_iter = 0
     except Exception:
-        pass
+        # Defensive: best-effort path must not break the caller.
+        logger.debug("Suppressed exception", exc_info=True)
     # Bridge the optional compact_focus variable (Claude Code `/compact
     # <focus>` style) so the LLM summarizer emphasizes it when set.
     session.session_manager._compact_focus = (
@@ -1136,6 +527,10 @@ def run_turn(session, text):
         base_persona_prompt,
         cached_skills=session._turn_skills_block,
     )
+    # Publish the pre-injection persona base so the emergency re-inject in
+    # the context guard can rebuild the layered hierarchy from it instead
+    # of stacking refreshed layers on the already-injected prompt.
+    session._system_prompt_base = base_persona_prompt
 
     recent_history = session._prepare_runtime_history()
     messages = session._build_messages_from_history(recent_history, new_user_message)
@@ -1143,6 +538,10 @@ def run_turn(session, text):
     initial_history_len = len(session.session_manager.history)
     session.session_manager.history.append(new_user_message)
     turn_start_index = len(session.session_manager.history) - 1
+    # True once any tool call in this turn has reached dispatch. Used by the
+    # 4xx rollback path: after a tool side effect exists, history rollback
+    # would orphan irreversibly-executed actions and invite duplication.
+    turn_had_tool_execution = False
     # Store on session so send_message's finally block can call _cleanup_protected
     # after the turn ends (unprotect the turn prompt if it's not otherwise worthy).
     session._current_turn_start_index = turn_start_index
@@ -1155,11 +554,16 @@ def run_turn(session, text):
     # Mark important user messages as protected from compaction.
     # The turn's starting prompt is always protected during this turn.
     session.session_manager._maybe_protect(turn_start_index, "user", effective_text, is_turn_prompt=True)
-    session.session_manager.save_history()
+    session.session_manager.save_history_turn()
     session.staged_files = []
     session.staged_attachments = []
 
-    max_iterations = session.variables.get("max_iterations", 50)
+    # Clamp persisted values: a corrupted/non-integer max_iterations must
+    # not raise TypeError at the loop condition on every turn.
+    try:
+        max_iterations = max(1, int(session.variables.get("max_iterations", 50)))
+    except (TypeError, ValueError):
+        max_iterations = 50
     iteration = 0
     active_tools = [t for t in TOOLS if t.name not in session.disabled_tools]
     active_tools = filter_tools_for_session_type(active_tools, session_type)
@@ -1184,8 +588,33 @@ def run_turn(session, text):
 
     logger.info(f"Starting agentic loop (max_iterations={max_iterations})")
     provider_bad_request_retried = False
-    exact_tool_sequence_history: list[str] = []
-    pattern_tool_sequence_history: list[str] = []
+    # Round-46 F8: loop-detection fingerprint histories are bounded deques —
+    # the detectors only ever inspect the last repeat_threshold entries
+    # (consecutive) or max_period*min_repeats entries (periodic), so an
+    # unbounded turn-long list retained 100k fingerprints for no benefit.
+    # maxlen covers both detectors' maximum lookback. Computed here because
+    # the threshold is defined further down (variable read must follow it).
+    loop_detection_repeat_threshold = max(
+        2,
+        int(session.variables.get("loop_detection_repeat_threshold", 5) or 5),
+    )
+    _loop_hist_maxlen = loop_detection_repeat_threshold + 12
+    exact_tool_sequence_history: deque = deque(maxlen=_loop_hist_maxlen)
+    pattern_tool_sequence_history: deque = deque(maxlen=_loop_hist_maxlen)
+    # Round-46 F1: history-checkpoint throttling. save_history_turn serializes
+    # and atomically rewrites the COMPLETE session document; doing that after
+    # EVERY tool iteration makes a 100k-iteration turn Θ(n²) in cumulative
+    # JSON+disk. The per-iteration tool-result save is now a bounded
+    # checkpoint: at most one full save per 2s wall clock OR every 10
+    # iterations (whichever first), with turn end / compactions / loop nudges
+    # still saving unconditionally. Staleness bound: the on-disk session can
+    # lag the live history by up to 2s / 10 iterations — the GUI live
+    # transcript refreshes from the next checkpoint (SSE-driven reloads are
+    # idempotent), and a crash loses at most that window of tool results.
+    _save_checkpoint_min_interval = 2.0
+    _save_checkpoint_every_iters = 10
+    _last_history_checkpoint = 0.0
+    _iters_since_checkpoint = 0
     # Dedicated lane for retryable-failure storms (R8, FM-6). Each
     # iteration that hits a retryable failure appends a synthetic
     # `retryable~<error_code>` fingerprint here; `is_repeated_tool_sequence`
@@ -1193,7 +622,7 @@ def run_turn(session, text):
     # tool args (which evade both the per-iteration escalation threshold
     # and the normal pattern lane, since non-search tools like read_file
     # produce per-arg-distinct fingerprints).
-    retryable_tool_sequence_history: list[str] = []
+    retryable_tool_sequence_history: deque = deque(maxlen=_loop_hist_maxlen)
     loop_detection_enabled = bool(
         session.variables.get("loop_detection_enabled", True)
     )
@@ -1450,11 +879,17 @@ def run_turn(session, text):
             # The trace event is written after the response is archived, so
             # deriving its estimate from live history there would incorrectly
             # include the newly generated assistant message.
+            # Round-46 F2: reuse the preflight estimate manifest instead of
+            # re-tokenizing the full prompt + messages + tool schemas a third
+            # time per provider call. Fallback covers preflight-less callers.
+            _est = getattr(session, "_request_estimate_manifest", None)
             request_token_estimate = (
-                estimate_tokens(dynamic_system_prompt)
-                + _estimate_messages_tokens(messages)
-                + _estimate_tools_tokens(
-                    provider_tools
+                _est["total"]
+                if _est
+                else (
+                    estimate_tokens(dynamic_system_prompt)
+                    + _estimate_messages_tokens(messages)
+                    + _estimate_tools_tokens(provider_tools)
                 )
             )
             try:
@@ -1466,9 +901,11 @@ def run_turn(session, text):
                         messages=messages,
                         tools=provider_tools,
                         token_estimate=request_token_estimate,
+                        estimate_manifest=_est,
                     ))
             except Exception:
-                pass
+                # Defensive: best-effort path must not break the caller.
+                logger.debug("Suppressed exception", exc_info=True)
 
             if session.ui and hasattr(session.ui, "build_live_status"):
                 status_msg = session.ui.build_live_status(
@@ -1701,7 +1138,8 @@ def run_turn(session, text):
                     except Exception:  # noqa: BLE001
                         _ctx_est = 0
             except Exception:
-                pass
+                # Defensive: best-effort path must not break the caller.
+                logger.debug("Suppressed exception", exc_info=True)
 
             # Live subagent context-usage: a child session reports its
             # per-iteration context fill / iter / tokens to the parent's
@@ -1749,7 +1187,8 @@ def run_turn(session, text):
                             tokens_in=_fill,
                         )
             except Exception:
-                pass
+                # Defensive: best-effort path must not break the caller.
+                logger.debug("Suppressed exception", exc_info=True)
 
             if not has_tool_call:
                 if not has_text:
@@ -1769,11 +1208,17 @@ def run_turn(session, text):
                         if _role == "child"
                         else NUDGE_EMPTY_RESPONSE
                     )
+                    # Round-14 F10: tag synthetic nudges so
+                    # compact_completed_turn can locate the REAL turn
+                    # boundary — a nudge stored as a plain user message
+                    # made the compactor treat the suffix after the nudge
+                    # as the whole turn, preserving stale tool metadata.
                     nudge_msg = {
                         "role": "user",
                         "parts": [
                             {"type": "text", "text": _nudge_text}
                         ],
+                        "synthetic": True,
                     }
                     session.session_manager.history.append(nudge_msg)
                     emit_nudge(session, "empty_response", iteration, role=_role)
@@ -1843,14 +1288,29 @@ def run_turn(session, text):
                     session._set_feature_state()
 
                 if session.variables.get("compact_history", False):
+                    # Compaction must run regardless of UI presence —
+                    # headless/API sessions with compact_history=True were
+                    # silently skipping it under the old `if session.ui`.
                     if session.ui:
                         session.ui.show_info(
                             "[dim]Compacting turn history (removing tool metadata)...[/dim]"
                         )
-                        session.session_manager.compact_completed_turn()
+                    session.session_manager.compact_completed_turn()
+                    # Fold whatever the just-finished turn displaced into the
+                    # rolling summary so compacted-away content survives in
+                    # L2 — otherwise the summary never learns about turns
+                    # that were dropped from history without a budget-driven
+                    # compaction pass.
+                    try:
+                        session.session_manager.roll_history_summary(
+                            keep_recent=resolve_keep_recent(session),
+                            provider=session.provider,
+                        )
+                    except Exception as exc:
+                        logger.debug("Post-turn summary roll skipped: %s", exc)
                     logger.debug("History compacted.")
 
-                session.session_manager.save_history(session.folder_context)
+                session.session_manager.save_history_turn(session.folder_context)
                 # If a hook aborted during this final iteration, surface
                 # that as the turn status — the abort fired, the user
                 # should see why the loop stopped.
@@ -2045,7 +1505,8 @@ def run_turn(session, text):
                                     f"already supplied — cache_key={ck}]"
                                 )
                             except Exception:
-                                pass
+                                # Defensive: best-effort path must not break the caller.
+                                logger.debug("Suppressed exception", exc_info=True)
                         return (
                             f"[dedup: {part.tool_name} — file unchanged; this "
                             f"range was already read this session "
@@ -2069,7 +1530,8 @@ def run_turn(session, text):
                                 f"cache {hit.get('cache_key', '')} — file unchanged]"
                             )
                         except Exception:
-                            pass
+                            # Defensive: best-effort path must not break the caller.
+                            logger.debug("Suppressed exception", exc_info=True)
                     return hit["result"]
                 return session._execute_tool_with_memory(
                     part.tool_name, part.tool_args
@@ -2095,6 +1557,20 @@ def run_turn(session, text):
                         parallel_indices.append(i)
                     else:
                         serial_indices.append(i)
+
+                # Order-preserving execution: a mixed batch like
+                # [write_file, read_file] must NOT be reordered so all
+                # "parallel-safe" calls run before serial mutations — the
+                # model's call order encodes read-after-write dependencies.
+                # Any serial call positioned BEFORE a parallel-safe call
+                # forces the whole batch serial (barrier semantics); a
+                # serial call after all parallel calls keeps the fast path.
+                if (
+                    parallel_indices
+                    and serial_indices
+                    and min(parallel_indices) > min(serial_indices)
+                ):
+                    parallel_indices, serial_indices = [], list(pending_executions)
 
                 # Parallel batch — preserves input-order results.
                 if parallel_indices:
@@ -2175,7 +1651,19 @@ def run_turn(session, text):
                         # collation buffer. Placeholder result here.
                         exec_results[idx] = None
                         continue
-                    exec_results[idx] = _auto_recall_or_execute(idx, part)
+                    try:
+                        exec_results[idx] = _auto_recall_or_execute(idx, part)
+                    except Exception as serial_exc:
+                        # A serial tool raising must not abort the remaining
+                        # serial calls or leave the tool call without a
+                        # result (codex review finding #4) — that produced
+                        # an invalid conversation sequence and lost the
+                        # outcomes of earlier tools. Convert to an error
+                        # result so Phase 3 archives one result per call.
+                        logger.warning(
+                            "Serial tool %s raised: %s", part.tool_name, serial_exc
+                        )
+                        exec_results[idx] = f"Error: {serial_exc}"
 
             # --- PHASE 3: post-processing (serial, in input order) -----------
             for i, part in enumerate(tool_calls):
@@ -2242,7 +1730,8 @@ def run_turn(session, text):
                                 bytes=len(body.encode("utf-8", errors="replace")),
                                 reason="model_flush")
                     except Exception:
-                        pass
+                        # Defensive: best-effort path must not break the caller.
+                        logger.debug("Suppressed exception", exc_info=True)
                 elif is_discard_deferred:
                     ids = part.tool_args.get("artifact_ids", []) if isinstance(part.tool_args, dict) else []
                     removed = session.collation_buffer.discard(ids if isinstance(ids, list) else [])
@@ -2254,7 +1743,8 @@ def run_turn(session, text):
                                 artifact_id=artifact_id, state="discarded",
                                 reason=str(part.tool_args.get("reason", "model_cleanup")))
                     except Exception:
-                        pass
+                        # Defensive: best-effort path must not break the caller.
+                        logger.debug("Suppressed exception", exc_info=True)
                 elif should_collate:
                     # Don't collate if there was an error
                     collation_cache_key = None
@@ -2279,7 +1769,8 @@ def run_turn(session, text):
                             part.tool_name, part.tool_args, raw_result
                         )
                         count = len(session.collation_buffer.entries)
-                        artifact = session.collation_buffer.manifest()[-1]
+                        # Round-46 F7: O(1) — cached at add() time, no full re-manifest.
+                        artifact = session.collation_buffer.last_manifest_entry()
                         cache_hint = (
                             f" [cache:{collation_cache_key}]"
                             if collation_cache_key
@@ -2301,7 +1792,8 @@ def run_turn(session, text):
                                 path=str(part.tool_args.get("filename") or part.tool_args.get("path") or "") if isinstance(part.tool_args, dict) else "",
                                 bytes=artifact["bytes"], reason="collation")
                         except Exception:
-                            pass
+                            # Defensive: best-effort path must not break the caller.
+                            logger.debug("Suppressed exception", exc_info=True)
                     if session.ui and active_mode != "loop":
                         session.ui.show_info(f"  [Collated: {part.tool_name}]")
                     else:
@@ -2384,7 +1876,8 @@ def run_turn(session, text):
                                 result=source_result,
                             )
                 except Exception:
-                    pass
+                    # Defensive: best-effort path must not break the caller.
+                    logger.debug("Suppressed exception", exc_info=True)
 
                 # Range-memo bookkeeping (spec #7): record the supplied range
                 # so a later overlapping read of the unchanged file dedups.
@@ -2406,7 +1899,8 @@ def run_turn(session, text):
                             part.tool_name, part.tool_args, cache_key
                         )
                 except Exception:
-                    pass
+                    # Defensive: best-effort path must not break the caller.
+                    logger.debug("Suppressed exception", exc_info=True)
 
                 if session.variables.get("structured_tool_results", True):
                     if raw_result != source_result:
@@ -2507,7 +2001,8 @@ def run_turn(session, text):
                             "cache_key": cache_key,
                         })
                     except Exception:
-                        pass
+                        # Defensive: best-effort path must not break the caller.
+                        logger.debug("Suppressed exception", exc_info=True)
                 # --- Trace: per-tool capture (latency, cache hit, result size) ---
                 try:
                     _t_start = _tool_start_times.pop(i, None)
@@ -2596,7 +2091,22 @@ def run_turn(session, text):
 
             tool_result_msg = {"role": "tool", "parts": tool_result_parts}
             session.session_manager.history.append(tool_result_msg)
-            session.session_manager.save_history(session.folder_context)
+            # Round-46 F1: throttled checkpoint — the first save of the turn
+            # is immediate (baseline), afterwards at most one full-document
+            # checkpoint per 2s / 10 iterations. Turn end and compaction
+            # sites still save unconditionally.
+            _now = time.monotonic()
+            _iters_since_checkpoint += 1
+            if (
+                _last_history_checkpoint == 0.0
+                or _iters_since_checkpoint >= _save_checkpoint_every_iters
+                or (_now - _last_history_checkpoint)
+                >= _save_checkpoint_min_interval
+            ):
+                session.session_manager.save_history_turn(session.folder_context)
+                _last_history_checkpoint = _now
+                _iters_since_checkpoint = 0
+            turn_had_tool_execution = True
 
             # --- Fix #12: context-gathering stall detection -------------
             # Count consecutive iterations that re-cover already-read paths
@@ -2641,7 +2151,7 @@ def run_turn(session, text):
                             "role": "user",
                             "parts": [{"type": "text", "text": _nudge}],
                         })
-                        session.session_manager.save_history(
+                        session.session_manager.save_history_turn(
                             session.folder_context
                         )
                         emit_nudge(
@@ -2736,7 +2246,7 @@ def run_turn(session, text):
                         ],
                     }
                     session.session_manager.history.append(loop_break_msg)
-                    session.session_manager.save_history(session.folder_context)
+                    session.session_manager.save_history_turn(session.folder_context)
                     emit_nudge(session, "loop_detect", iteration)
                     messages = session._build_messages_from_history(
                         session._prepare_runtime_history(turn_start_index),
@@ -2794,7 +2304,7 @@ def run_turn(session, text):
                         ],
                     }
                     session.session_manager.history.append(retryable_break_msg)
-                    session.session_manager.save_history(session.folder_context)
+                    session.session_manager.save_history_turn(session.folder_context)
                     emit_nudge(session, "loop_detect_retryable", iteration)
                     messages = session._build_messages_from_history(
                         session._prepare_runtime_history(turn_start_index),
@@ -2832,7 +2342,7 @@ def run_turn(session, text):
                     "parts": [{"type": "text", "text": escalation_text}],
                 }
                 session.session_manager.history.append(escalation_msg)
-                session.session_manager.save_history(session.folder_context)
+                session.session_manager.save_history_turn(session.folder_context)
                 emit_nudge(session, "retryable_escalation", iteration)
                 messages = session._build_messages_from_history(
                     session._prepare_runtime_history(turn_start_index),
@@ -2879,7 +2389,7 @@ def run_turn(session, text):
                     ],
                 }
             )
-            session.session_manager.save_history(session.folder_context)
+            session.session_manager.save_history_turn(session.folder_context)
             if session.session_manager.get_feature_state():
                 session._set_feature_state(status="interrupted")
             return session._collect_turn_response(
@@ -2909,11 +2419,15 @@ def run_turn(session, text):
             status_code = session._extract_http_status_code(str(e).lower())
             if (
                 not provider_bad_request_retried
-                and not current_tool_name
+                and not turn_had_tool_execution
                 and status_code is not None
                 and 400 <= status_code < 500
                 and status_code not in {408, 409, 425, 429}
             ):
+                # Roll back + retry once ONLY before any tool has run this
+                # turn. Once a tool side effect exists, deleting its history
+                # record orphans an irreversible action and retrying the
+                # request can duplicate it — surface the error instead.
                 provider_bad_request_retried = True
                 session.session_manager.history = session.session_manager.history[:initial_history_len]
                 session.session_manager.summary_anchor = min(
@@ -2921,7 +2435,7 @@ def run_turn(session, text):
                     len(session.session_manager.history),
                 )
                 session.session_manager.history.append(new_user_message)
-                session.session_manager.save_history(session.folder_context)
+                session.session_manager.save_history_turn(session.folder_context)
                 messages = session._build_messages_from_history(
                     session._prepare_runtime_history(),
                     new_user_message,
@@ -2940,7 +2454,7 @@ def run_turn(session, text):
                     session.session_manager.summary_anchor,
                     len(session.session_manager.history),
                 )
-                session.session_manager.save_history(session.folder_context)
+                session.session_manager.save_history_turn(session.folder_context)
                 messages = session._build_messages_from_history(
                     session._prepare_runtime_history(turn_start_index),
                     {"role": "system", "parts": []},
@@ -2951,7 +2465,7 @@ def run_turn(session, text):
                 iteration -= 1  # Decrement so the next loop run tries the same step
                 continue
 
-            session.session_manager.save_history(session.folder_context)
+            session.session_manager.save_history_turn(session.folder_context)
             if session.session_manager.get_feature_state():
                 session._set_feature_state(status="error")
             return session._collect_turn_response(
@@ -2963,7 +2477,7 @@ def run_turn(session, text):
                 error=f"{e}{tool_context}",
             )
 
-    session.session_manager.save_history(session.folder_context)
+    session.session_manager.save_history_turn(session.folder_context)
     session.paused_execution_text = None
 
     # Fix #13: instead of silently stopping at max_iterations mid-work,
@@ -2992,7 +2506,7 @@ def run_turn(session, text):
                 "role": "user",
                 "parts": [{"type": "text", "text": consolidation_text}],
             })
-            session.session_manager.save_history(session.folder_context)
+            session.session_manager.save_history_turn(session.folder_context)
 
             # Fresh L2/L3 for the consolidation call (cheap; reuses per-turn
             # cached L1B).
@@ -3046,7 +2560,7 @@ def run_turn(session, text):
                     "role": "assistant",
                     "parts": _consol_parts,
                 })
-                session.session_manager.save_history(session.folder_context)
+                session.session_manager.save_history_turn(session.folder_context)
             # Persist the consolidation into task memory so the next turn
             # inherits the handoff instead of re-deriving state from scratch.
             try:

@@ -21,11 +21,14 @@ import os
 
 import pytest
 
+import tempfile
+
 from mu.security.engine import (
     SEVERITY_LEVELS,
     SecurityFinding,
     SecurityProof,
     SecurityRemediation,
+    SecurityReport,
     add_finding,
     approve_finding,
     attach_proof,
@@ -451,3 +454,39 @@ def test_handlers_refuse_approval_without_dual_verification(workspace):
     result = json.loads(_handle_approve_security_finding({"finding_id": fid}, ctx))
     assert "error" in result
     assert "remediation" in result["error"].lower()
+
+
+def test_garbage_proof_loads_as_none_and_cannot_verify():
+    """Round-29 F2: a corrupt/hand-edited report whose proof dict
+    carries no usable fields must deserialize to proof=None (not a
+    default proof), so verify_proof refuses — a vacuous empty-marker
+    check would 'verify' a finding with zero evidence."""
+    import json as _json
+
+    report = SecurityReport(scan_id="r29-garbage", title="t")
+    report.directory = tempfile.mkdtemp()
+    save_report("s", report)
+    data = _json.load(open(report.metadata_path))
+    data["findings"] = [
+        {"finding_id": "f001", "title": "x", "proof": {"garbage": 1}}
+    ]
+    _json.dump(data, open(report.metadata_path, "w"))
+    loaded = load_report(report.metadata_path)
+    assert loaded is not None and loaded.findings[0].proof is None
+    with pytest.raises(ValueError, match="attach a proof"):
+        verify_proof(loaded.findings[0], cwd=tempfile.gettempdir())
+
+
+def test_empty_marker_proof_refused():
+    """Round-29 F2: an empty expected_markers list vacuously matches
+    (`not missing` with zero markers) — verify_proof must refuse."""
+    from mu.security.engine import SecurityProof, SecurityFinding
+
+    finding = SecurityFinding(
+        finding_id="f001",
+        title="x",
+        proof=SecurityProof(kind="command", command="echo hi",
+                            expected_markers=[]),
+    )
+    with pytest.raises(ValueError, match="vacuous"):
+        verify_proof(finding, cwd=tempfile.gettempdir())

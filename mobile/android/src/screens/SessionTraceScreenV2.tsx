@@ -45,6 +45,13 @@ const AXIS_HEIGHT = 20;
 const Y_AXIS_WIDTH = 56;
 const Y_AXIS_TARGET_TICKS = 4;
 const MAX_VISIBLE_POINTS = 72;
+// Round-44 F12: caps for the non-virtualized chip/pill rails. The server now
+// bounds trace payloads (500 iters / 2000 events per category), but the
+// scope-chip run rail and the compaction/nudge pill rails still mounted
+// every row they received. Newest-window slices keep the rails light while
+// preserving the visual design; totals remain visible via the MetricGrid.
+const MAX_SCOPE_CHIPS = 40;
+const MAX_EVENT_PILLS = 60;
 
 export function SessionTraceScreenV2() {
   const { colors } = useTheme();
@@ -168,7 +175,11 @@ export function SessionTraceScreenV2() {
                 onPress={() => { setLoading(true); load(null); }}
               />
             ) : null}
-            {runs.map(run => (
+            {/* Round-44 F12: newest-window slice — the rail is a flat .map
+                (non-virtualized), so a session with hundreds of runs would
+                mount every chip at once. runBounds/MetricGrid still surface
+                the totals. */}
+            {runs.slice(-MAX_SCOPE_CHIPS).map(run => (
               <ScopeChip
                 key={run.run_id}
                 label={`${run.mode} · ${run.iters} iters`}
@@ -546,7 +557,10 @@ function EventTimeline({ groups }: { groups: Array<{ label: string; items: Numer
         <View key={group.label} style={styles.timelineGroup}>
           <Text variant="xs" dim style={styles.timelineLabel}>{group.label}</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.timelineItems}>
-            {group.items.map((item, index) => (
+            {/* Round-44 F12: newest-window slice — the pill rail is a flat
+                .map inside a ScrollView (renders all children); long sessions
+                with thousands of compactions/nudges would mount them all. */}
+            {group.items.slice(-MAX_EVENT_PILLS).map((item, index) => (
               <View key={`${group.label}-${index}`} style={[styles.eventPill, { backgroundColor: colors.bgHover }]}>
                 <View style={[styles.eventDot, { backgroundColor: group.color }]} />
                 <Text variant="xs">{String(item[group.kindKey] || group.label)} · {formatInteger(numberValue(item.iter))}</Text>

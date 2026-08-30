@@ -107,13 +107,15 @@ def test_compaction_budget_applies_trim_threshold(monkeypatch):
     assert session._compaction_token_budget() == 4096
 
 
-def test_compaction_budget_floors_at_512():
-    """Even pathological settings shouldn't yield a near-zero budget."""
+def test_compaction_budget_zero_when_no_capacity():
+    """When reserve + non-L5 layers exceed the window, there is no real
+    history capacity — the budget must be 0 (not a fabricated floor), so
+    callers report the condition instead of looping (codex round-7 F6)."""
     session = _session(_SmallWindowProvider("dummy"))
     session.variables["context_token_limit"] = 1024
     session.variables["context_trim_threshold"] = 0.10
     session.variables["response_token_reserve"] = 100_000
-    assert session._compaction_token_budget() == 512
+    assert session._compaction_token_budget() == 0
 
 
 def test_provider_window_exception_is_swallowed():

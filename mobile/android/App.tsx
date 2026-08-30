@@ -5,7 +5,7 @@ import { ThemeProvider } from './src/theme/ThemeContext';
 import { AppNavigator } from './src/navigation/AppNavigator';
 import { PromptHost } from './src/components/PromptHost';
 import { AtmosphericBackground } from './src/components/AtmosphericBackground';
-import { useConnectionStore } from './src/store/connection';
+import { refreshPendingMutations, useConnectionStore } from './src/store/connection';
 
 export default function App() {
   const loadFromStorage = useConnectionStore((s) => s.loadFromStorage);
@@ -19,6 +19,14 @@ export default function App() {
 
     void (async () => {
       await loadFromStorage();
+      // Round-33b F6: cold-start hydration MUST run between storage load and
+      // the first reconnect/replay — refreshPendingMutations() derives the
+      // conflict banner + pending-mutation badge from the durable queue
+      // (rebuilding each session's conflict map, F7). Without this call the
+      // hydration helper existed but was never invoked by the app, so a
+      // restarted client showed no banner over a still-blocked queue and
+      // replayPending() could not attribute parked ids on the first pass.
+      await refreshPendingMutations();
       hydrated = true;
       if (!disposed) await autoReconnect();
     })();

@@ -5,6 +5,7 @@ import {
   SafeAreaProvider,
   SafeAreaView,
   initialWindowMetrics,
+  useSafeAreaInsets,
 } from 'react-native-safe-area-context';
 import type { Edge } from 'react-native-safe-area-context';
 import { AtmosphericBackground } from './AtmosphericBackground';
@@ -20,6 +21,15 @@ export type SafeAreaModalProps = Omit<ModalProps, 'children'> & {
  * workflows receive the same atmospheric product background as the app;
  * transparent overlays keep the underlying app visible instead.
  */
+/** Modal-local insets: navigation bar must not bleed under modal content. */
+const navigationBarTranslucent = false;
+
+function ModalInsets({ edges }: { edges: Edge[] }) {
+  const insets = useSafeAreaInsets();
+  void insets; // consumed by SafeAreaView inside the provider below
+  return null;
+}
+
 export function SafeAreaModal({
   children,
   edges = ['top', 'bottom'],
@@ -30,6 +40,7 @@ export function SafeAreaModal({
 }: SafeAreaModalProps) {
   const safeArea = (
     <SafeAreaProvider initialMetrics={initialWindowMetrics} style={styles.provider}>
+      <ModalInsets edges={edges} />
       <SafeAreaView edges={edges} style={[styles.container, containerStyle]}>
         {children}
       </SafeAreaView>

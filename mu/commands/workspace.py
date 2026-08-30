@@ -92,12 +92,9 @@ def _add_folders(session: Any, raw: str, allow_prompt: bool) -> CommandResult:
         if session.folder_context.add_folder(path):
             added.append(path)
             _emit(session, f"Added folder: {path}", allow_prompt)
-            if len(session.folder_context.folders) == 1:
-                try:
-                    os.chdir(session.folder_context.folders[0])
-                    _emit(session, f"Switched workspace to: {os.getcwd()}", allow_prompt)
-                except Exception:
-                    pass
+            # No os.chdir here either: the process cwd is global and the GUI
+            # runs sessions concurrently in one process. Tool handlers pick
+            # the workspace root per-call via default_working_directory().
         else:
             invalid.append(path)
             _emit_error(session, f"Folder not found or invalid: {path}", allow_prompt)

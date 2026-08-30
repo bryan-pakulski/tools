@@ -1,26 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { chatApi } from '../api/chat';
-import { sessionsApi, type SessionHistoryTurn } from '../api/sessions';
+import {
+  sessionsApi,
+  type SessionHistoryResponse,
+  type SessionHistoryTurn,
+} from '../api/sessions';
 import { subscribeToEvents, type SSESubscription } from '../api/sse';
+import { queueIfOffline, useConnectionStore } from '../store/connection';
+import { revisionToken } from '../api/offlineQueue';
 import type { ArtifactDescriptor } from '../api/artifacts';
 import type { AttachmentDescriptor } from '../api/attachments';
 
 const SESSION_POLL_MS = 5000;
 // Initial window size — the latest N turns to load on session open.
-// Older turns are loaded on demand via loadOlderHistory() when the user
-// scrolls near the top (sliding window). FlatList virtualization keeps
-// only a few cells mounted, so the array can grow without OOM.
-// Initial window size — the latest N turns to load on session open.
 // Kept small to avoid OOM on mid-range Android; older turns load on demand
 // via loadOlderHistory() (sliding window) when the user scrolls up.
-const MOBILE_HISTORY_TURN_LIMIT = 20;
-const MOBILE_HISTORY_PAGE_SIZE = 20;
+const MOBILE_HISTORY_TURN_LIMIT = 80;
+const MOBILE_HISTORY_CHECKPOINT_BATCH = 5;
+const MOBILE_HISTORY_CHECKPOINT_SCAN_PAGES = 6;
 
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'visualization' | 'subagent_panel' | 'collapse';
   text: string;
   turnId?: string;
+  /** Durable server turn index; user messages sharing it are one checkpoint. */
+  historyIndex?: number;
   streaming?: boolean;
   origin?: 'history' | 'local' | 'stream';
   artifact?: ArtifactDescriptor;
@@ -70,7 +75,7 @@ export interface LiveSubagent {
 }
 
 type StreamEvent = { kind: string; [key: string]: unknown };
-type ActiveSessionState = { active?: boolean; is_busy?: boolean; external_active?: boolean; external_last_at?: number };
+type ActiveSessionState = { active?: boolean; is_busy?: boolean; external_active?: boolean; external_last_at?: number; revision?: number | string };
 
 function asVisualization(value: unknown): ArtifactDescriptor | null {
   if (!value || typeof value !== 'object') return null;
@@ -100,6 +105,7 @@ export function historyToMessages(turns: SessionHistoryTurn[]): ChatMessage[] {
         id: `history-${turn.index}-${partIndex++}`,
         role: messageRole,
         text,
+        historyIndex: turn.index,
         streaming: false,
         origin: 'history',
         attachments: messageRole === 'user' ? [...pendingAttachments] : undefined,
@@ -159,6 +165,7 @@ export function historyToMessages(turns: SessionHistoryTurn[]): ChatMessage[] {
         id: `history-${turn.index}-attachments`,
         role: 'user',
         text: '',
+        historyIndex: turn.index,
         streaming: false,
         origin: 'history',
         attachments: [...pendingAttachments],
@@ -166,6 +173,87 @@ export function historyToMessages(turns: SessionHistoryTurn[]): ChatMessage[] {
     }
     return messages;
   });
+}
+
+async function historyToMessagesCooperatively(
+  turns: SessionHistoryTurn[],
+  signal?: AbortSignal,
+): Promise<ChatMessage[]> {
+  const messages: ChatMessage[] = [];
+  const batchSize = 8;
+  for (let start = 0; start < turns.length; start += batchSize) {
+    if (signal?.aborted) return [];
+    messages.push(...historyToMessages(turns.slice(start, start + batchSize)));
+    if (start + batchSize < turns.length) {
+      // Let gestures, navigation, and incoming SSE deltas run between
+      // conversion batches. A large history response must not monopolize
+      // React Native's JS thread even though FlatList virtualizes its cells.
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    }
+  }
+  return messages;
+}
+
+/**
+ * Fetch a backward history window containing five distinct user prompts.
+ *
+ * The server's limit is expressed in raw provider/tool turns, so one page can
+ * legitimately contain no user turns. Keep scanning bounded pages until the
+ * rail has a useful checkpoint batch or the start of history is reached.
+ */
+export async function fetchCheckpointHistory(
+  sessionName: string,
+  options: {
+    beforeIndex?: number;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+  } = {},
+): Promise<SessionHistoryResponse> {
+  const turnsByIndex = new Map<number, SessionHistoryTurn>();
+  const checkpointIndexes = new Set<number>();
+  let cursor = options.beforeIndex;
+  let firstResponse: SessionHistoryResponse | null = null;
+  let oldestResponse: SessionHistoryResponse | null = null;
+
+  for (let page = 0; page < MOBILE_HISTORY_CHECKPOINT_SCAN_PAGES; page += 1) {
+    const remaining = Math.max(1, MOBILE_HISTORY_CHECKPOINT_BATCH - checkpointIndexes.size);
+    const response = await sessionsApi.getHistory(sessionName, {
+      signal: options.signal,
+      timeoutMs: options.timeoutMs,
+      limitTurns: MOBILE_HISTORY_TURN_LIMIT,
+      beforeIndex: cursor,
+      checkpointCount: remaining,
+    });
+    if (!firstResponse) firstResponse = response;
+    oldestResponse = response;
+    for (const turn of response.turns || []) {
+      turnsByIndex.set(turn.index, turn);
+      if (turn.role === 'user') checkpointIndexes.add(turn.index);
+    }
+
+    const nextCursor = response.start_index;
+    if (
+      checkpointIndexes.size >= MOBILE_HISTORY_CHECKPOINT_BATCH
+      || !response.has_more
+      || nextCursor == null
+      || nextCursor <= 0
+      || nextCursor === cursor
+    ) break;
+    cursor = nextCursor;
+  }
+
+  const base = firstResponse || {
+    name: sessionName,
+    turns: [],
+    start_index: options.beforeIndex ?? 0,
+    has_more: false,
+  };
+  return {
+    ...base,
+    turns: [...turnsByIndex.values()].sort((left, right) => left.index - right.index),
+    start_index: oldestResponse?.start_index ?? base.start_index,
+    has_more: oldestResponse?.has_more ?? false,
+  };
 }
 
 function eventBelongsToSession(event: StreamEvent, activeSessionName: string | null): boolean {
@@ -474,6 +562,94 @@ function foldLiveInterim(messages: ChatMessage[], currentTurnId: string): ChatMe
   return [...messages.slice(0, userIndex + 1), ...regrouped];
 }
 
+// Pure whole-turn eviction helper retained for callers that need a bounded
+// offline snapshot. Interactive checkpoint history intentionally does not
+// use it: every exposed dot must remain a valid navigation target.
+// Keeps the
+// oldest `maxHistoryMessages` history-origin messages and drops the rest
+// (newest first eviction); live/stream messages always survive. Returns the
+// trimmed array plus the server index the forward cursor should point at
+// (null when nothing was evicted). History ids are `history-{turnIndex}-...`
+// so the newest surviving history message names the eviction boundary.
+export function applyHistoryWindowEviction(
+  messages: ChatMessage[],
+  options: {
+    maxHistoryMessages: number;
+  },
+): { messages: ChatMessage[]; forwardCursor: number | null } {
+  const { maxHistoryMessages } = options;
+  const parseTurnIndex = (message: ChatMessage): number | null => {
+    const parsed = /^history-(\d+)-/.exec(message.id);
+    return parsed ? Number(parsed[1]) : null;
+  };
+
+  const historyIndexes: number[] = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    if (messages[index].origin === 'history') historyIndexes.push(index);
+  }
+  if (historyIndexes.length <= maxHistoryMessages) {
+    // Nothing evicted. Report the index after the newest retained turn.
+    if (historyIndexes.length === 0) return { messages, forwardCursor: null };
+    const lastTurn = parseTurnIndex(messages[historyIndexes[historyIndexes.length - 1]]);
+    // Without a parseable id we can't know whether newer content exists;
+    // null keeps any armed cursor as-is (caller decides).
+    return { messages, forwardCursor: lastTurn === null ? null : lastTurn + 1 };
+  }
+
+  // Round-45 F8: evict WHOLE server turns, never a partial turn. The old
+  // message-count slice could split a multi-part turn — half its parts
+  // evicted, cursor set past the whole turn, and the evicted remainder
+  // unrecoverable. Group history messages by parsed turn index and evict
+  // the NEWEST complete turns until the kept history fits the budget
+  // (a turn whose group crosses the budget is kept whole — it may push
+  // the kept count slightly over, which is fine: the budget is a target).
+  const groupsByTurn = new Map<number, number[]>();
+  const turnOrder: number[] = [];
+  for (const index of historyIndexes) {
+    const turnIndex = parseTurnIndex(messages[index]);
+    if (turnIndex === null) continue; // unparseable history ids are always kept
+    if (!groupsByTurn.has(turnIndex)) {
+      groupsByTurn.set(turnIndex, []);
+      turnOrder.push(turnIndex);
+    }
+    groupsByTurn.get(turnIndex)!.push(index);
+  }
+  // Walk turns OLDEST-first, keeping complete turns while the count stays
+  // within budget; the FIRST turn that would cross the budget starts the
+  // evicted tail. A turn is never split — it is kept whole or evicted whole.
+  let keptCount = 0;
+  let evictFromOrder = turnOrder.length;
+  for (let position = 0; position < turnOrder.length; position += 1) {
+    const group = groupsByTurn.get(turnOrder[position])!;
+    if (position > 0 && keptCount + group.length > maxHistoryMessages) {
+      evictFromOrder = position;
+      break;
+    }
+    keptCount += group.length;
+    evictFromOrder = position + 1;
+  }
+  const evictedSet = new Set<number>();
+  for (let position = evictFromOrder; position < turnOrder.length; position += 1) {
+    for (const index of groupsByTurn.get(turnOrder[position])!) {
+      evictedSet.add(index);
+    }
+  }
+  // Everything NOT in evictedSet survives — live/stream messages were never
+  // added to it, so they always survive.
+  const result = messages.filter((_, index) => !evictedSet.has(index));
+
+  // Forward cursor: server index AFTER the newest wholly-KEPT turn. Every
+  // evicted turn is complete, so reloading from this cursor can never
+  // re-fetch half a turn or skip evicted parts.
+  const newestKeptOrder = evictFromOrder - 1;
+  if (newestKeptOrder < 0) return { messages: result, forwardCursor: null };
+  const newestKeptTurn = turnOrder[newestKeptOrder];
+  return {
+    messages: result,
+    forwardCursor: newestKeptTurn == null ? null : newestKeptTurn + 1,
+  };
+}
+
 function prepareForAssistantTurn(
   messages: ChatMessage[],
   turnId: string,
@@ -514,6 +690,7 @@ export function useChatSession(activeSessionName: string | null) {
   const historyHydratedRef = useRef<string | null>(null);
   const historyRequestRef = useRef<{ sessionName: string; promise: Promise<void> } | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
+  const olderHistoryAbortRef = useRef<AbortController | null>(null);
   const stateAbortRef = useRef<AbortController | null>(null);
   const externalWriteAtRef = useRef(0);
   const completionProbeRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -527,7 +704,9 @@ export function useChatSession(activeSessionName: string | null) {
   // backward pagination. Reset on session change / full reload.
   const oldestLoadedIndexRef = useRef<number | null>(null);
   const loadingOlderRef = useRef(false);
-
+  // Round-44 F5: coalesced streaming deltas — pending text + flush cadence.
+  const pendingDeltaRef = useRef<{ turnId: string; text: string; first: boolean } | null>(null);
+  const deltaFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
@@ -568,24 +747,35 @@ export function useChatSession(activeSessionName: string | null) {
     }, 260);
   }, []);
 
-  const appendAssistantDelta = useCallback((turnId: string, delta: string) => {
-    if (!delta) return;
-    const safeTurnId = turnId || 'active-turn';
-    const firstDelta = !seenAssistantTurnsRef.current.has(safeTurnId);
-    seenAssistantTurnsRef.current.add(safeTurnId);
+  // Round-44 F5: streaming deltas are coalesced. Each SSE delta used to
+  // run prepareForAssistantTurn (full .map), a findIndex, and a full array
+  // copy — O(loaded history) per token, with a new array identity per token
+  // forcing FlatList reconciliation every frame. Deltas now accumulate in
+  // a ref and flush to React state at a fixed 32ms cadence (and on turn
+  // end), so a 200k-message session pays O(1) amortized per token instead
+  // of O(n).
+  const flushPendingDeltas = useCallback(() => {
+    if (deltaFlushTimerRef.current) {
+      clearTimeout(deltaFlushTimerRef.current);
+      deltaFlushTimerRef.current = null;
+    }
+    const pending = pendingDeltaRef.current;
+    if (!pending) return;
+    pendingDeltaRef.current = null;
+    const { turnId, text, first } = pending;
     setMessages(current => {
-      const prepared = prepareForAssistantTurn(current, safeTurnId);
+      const prepared = prepareForAssistantTurn(current, turnId);
       const index = prepared.findIndex(
-        message => message.role === 'assistant' && message.turnId === safeTurnId,
+        message => message.role === 'assistant' && message.turnId === turnId,
       );
       if (index >= 0) {
         const updated = [...prepared];
         updated[index] = {
           ...updated[index],
-          text: updated[index].text + delta,
+          text: updated[index].text + text,
           streaming: true,
           origin: 'stream',
-          handoff: firstDelta ? 'entering' : updated[index].handoff,
+          handoff: first ? 'entering' : updated[index].handoff,
         };
         return updated;
       }
@@ -593,7 +783,7 @@ export function useChatSession(activeSessionName: string | null) {
       for (let scan = prepared.length - 1; scan >= 0; scan -= 1) {
         if (prepared[scan].role === 'user') { lastUserIndex = scan; break; }
       }
-      const previousMarked = firstDelta
+      const previousMarked = first
         ? prepared.map((message, messageIndex) => (
           messageIndex > lastUserIndex
           && message.role === 'assistant'
@@ -606,15 +796,35 @@ export function useChatSession(activeSessionName: string | null) {
       return [...previousMarked, {
         id: nextId('assistant'),
         role: 'assistant',
-        text: delta,
-        turnId: safeTurnId,
+        text,
+        turnId,
         streaming: true,
         origin: 'stream',
-        handoff: firstDelta ? 'entering' : undefined,
+        handoff: first ? 'entering' : undefined,
       }];
     });
-    if (firstDelta) scheduleAssistantHandoff(safeTurnId);
+    if (first) scheduleAssistantHandoff(turnId);
   }, [nextId, scheduleAssistantHandoff]);
+
+  const appendAssistantDelta = useCallback((turnId: string, delta: string) => {
+    if (!delta) return;
+    const safeTurnId = turnId || 'active-turn';
+    const firstDelta = !seenAssistantTurnsRef.current.has(safeTurnId);
+    seenAssistantTurnsRef.current.add(safeTurnId);
+    const pending = pendingDeltaRef.current;
+    if (pending && pending.turnId === safeTurnId) {
+      pending.text += delta;
+    } else {
+      if (pending) flushPendingDeltas();
+      pendingDeltaRef.current = { turnId: safeTurnId, text: delta, first: firstDelta };
+    }
+    if (!deltaFlushTimerRef.current) {
+      deltaFlushTimerRef.current = setTimeout(() => {
+        deltaFlushTimerRef.current = null;
+        flushPendingDeltas();
+      }, 32);
+    }
+  }, [flushPendingDeltas]);
 
   const finalizeAssistant = useCallback((turnId: string) => {
     setMessages(current => current.map(message =>
@@ -659,23 +869,23 @@ export function useChatSession(activeSessionName: string | null) {
     const initialLoad = historyHydratedRef.current !== activeSessionName;
     if (initialLoad) setHistoryLoading(true);
 
+    olderHistoryAbortRef.current?.abort();
+    olderHistoryAbortRef.current = null;
     historyAbortRef.current?.abort();
     const controller = new AbortController();
     historyAbortRef.current = controller;
     const request = (async () => {
       try {
-        const response = await sessionsApi.getHistory(activeSessionName, {
+        const response = await fetchCheckpointHistory(activeSessionName, {
           signal: controller.signal,
           timeoutMs: 15_000,
-          limitTurns: MOBILE_HISTORY_TURN_LIMIT,
-          // Visualization cards are collapsed until opened, so hydrate every
-          // durable visualization descriptor for parity with the web client.
         });
-        // Yield once before converting/rendering history so a navigation press
-        // already queued by React Native is handled first.
-        await new Promise<void>(resolve => setTimeout(resolve, 0));
         if (controller.signal.aborted || lastSessionRef.current !== activeSessionName) return;
-        const historyMessages = historyToMessages(response.turns || []);
+        const historyMessages = await historyToMessagesCooperatively(
+          response.turns || [],
+          controller.signal,
+        );
+        if (controller.signal.aborted || lastSessionRef.current !== activeSessionName) return;
         // Track the oldest loaded turn index for backward pagination.
         const oldestIdx = response.start_index ?? null;
         oldestLoadedIndexRef.current = oldestIdx;
@@ -691,6 +901,18 @@ export function useChatSession(activeSessionName: string | null) {
           // key changes → FlatList unmounts/remounts all cells → visible
           // "jumping up and down" effect.
           const currentFlat = flattenCollapsedMessages(current);
+          // Fast path: identical history refresh → keep current array identity
+          // so FlatList sees no change and does not re-render any cell.
+          const unchanged = current.length === historyMessages.length
+            && historyMessages.every((next, index) => {
+              const prev = currentFlat[index];
+              return !!prev
+                && prev.role === next.role
+                && prev.text === next.text;
+            });
+          if (unchanged) {
+            return unchanged ? current : historyMessages;
+          }
           const merged = historyMessages.map((next, index) => {
             const prev = currentFlat[index];
             if (!prev) return next;
@@ -741,28 +963,41 @@ export function useChatSession(activeSessionName: string | null) {
 
     loadingOlderRef.current = true;
     setLoadingOlder(true);
+    const controller = new AbortController();
+    olderHistoryAbortRef.current = controller;
     try {
-      const response = await sessionsApi.getHistory(activeSessionName, {
+      const response = await fetchCheckpointHistory(activeSessionName, {
+        signal: controller.signal,
         timeoutMs: 15_000,
-        limitTurns: MOBILE_HISTORY_PAGE_SIZE,
         beforeIndex: cursor,
       });
-      if (lastSessionRef.current !== activeSessionName) return 0;
-      const olderMessages = historyToMessages(response.turns || []);
-      const olderCount = olderMessages.length;
+      if (controller.signal.aborted || lastSessionRef.current !== activeSessionName) return 0;
+      const olderMessages = await historyToMessagesCooperatively(
+        response.turns || [],
+        controller.signal,
+      );
+      if (controller.signal.aborted || lastSessionRef.current !== activeSessionName) return 0;
+      const olderCheckpointCount = new Set(
+        olderMessages
+          .filter(message => message.role === 'user' && message.historyIndex != null)
+          .map(message => message.historyIndex),
+      ).size;
       const newOldest = response.start_index ?? null;
       oldestLoadedIndexRef.current = newOldest;
       setHasMore(response.has_more ?? false);
-      if (olderCount > 0) {
-        setMessages(current => groupIntermediateTurns(
-          [...olderMessages, ...flattenCollapsedMessages(current)],
-          current,
-        ));
+      if (olderMessages.length > 0) {
+        setMessages(current => {
+          return groupIntermediateTurns(
+            [...olderMessages, ...flattenCollapsedMessages(current)],
+            current,
+          );
+        });
       }
-      return olderCount;
+      return olderCheckpointCount;
     } catch {
       return 0;
     } finally {
+      if (olderHistoryAbortRef.current === controller) olderHistoryAbortRef.current = null;
       loadingOlderRef.current = false;
       setLoadingOlder(false);
     }
@@ -786,6 +1021,15 @@ export function useChatSession(activeSessionName: string | null) {
       const externalWriteAt = Number(response.external_last_at || 0);
       const sawExternalWrite = externalWriteAt > externalWriteAtRef.current;
       if (sawExternalWrite) externalWriteAtRef.current = externalWriteAt;
+      // F11 (round-13): track the server-side session revision so offline
+      // mutations can queue with If-Match CAS protection. Round-32b F4:
+      // capture the token losslessly — number stays number, a decimal
+      // string (revision > 2^53-1) passes through verbatim; Number()
+      // would round 9007199254740993 to ...992 and CAS would never match.
+      const stateRevision = revisionToken(response.revision);
+      if (stateRevision !== null) {
+        useConnectionStore.getState().setSessionRevision(stateRevision);
+      }
       const wasBusy = busyRef.current;
       busyRef.current = busy;
       setStreaming(busy);
@@ -795,6 +1039,13 @@ export function useChatSession(activeSessionName: string | null) {
           message.role === 'assistant' && message.streaming && message.text.trim().length > 0,
         );
         if (!hasStreamingText) setWaitingForFirstToken(true);
+        // Round-20 F46: reconciliation restored busy/streaming but only
+        // replaced the activity label when SSE was disconnected — after a
+        // 'Send failed' label was set (F42 path) with SSE still connected,
+        // the UI showed a failed send while a server turn was actually
+        // running. Busy is authoritative for the label whenever the
+        // current label is a terminal failure marker.
+        setActivityLabel(prev => (prev === 'Send failed' ? 'Thinking' : prev));
         if (!sseConnectedRef.current) setActivityLabel('Reconnecting');
       } else {
         setWaitingForFirstToken(false);
@@ -902,6 +1153,9 @@ export function useChatSession(activeSessionName: string | null) {
     }
 
     if (kind === 'assistant_end') {
+      // Round-44 F5: flush coalesced deltas BEFORE finalizing so the full
+      // streamed text is in state when streaming is retired.
+      flushPendingDeltas();
       finalizeAssistant(String(event.turn_id || 'active-turn'));
       if (busyRef.current) {
         setWaitingForFirstToken(true);
@@ -931,6 +1185,8 @@ export function useChatSession(activeSessionName: string | null) {
     }
 
     if (kind === 'turn_complete') {
+      // Round-44 F5: never drop pending deltas on turn completion.
+      flushPendingDeltas();
       if (handoffTimerRef.current) {
         clearTimeout(handoffTimerRef.current);
         handoffTimerRef.current = null;
@@ -943,6 +1199,14 @@ export function useChatSession(activeSessionName: string | null) {
       setStreaming(false);
       setWaitingForFirstToken(false);
       setActivityLabel('Thinking');
+      // Round-31 F35: the turn_complete publish carries the post-turn
+      // revision (chat.py _drive); capture it as the fresh If-Match token
+      // so the next offline mutation CASes against the state just written.
+      // Round-32b F4: lossless token capture (never Number()-convert).
+      const completedRevision = revisionToken(event.revision);
+      if (completedRevision !== null) {
+        useConnectionStore.getState().setSessionRevision(completedRevision);
+      }
       const result = event.result && typeof event.result === 'object'
         ? event.result as Record<string, unknown>
         : null;
@@ -1032,6 +1296,20 @@ export function useChatSession(activeSessionName: string | null) {
     }
 
     if (kind === 'session_updated') {
+      // Round-31 F35: the watcher now publishes the post-reload session
+      // revision in session_updated; capture it as the If-Match token so
+      // offline mutations CAS against the server state we just learned
+      // about. Round-32b F4: lossless token capture — the decimal string
+      // form (revision above 2^53-1) must pass through verbatim.
+      // Round-33b F3: a session_updated WITHOUT a valid revision is the
+      // deferred/failed-reload path (round-32 F7) — the server state this
+      // event describes was NOT re-read, so any previously captured token
+      // is now known-stale. Reset it to null: the next offline send then
+      // goes out UNGUARDED (server decides) rather than 409-ing forever
+      // against a dead token. The successful deferred_reload event DOES
+      // carry a fresh revision and re-arms the guard here.
+      const updatedRevision = revisionToken(event.revision);
+      useConnectionStore.getState().setSessionRevision(updatedRevision);
       if (!busyRef.current) void loadHistory(false);
       return;
     }
@@ -1059,6 +1337,7 @@ export function useChatSession(activeSessionName: string | null) {
     appendAssistantDelta,
     appendUserMessage,
     finalizeAssistant,
+    flushPendingDeltas,
     loadHistory,
     replaceSubagentSnapshot,
     syncSessionState,
@@ -1070,6 +1349,8 @@ export function useChatSession(activeSessionName: string | null) {
     subscriptionRef.current = null;
     historyAbortRef.current?.abort();
     historyAbortRef.current = null;
+    olderHistoryAbortRef.current?.abort();
+    olderHistoryAbortRef.current = null;
     historyRequestRef.current = null;
     stateAbortRef.current?.abort();
     stateAbortRef.current = null;
@@ -1135,9 +1416,10 @@ export function useChatSession(activeSessionName: string | null) {
     void syncSessionState();
     const poll = setInterval(() => {
       // A connected event stream already carries busy, completion, prompt,
-      // artifact, and external session updates. Poll only as a disconnected
-      // recovery path so mobile does not hammer the host while an agent runs.
-      if (sseConnectedRef.current) return;
+      // artifact, and external session updates. Skip only while connected AND
+      // busy so idle sessions still reconcile; this keeps mobile from
+      // hammering the host while an agent runs.
+      if (sseConnectedRef.current && busyRef.current) return;
       void syncSessionState();
     }, SESSION_POLL_MS);
 
@@ -1159,6 +1441,8 @@ export function useChatSession(activeSessionName: string | null) {
       subscriptionRef.current = null;
       historyAbortRef.current?.abort();
       historyAbortRef.current = null;
+      olderHistoryAbortRef.current?.abort();
+      olderHistoryAbortRef.current = null;
       stateAbortRef.current?.abort();
       stateAbortRef.current = null;
     };
@@ -1176,12 +1460,53 @@ export function useChatSession(activeSessionName: string | null) {
     setActivityLabel(sseConnectedRef.current ? 'Thinking' : 'Connecting');
     appendUserMessage(trimmed, 'local', attachments);
 
+    // G5 (§3.6): offline sends join the outbound queue and replay on the
+    // next reconnect; the optimistic user bubble above keeps the chat UX.
+    // F11: carry the last-known session revision as If-Match so a stale
+    // send is rejected (409) instead of silently clobbering.
+    if (await queueIfOffline('chat_send', {
+      text: trimmed,
+      session_name: activeSessionName,
+      attachment_ids: attachments.map(item => item.attachment_id),
+    }, {
+      sessionName: activeSessionName,
+      ifMatch: useConnectionStore.getState().sessionRevision ?? undefined,
+    })) {
+      busyRef.current = false;
+      setStreaming(false);
+      setWaitingForFirstToken(false);
+      setActivityLabel('Queued (offline)');
+      return true;
+    }
+
     try {
-      await chatApi.send(trimmed, activeSessionName, attachments.map(item => item.attachment_id));
+      const response = await chatApi.send(trimmed, activeSessionName, attachments.map(item => item.attachment_id));
+      // Round-32b F5: capture the send response's revision — covers the
+      // SSE-missed-terminal-event case (the phone never saw turn_complete,
+      // so this response is the only fresh If-Match source). Same lossless
+      // token handling as F4; only valid tokens update the store.
+      const sendRevision = revisionToken(response.revision);
+      if (sendRevision !== null) {
+        useConnectionStore.getState().setSessionRevision(sendRevision);
+      }
       return true;
     } catch (sendError) {
       setError(String(sendError));
-      await syncSessionState();
+      // Round-19 F42: the send never reached/failed at the server — the
+      // turn is NOT in flight. Clear the local busy state BEFORE the
+      // reconciliation attempt; if syncSessionState also fails it
+      // deliberately preserves a busy presentation, which dead-locked
+      // the send guard (busyRef stays true forever, no further sends).
+      busyRef.current = false;
+      setStreaming(false);
+      setWaitingForFirstToken(false);
+      setActivityLabel('Send failed');
+      try {
+        await syncSessionState();
+      } catch {
+        // Reconciliation failed — the local state above is still the
+        // truthful one (nothing is running server-side).
+      }
       return false;
     }
   }, [activeSessionName, appendUserMessage, syncSessionState]);

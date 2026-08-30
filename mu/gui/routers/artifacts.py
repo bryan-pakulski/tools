@@ -58,12 +58,18 @@ def _registry(session_name: str) -> ArtifactRegistry:
 
 
 @router.get("/{name}/artifacts")
-async def list_artifacts(name: str, response: Response):
+async def list_artifacts(name: str, response: Response, limit: int = 100):
     # Artifact registries are written by both the host and mounted container
     # workers. Never let a mobile HTTP cache hide a newly published entry.
     response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["Pragma"] = "no-cache"
-    return {"artifacts": _registry(name).list()}
+    # Round-44 F9: bounded list — newest `limit` descriptors (0 = all).
+    # A 200k-message session that publishes artifacts repeatedly no longer
+    # transfers and stat()s every descriptor on each refresh.
+    registry = _registry(name)
+    if limit and limit > 0:
+        return {"artifacts": registry.list(limit=limit), "total": len(registry._read())}
+    return {"artifacts": registry.list()}
 
 
 @router.get("/{name}/artifacts/{artifact_id}/view")

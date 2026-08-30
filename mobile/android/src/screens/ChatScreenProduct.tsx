@@ -15,6 +15,7 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { Ionicons } from '@expo/vector-icons';
 import * as Clipboard from 'expo-clipboard';
 import Markdown from 'react-native-markdown-display';
+import { openExternalUrl } from '../api/urlSafety';
 import { useTheme } from '../theme/ThemeContext';
 import { useConnectionStore } from '../store/connection';
 import { modesApi, ModeInfo } from '../api/modes';
@@ -31,6 +32,10 @@ import { useChatSession, type ChatMessage } from '../hooks/useChatSession';
 import { useCommandCompletion, type CompletionItem } from '../hooks/useCommandCompletion';
 import { CommandSuggestionBar } from '../components/CommandSuggestionBar';
 import { SubagentActivityPanel } from '../components/SubagentActivityPanel';
+import {
+  ConversationStageRail,
+  conversationStages,
+} from '../components/ConversationStageRail';
 
 /**
  * Product presentation for the mobile conversation.
@@ -72,16 +77,107 @@ export function ChatScreenProduct() {
   const [varGroups, setVarGroups] = useState<InspectorVariableGroup[]>([]);
   const [varsLoading, setVarsLoading] = useState(false);
   const [attachmentsOpen, setAttachmentsOpen] = useState(false);
+  // Round-51 UI: artifacts/visualizations strip is toggleable to reduce clutter.
+  const [artifactsVisible, setArtifactsVisible] = useState(true);
   const [selectedAttachments, setSelectedAttachments] = useState<AttachmentDescriptor[]>([]);
   const [workedById, setWorkedById] = useState<Record<string, number>>({});
+  const [activeMessageIndex, setActiveMessageIndex] = useState(0);
 
   const flatListRef = useRef<FlatList<ChatMessage>>(null);
   const loadingOlderRef = useRef(false);
+  const checkpointRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingCheckpointIndexRef = useRef<number | null>(null);
+  const checkpointJumpAttemptsRef = useRef(0);
+  const olderCheckpointAnchorRef = useRef<string | null | undefined>(undefined);
   const followOutputRef = useRef(true);
   const visualizationActiveRef = useRef(false);
   const previousStreamingRef = useRef(false);
   const turnStartedAtRef = useRef<number | null>(null);
   const completion = useCommandCompletion();
+  const viewabilityRef = useRef(({ viewableItems }: { viewableItems: Array<{ index: number | null }> }) => {
+    const indexes = viewableItems
+      .map(item => item.index)
+      .filter((index): index is number => index !== null)
+      .sort((left, right) => left - right);
+    if (indexes.length > 0) {
+      const pendingIndex = pendingCheckpointIndexRef.current;
+      if (pendingIndex !== null && indexes.includes(pendingIndex)) {
+        setActiveMessageIndex(pendingIndex);
+        pendingCheckpointIndexRef.current = null;
+        checkpointJumpAttemptsRef.current = 0;
+        if (checkpointRetryTimerRef.current) clearTimeout(checkpointRetryTimerRef.current);
+        checkpointRetryTimerRef.current = null;
+      } else {
+        setActiveMessageIndex(indexes[0]);
+      }
+    }
+  });
+  // FlatList requires viewabilityConfig identity to remain stable. Recreating
+  // it when the active marker changes can stop viewability callbacks entirely.
+  const stageViewabilityConfigRef = useRef({ itemVisiblePercentThreshold: 20 });
+
+  const jumpToCheckpoint = useCallback((messageIndex: number) => {
+    followOutputRef.current = false;
+    pendingCheckpointIndexRef.current = messageIndex;
+    checkpointJumpAttemptsRef.current = 0;
+    setActiveMessageIndex(messageIndex);
+    flatListRef.current?.scrollToIndex({
+      index: messageIndex,
+      animated: false,
+      viewPosition: 0,
+    });
+  }, []);
+
+  const onCheckpointScrollFailed = useCallback(({
+    index,
+    averageItemLength,
+  }: {
+    index: number;
+    averageItemLength: number;
+  }) => {
+    if (pendingCheckpointIndexRef.current !== index) return;
+    checkpointJumpAttemptsRef.current += 1;
+    flatListRef.current?.scrollToOffset({
+      offset: Math.max(0, index * Math.max(1, averageItemLength)),
+      animated: false,
+    });
+    if (checkpointRetryTimerRef.current) clearTimeout(checkpointRetryTimerRef.current);
+    if (checkpointJumpAttemptsRef.current >= 6) return;
+    checkpointRetryTimerRef.current = setTimeout(() => {
+      if (pendingCheckpointIndexRef.current !== index) return;
+      flatListRef.current?.scrollToIndex({
+        index,
+        animated: false,
+        viewPosition: 0,
+      });
+    }, 96);
+  }, []);
+
+  const loadOlderCheckpoints = useCallback(() => {
+    if (loadingOlder) return;
+    const stages = conversationStages(messages);
+    olderCheckpointAnchorRef.current = stages[0]?.key ?? null;
+    void loadOlderHistory().then(checkpointCount => {
+      if (checkpointCount <= 0) olderCheckpointAnchorRef.current = undefined;
+    });
+  }, [loadOlderHistory, loadingOlder, messages]);
+
+  useEffect(() => {
+    const anchorKey = olderCheckpointAnchorRef.current;
+    if (anchorKey === undefined) return;
+    const stages = conversationStages(messages);
+    const anchorIndex = anchorKey === null
+      ? stages.length
+      : stages.findIndex(stage => stage.key === anchorKey);
+    if (anchorIndex <= 0) return;
+    const target = stages[anchorIndex - 1];
+    olderCheckpointAnchorRef.current = undefined;
+    jumpToCheckpoint(target.messageIndex);
+  }, [jumpToCheckpoint, messages]);
+
+  useEffect(() => () => {
+    if (checkpointRetryTimerRef.current) clearTimeout(checkpointRetryTimerRef.current);
+  }, []);
 
   const copyMessage = useCallback((text: string) => {
     void Clipboard.setStringAsync(text);
@@ -135,6 +231,11 @@ export function ChatScreenProduct() {
     setWorkedById({});
     previousStreamingRef.current = false;
     turnStartedAtRef.current = null;
+    pendingCheckpointIndexRef.current = null;
+    checkpointJumpAttemptsRef.current = 0;
+    olderCheckpointAnchorRef.current = undefined;
+    if (checkpointRetryTimerRef.current) clearTimeout(checkpointRetryTimerRef.current);
+    checkpointRetryTimerRef.current = null;
   }, [activeSessionName]);
 
   const send = useCallback(async () => {
@@ -177,6 +278,13 @@ export function ChatScreenProduct() {
     if (active) followOutputRef.current = false;
   }, []);
 
+  // Safe link handler: only http(s) URLs reach the OS. Everything else is
+  // blocked (with an alert) instead of being handed to Linking.
+  const handleMarkdownLinkPress = useCallback((url: string) => {
+    void openExternalUrl(url);
+    return false;
+  }, []);
+
   const markdownRules = useMemo(() => ({
     fence: (node: any) => (
       <CodeBlock key={node.key} code={node.content} language={(node.sourceInfo || '').trim()} colors={colors} />
@@ -211,7 +319,7 @@ export function ChatScreenProduct() {
       );
     }
     return (
-      <Markdown style={compact ? compactMarkdownStyles(colors) : mdStyles} rules={markdownRules}>
+      <Markdown style={compact ? compactMarkdownStyles(colors) : mdStyles} rules={markdownRules} onLinkPress={handleMarkdownLinkPress}>
         {message.text}
       </Markdown>
     );
@@ -344,16 +452,28 @@ export function ChatScreenProduct() {
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         keyboardVerticalOffset={insets.bottom}
       >
+        {/* Round-44 F13: match ChatScreen's list tuning so both chat
+            surfaces behave identically at scale — bounded initial/batch
+            render + window size keep long loaded histories responsive. */}
+        <View style={styles.timeline}>
         <FlatList
           ref={flatListRef}
           data={messages}
           keyExtractor={item => item.id}
           renderItem={renderMessage}
+          initialNumToRender={20}
+          maxToRenderPerBatch={10}
+          updateCellsBatchingPeriod={32}
+          windowSize={9}
+          removeClippedSubviews={false}
           contentContainerStyle={[styles.messageList, messages.length === 0 && styles.messageListEmpty]}
           maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
           keyboardShouldPersistTaps="always"
           keyboardDismissMode="none"
           onScroll={onScroll}
+          onViewableItemsChanged={viewabilityRef.current}
+          viewabilityConfig={stageViewabilityConfigRef.current}
+          onScrollToIndexFailed={onCheckpointScrollFailed}
           scrollEventThrottle={32}
           onScrollBeginDrag={() => { followOutputRef.current = false; }}
           onContentSizeChange={() => {
@@ -382,6 +502,7 @@ export function ChatScreenProduct() {
           ListEmptyComponent={
             historyLoading ? (
               <View style={styles.historyLoading}>
+                <GeneratingIndicator label="Loading conversation history" />
                 <Skeleton height={16} style={{ marginBottom: 9, width: '72%' }} />
                 <Skeleton height={16} style={{ marginBottom: 9, width: '88%' }} />
                 <Skeleton height={16} style={{ width: '56%' }} />
@@ -406,8 +527,19 @@ export function ChatScreenProduct() {
             </View>
           }
         />
+        <ConversationStageRail
+          messages={messages}
+          activeMessageIndex={activeMessageIndex}
+          hasMoreHistory={hasMore}
+          loadingHistory={loadingOlder}
+          onLoadOlder={loadOlderCheckpoints}
+          onJump={jumpToCheckpoint}
+        />
+        </View>
 
-        <ArtifactStrip sessionName={activeSessionName} refreshKey={artifactRevision} />
+        {artifactsVisible ? (
+          <ArtifactStrip sessionName={activeSessionName} refreshKey={artifactRevision} />
+        ) : null}
         <CommandSuggestionBar
           visible={completion.visible}
           items={completion.items}
@@ -428,6 +560,8 @@ export function ChatScreenProduct() {
           selectedAttachments={selectedAttachments}
           onRemoveAttachment={attachmentId => setSelectedAttachments(current => current.filter(item => item.attachment_id !== attachmentId))}
           bottomInset={insets.bottom}
+          artifactsVisible={artifactsVisible}
+          onToggleArtifacts={() => setArtifactsVisible(current => !current)}
         />
 
         <AttachmentSheet
@@ -471,6 +605,8 @@ function Composer({
   selectedAttachments,
   onRemoveAttachment,
   bottomInset,
+  artifactsVisible,
+  onToggleArtifacts,
 }: {
   input: string;
   setInput: (value: string) => void;
@@ -484,6 +620,8 @@ function Composer({
   selectedAttachments: AttachmentDescriptor[];
   onRemoveAttachment: (attachmentId: string) => void;
   bottomInset: number;
+  artifactsVisible: boolean;
+  onToggleArtifacts: () => void;
 }) {
   const { colors } = useTheme();
   const canSend = input.trim().length > 0 || selectedAttachments.length > 0;
@@ -506,6 +644,17 @@ function Composer({
         <TouchableOpacity onPress={onModePress} style={styles.utilityButton}>
           <Text variant="xs" style={{ color: colors.textDim, textTransform: 'capitalize' }}>{activeMode}</Text>
           <Ionicons name="chevron-down" size={13} color={colors.textDim} />
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={onToggleArtifacts}
+          style={styles.utilityIconButton}
+          accessibilityLabel={artifactsVisible ? 'Hide artifacts panel' : 'Show artifacts panel'}
+        >
+          <Ionicons
+            name={artifactsVisible ? 'eye' : 'eye-off'}
+            size={16}
+            color={artifactsVisible ? colors.accent : colors.textDim}
+          />
         </TouchableOpacity>
         <TouchableOpacity onPress={onSettingsPress} style={styles.utilityIconButton} accessibilityLabel="Session settings">
           <Ionicons name="settings-outline" size={16} color={colors.textDim} />
@@ -719,7 +868,8 @@ function compactMarkdownStyles(colors: any) {
 const styles = StyleSheet.create({
   safeArea: { flex: 1 },
   flex: { flex: 1 },
-  messageList: { paddingHorizontal: 18, paddingTop: 24, paddingBottom: 12 },
+  timeline: { flex: 1, position: 'relative' },
+  messageList: { paddingLeft: 18, paddingRight: 46, paddingTop: 24, paddingBottom: 12 },
   messageListEmpty: { flexGrow: 1 },
   msgRow: { flexDirection: 'row', marginBottom: 17 },
   userRow: { justifyContent: 'flex-end' },

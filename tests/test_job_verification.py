@@ -62,6 +62,31 @@ def verifying_job(tmp_path, *, commands, max_retries=2, attempts=1):
     return service, service.get(job.id), repo
 
 
+def test_first_command_timeout_yields_timed_out_check_not_crash(tmp_path):
+    """Round-35 F5: a timeout on the FIRST command must produce a
+    timed-out VerificationCheck, not UnboundLocalError (stdout/stderr were
+    only assigned after a successful wait)."""
+    command = python_command("import time; time.sleep(30)")
+    service, job, _primary = verifying_job(
+        tmp_path,
+        commands=[command],
+        max_retries=0,
+    )
+    service.store.update_runtime_fields(
+        job.id, execution_json={"validation_timeout_seconds": 1}
+    )
+    fresh = service.get(job.id)
+    store = VerificationStore(service.store, evidence_root=str(tmp_path / "evidence"))
+    run = DeterministicVerifier(service, store=store).verify(fresh)
+
+    assert len(run.checks) == 1
+    check = run.checks[0]
+    assert check.timed_out is True
+    assert check.passed is False
+    assert check.return_code is None
+    assert "timed out after 1s" in (check.error or "")
+
+
 def test_passing_commands_materialize_branch_and_retire_worktree_for_review(tmp_path):
     command = python_command(
         "from pathlib import Path; assert Path('code.txt').read_text() == 'implemented\\n'"
