@@ -638,9 +638,6 @@ class Session:
             if next_task_text:
                 sections.append(f"- next_task: {next_task_text}")
 
-        scratch = self.turn_scratchpad.render_summary(limit=8).strip()
-        if scratch:
-            sections.append("\nScratchpad snapshot:\n" + scratch)
         return "\n".join(sections).strip()
 
     def _ensure_session_goal_persistence(self) -> None:

@@ -102,6 +102,47 @@ from mu.agent.teacher_watcher import (
     _run_teacher_watcher_user,
 )
 
+def _filter_goal_echo_entries(summary: str, goal_texts: list[str]) -> str:
+    """Drop memory-snapshot entries that restate an already-rendered goal.
+
+    The LAYER 3 active-goal block renders ``session_goal`` / ``loop_goal``
+    verbatim every prompt (goal-persistence policy keeps them pinned in L3),
+    so working-memory entries that only restate the same sentence are pure
+    duplication in long sessions. Entry-level (not line-level) matching is
+    robust to multi-line entry content. Two drop rules, both requiring the
+    goal text to be present inside the entry:
+
+    * dominance: the whitespace-normalized goal makes up >=50% of the
+      entry (floor 24 chars so short goals never nuke whole entries);
+    * persistence framing: entries written by the goal-persistence hatch
+      ("Locked session goal:" / "Locked loop goal:" prefix) carry no other
+      substance.
+
+    Returns the summary unchanged when no goals are set or nothing matches.
+    """
+    goal_norms = [" ".join(str(g or "").split()) for g in goal_texts]
+    goal_norms = [g for g in goal_norms if g]
+    if not goal_norms or not summary:
+        return summary
+    kept: list[str] = []
+    # Snapshot entries render one "- #id ..." block each; entry-level
+    # matching survives multi-line entry content.
+    for entry in re.split(r"(?=\n- #)", summary):
+        norm = " ".join(entry.split())
+        low = norm.lower()
+        dominated = any(
+            g in norm and len(g) >= max(24, 0.5 * len(norm))
+            for g in goal_norms
+        )
+        framed = ("locked session goal:" in low or "locked loop goal:" in low) and any(
+            g in norm for g in goal_norms
+        )
+        if dominated or framed:
+            continue
+        kept.append(entry)
+    return "\n".join(kept)
+
+
 def run_turn(session, text, *, origin="user"):
     logger.info(f"Sending message: {text[:100]}...")
     session.paused_execution_text = None
@@ -933,6 +974,14 @@ def run_turn(session, text, *, origin="user"):
                     limit=int(session.variables.get("memory_summary_limit", 8)),
                     query=effective_text,
                 )
+                if memory_summary:
+                    memory_summary = _filter_goal_echo_entries(
+                        memory_summary,
+                        [
+                            str(session.variables.get(k, "") or "")
+                            for k in ("session_goal", "loop_goal")
+                        ],
+                    )
                 if memory_summary:
                     dynamic_system_prompt += (
                         "\n\nLAYER 3 — Persisted working memory snapshot:\n"

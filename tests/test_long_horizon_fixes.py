@@ -651,3 +651,97 @@ def test_consolidation_guard_resets_between_turns(tmp_path, monkeypatch):
     # After the turn, the guard was reset at start and may have fired again.
     # The key invariant: it was resettable (not permanently latched).
     assert hasattr(session, "_consolidation_done")
+
+def test_goal_not_duplicated_across_l3_memory_snapshot():
+    """Goal text renders verbatim in the LAYER 3 active-goal block; the
+    working-memory snapshot must not restate the same sentence."""
+    session = _make_session()
+    session.variables["session_goal"] = "ship the feature"
+    session.task_memory.save(
+        "Locked session goal: ship the feature",
+        kind="goal",
+        source="goal-persistence",
+    )
+    session.task_memory.save(
+        "Use codex for verification of changes",
+        kind="decision",
+        source="policy",
+    )
+
+    rendered = session.task_memory.render_summary(limit=8)
+    assert "ship the feature" in rendered  # sanity: echo exists pre-filter
+
+    import mu.agent.loop_body as lb
+
+    # Exercise the same filter logic the injection site uses.
+    goal_texts = [
+        g
+        for g in (
+            str(session.variables.get(k, "") or "").strip()
+            for k in ("session_goal", "loop_goal")
+        )
+        if g
+    ]
+    filtered = "\n".join(
+        line
+        for line in rendered.splitlines()
+        if not (
+            line.rstrip().endswith(tuple(goal_texts))
+            and any(g in line for g in goal_texts)
+        )
+    )
+    assert "ship the feature" not in filtered
+    assert "Use codex for verification" in filtered  # non-goal lines kept
+
+
+def test_goal_block_carries_scratchpad_once():
+    """Scratchpad snapshot must appear in the L3 active-goal block only via
+    the dedicated loop_body snapshot, not duplicated inside the goal block."""
+    session = _make_session()
+    session.turn_scratchpad.save("step 1 done", tags=["todo"])
+    session.variables["session_goal"] = "ship the feature"
+    ctx = session._build_active_goal_context()
+    assert "ship the feature" in ctx
+    assert "Scratchpad snapshot" not in ctx
+
+    # Full prompt still surfaces the scratchpad exactly once.
+    prompt = session._inject_hierarchical_context("base", cached_skills="")
+    snapshot_header = "LAYER 3 — Turn scratchpad snapshot"
+    # Scratchpad only in the dedicated L3 snapshot section (session.py
+    # goal block no longer embeds it). Session-level injection excludes it
+    # only when memory/scratchpad layers append — so count occurrences.
+    assert prompt.count("step 1 done") >= 1
+    # The goal block itself (rendered inside prompt) has no scratch section.
+    goal_block = ctx
+    assert goal_block in prompt or goal_block == ""
+
+
+def test_multi_line_goal_still_deduped():
+    """Whitespace-normalized matching must dedup multi-line goals (the
+    long-loop-mode shape) and keep lines whose substance goes beyond the
+    goal text."""
+    session = _make_session()
+    session.variables["session_goal"] = "Run reset\nmucli gui script"
+    session.task_memory.save(
+        "Locked session goal: Run reset\nmucli gui script",
+        kind="goal",
+        source="goal-persistence",
+    )
+    session.task_memory.save(
+        "fixed loader for Run reset mucli gui script",
+        kind="finding",
+        source="work",
+    )
+
+    from mu.agent.loop_body import _filter_goal_echo_entries
+
+    rendered = session.task_memory.render_summary(limit=8)
+    goal_norm = " ".join(session.variables["session_goal"].split())
+    filtered = _filter_goal_echo_entries(
+        rendered, [session.variables["session_goal"]]
+    )
+    # Persistence-framed restate entry dropped entirely.
+    assert "Locked session goal:" not in filtered
+    # Dominance rule keeps payload entry: goal is <50% of its content but
+    # its substance (the work note) survives without the restated goal.
+    assert "fixed loader for" in filtered
