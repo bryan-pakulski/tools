@@ -93,6 +93,9 @@ def inject_hierarchical_context(session: Any, system_prompt: str, *, cached_skil
     state_budget = int(summary_limit * 0.70) if summary_limit else 0
     try:
         from mu.session.state_capsule import build_state_capsule
+        # Keep max_chars in lockstep with loop_body's dedup build (same
+        # 0.7x summary budget) — divergent budgets would instantiate two
+        # projectors with different truncation points.
         state_capsule = build_state_capsule(session, max_chars=state_budget, include_goal=False)
         state_capsule = state_capsule[:state_budget] if state_budget else ""
     except Exception:
