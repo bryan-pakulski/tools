@@ -103,6 +103,35 @@ from mu.agent.teacher_watcher import (
     _run_teacher_watcher_user,
 )
 
+def _empty_flush_message(session) -> str:
+    """Self-diagnosing empty-flush message (increment 12).
+
+    An empty flush used to return bare "No data in collation buffer to
+    flush.", which models read as silent data loss — children (collation
+    disabled, inline delivery) and single-tool-call batches then re-derived
+    evidence they already held (observed: 10 redundant reads, ~8 wasted
+    iterations in subagent run_db7ad867a85b). The message now states which
+    delivery state the session is in, so the model acts on results it
+    already has instead of re-gathering.
+    """
+    if not session.variables.get("collation_enabled", True):
+        return (
+            "Collation is disabled in this session — "
+            "read-only results are delivered inline as "
+            "they execute. Nothing was dropped; act on "
+            "the results already in the conversation. "
+            "No `flush` calls are needed here."
+        )
+    return (
+        "No data in collation buffer to flush. "
+        "Read-only results deliver inline unless a "
+        "tool result explicitly said \"Stored ... in "
+        "collation buffer\" with an artifact_id — "
+        "only those are pending here. Nothing was "
+        "dropped."
+    )
+
+
 def _filter_state_capsule_duplicates(payload: str, state_capsule: str) -> str:
     """Drop payload lines whose normalized text is already in L2's capsule.
 
@@ -437,7 +466,7 @@ def run_turn(session, text, *, origin="user"):
             "Step through one task at a time until completion; never work multiple tasks simultaneously. "
             "Use get_execution_state to choose the next actionable phase/task, use block_task if external input is required, and resume_task when user unblock context arrives. "
             "Use review_all_completed_tasks/review_completed_tasks/propose_task_diff/decide_task_diff/archive_task for review-and-archive flow after implementation completes. "
-            "gather read-only context first, use save_scratchpad for temporary phase notes, call flush before acting on collected context, and call raise_blocker when blocked on user input. "
+            "gather read-only context first, use save_scratchpad for temporary phase notes, call flush only after a tool result reported \"Stored ... in collation buffer\", and call raise_blocker when blocked on user input. In subagent sessions read-only results always deliver inline — never call flush there. "
             "You must use save_memory for durable facts/decisions and reuse search_memory/list_memory before re-deriving context in long loops. "
             "You must use save_scratchpad/list_scratchpad within each turn to track in-flight plans as context grows. "
             "Do not stall on status-only updates: unless blocked or awaiting explicit approval/decision, continue implementation autonomously until all phases and tasks are completed."
@@ -2125,7 +2154,11 @@ def run_turn(session, text, *, origin="user"):
                     collated_pairs = session.collation_buffer.flush_selected(requested_ids)
                     collated_data = [body for _, body in collated_pairs]
                     if not collated_data:
-                        raw_result = "No data in collation buffer to flush."
+                        # Sub-increment 12a: self-diagnosing message so the
+                        # model doesn't read "No data" as data loss (see
+                        # _empty_flush_message — collation-disabled children
+                        # and single-call batches were re-deriving evidence).
+                        raw_result = _empty_flush_message(session)
                     else:
                         raw_result = "--- Flushed Context ---\n" + "\n\n".join(
                             collated_data

@@ -848,3 +848,33 @@ def test_context_pressure_nudge_hysteresis():
     session._pressure_nudge_fired = False
     _maybe_nudge_context_pressure(session, limit=LIMIT, manifest=None)
     assert n_nudges() == before
+
+
+def test_empty_flush_message_self_diagnosing():
+    """Empty-flush response states the session's delivery state.
+
+    Bare "No data in collation buffer" read as data loss in child sessions
+    (collation disabled, inline delivery) and in single-tool-call batches —
+    models re-derived evidence they already held (subagent run
+    db7ad867a85b: 10 redundant reads, ~8 wasted iterations).
+    """
+    from types import SimpleNamespace
+
+    from mu.agent.loop_body import _empty_flush_message
+
+    child = SimpleNamespace(variables={"collation_enabled": False})
+    msg_child = _empty_flush_message(child)
+    assert "Collation is disabled" in msg_child
+    assert "Nothing was dropped" in msg_child
+    assert "No `flush` calls are needed" in msg_child
+
+    parent = SimpleNamespace(variables={"collation_enabled": True})
+    msg_parent = _empty_flush_message(parent)
+    assert "No data in collation buffer to flush." in msg_parent
+    assert "Nothing was" in msg_parent and "dropped" in msg_parent
+    assert 'explicitly said "Stored' in msg_parent
+
+    # Missing variable defaults enabled (legacy sessions).
+    default = SimpleNamespace(variables={})
+    msg_default = _empty_flush_message(default)
+    assert "No data in collation buffer to flush." in msg_default
