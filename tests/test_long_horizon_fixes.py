@@ -779,3 +779,72 @@ def test_l3_snapshots_deduped_against_state_capsule():
     # Short lines (<24-char core) are never dropped — framing noise only.
     tiny = "- #1 [active] (s): ok"
     assert _filter_state_capsule_duplicates(tiny, capsule) == tiny
+
+
+def test_context_pressure_nudge_hysteresis():
+    """Model-directed compact nudge fires once per threshold crossing.
+
+    Default mode has no proactive compaction; this nudge tells the model
+    WHEN to call `compact` — once per crossing, re-armed by anchor advance
+    (compaction happened) or fill dropping back below the threshold.
+    """
+    from types import SimpleNamespace
+
+    from mu.agent.context_guard import _maybe_nudge_context_pressure
+
+    _sm = SimpleNamespace(summary_anchor=0, history=[])
+    session = SimpleNamespace(variables={}, session_manager=_sm)
+
+    manifest = {"total": 400_000}
+    LIMIT = 480_000  # 83.3% — over the default 80% threshold
+
+    def n_nudges():
+        return sum(
+            1 for m in _sm.history if "CONTEXT PRESSURE" in str(m.get("parts"))
+        )
+
+    # Under threshold: silent, no state changes.
+    _maybe_nudge_context_pressure(
+        session, limit=LIMIT, manifest={"total": 100_000}
+    )
+    assert n_nudges() == 0
+    assert not getattr(session, "_pressure_nudge_fired", False)
+
+    # Crossing: exactly one synthetic nudge, marked fired.
+    _maybe_nudge_context_pressure(session, limit=LIMIT, manifest=manifest)
+    assert n_nudges() == 1
+    assert _sm.history[-1]["synthetic"] is True
+    assert _sm.history[-1]["role"] == "user"
+    assert session._pressure_nudge_fired is True
+
+    # Still over threshold, anchor unmoved: no re-fire (hysteresis).
+    _maybe_nudge_context_pressure(session, limit=LIMIT, manifest=manifest)
+    assert n_nudges() == 1
+
+    # Compaction happened (anchor advanced): re-arms and may fire again.
+    session.session_manager.summary_anchor = 5
+    _maybe_nudge_context_pressure(session, limit=LIMIT, manifest=manifest)
+    assert n_nudges() == 2
+
+    # Dropped below threshold: re-arms silently (no message).
+    _maybe_nudge_context_pressure(
+        session, limit=LIMIT, manifest={"total": 50_000}
+    )
+    assert n_nudges() == 2
+    assert session._pressure_nudge_fired is False
+
+    # Fresh crossing after re-arm: fires again.
+    _maybe_nudge_context_pressure(session, limit=LIMIT, manifest=manifest)
+    assert n_nudges() == 3
+
+    # Threshold 0 disables the feature entirely.
+    session.variables["context_pressure_nudge_pct"] = 0
+    before = n_nudges()
+    _maybe_nudge_context_pressure(session, limit=LIMIT, manifest=manifest)
+    assert n_nudges() == before
+
+    # Missing manifest: silent no-op (no estimator seam this iteration).
+    del session.variables["context_pressure_nudge_pct"]
+    session._pressure_nudge_fired = False
+    _maybe_nudge_context_pressure(session, limit=LIMIT, manifest=None)
+    assert n_nudges() == before

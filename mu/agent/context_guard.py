@@ -557,6 +557,90 @@ def _aggressive_compact_for_overflow(
         session.session_manager._tool_result_floor = floor_value
 
 
+def _maybe_nudge_context_pressure(
+    session, *, limit: int, manifest: Dict[str, Any] | None = None
+) -> None:
+    """Model-directed compaction prompt when the assembled request runs hot.
+
+    Default mode has no proactive compaction (`auto_compaction_enabled`
+    defaults False — history cleanup is deliberately model-directed via the
+    `compact` tool). But nothing told the model WHEN to call it: sessions
+    without a vigilant model rode to the hard ceiling (observed 438k peak on
+    a 480k window), paying fat per-request costs until restore_trim or a
+    wire-level overflow backstop fired.
+
+    This nudge fires ONE synthetic user message per threshold crossing
+    (hysteresis: re-arms when the summary anchor advances past the armed
+    position — i.e. compaction actually happened — or fill drops below the
+    threshold again). Synthetic-tagged so compact_completed_turn can still
+    locate the real turn boundary. Configurable via
+    `context_pressure_nudge_pct` (default 80.0; 0 disables).
+
+    Never raises; silent no-op without a manifest (estimator seam absent).
+    """
+    try:
+        threshold = float(session.variables.get("context_pressure_nudge_pct", 80.0))
+    except Exception:
+        threshold = 80.0
+    if threshold <= 0:  # opt-out knob
+        return
+
+    # Episode hysteresis. `_pressure_nudge_fired` latches the active
+    # threshold-crossing episode. Two events end an episode: the summary
+    # anchor advanced (compaction actually happened) or fill dropped back
+    # below the threshold. Anchor comparison uses the last anchor value we
+    # observed (`_pressure_nudge_armed_at`) so each compaction resets the
+    # latch exactly once.
+    anchor = int(getattr(session.session_manager, "summary_anchor", 0) or 0)
+    seen = int(getattr(session, "_pressure_nudge_armed_at", 0) or 0)
+    if anchor > seen:
+        session._pressure_nudge_armed_at = anchor
+        session._pressure_nudge_fired = False
+
+    total = int((manifest or {}).get("total", 0) or 0)
+    if not total or not limit or limit <= 0:
+        return
+    fill = total / float(limit) * 100.0
+    if fill < threshold:
+        # Dropped back below the threshold without compacting — re-arm.
+        if getattr(session, "_pressure_nudge_fired", False):
+            session._pressure_nudge_fired = False
+        return
+    if getattr(session, "_pressure_nudge_fired", False):
+        return
+    session._pressure_nudge_fired = True
+
+    from mu.trace.emitter import emit_nudge
+
+    nudge_msg = {
+        "role": "user",
+        "parts": [
+            {
+                "type": "text",
+                "text": (
+                    "CONTEXT PRESSURE: assembled request is at "
+                    f"{fill:.0f}% of the context limit "
+                    f"({total:,} / {limit:,} tokens). Call the `compact` "
+                    "tool now to fold older history into the rolling "
+                    "summary before iteration results overflow the window. "
+                    "This fires once per threshold crossing; after "
+                    "compaction it re-arms automatically."
+                ),
+            }
+        ],
+        "synthetic": True,
+    }
+    session.session_manager.history.append(nudge_msg)
+    emit_nudge(
+        session, "context_pressure", int(getattr(session, "_trace_current_iter", 0) or 0)
+    )
+    logger.warning(
+        "Context pressure nudge: request estimate %d / %d tokens (%.0f%%) "
+        "crossed the %.0f%% threshold — compact nudge injected.",
+        total, limit, fill, threshold,
+    )
+
+
 def _generate_with_overflow_recovery(
     session, *, messages, system_prompt, thinking, tools, turn_start_index,
 ):

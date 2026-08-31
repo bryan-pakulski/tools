@@ -95,6 +95,7 @@ from mu.agent.context_guard import (  # noqa: F401
     _calibrate_drift_from_response,
     _aggressive_compact_for_overflow,
     _generate_with_overflow_recovery,
+    _maybe_nudge_context_pressure,
 )
 from mu.agent.teacher_watcher import (
     _render_learner_profile_block,
@@ -1297,6 +1298,28 @@ def run_turn(session, text, *, origin="user"):
             # effective_drift_ratio. Factored into _calibrate_drift_from_response
             # so the warm-vs-cold gate is unit-testable.
             _calibrate_drift_from_response(session, response)
+
+            # Model-directed context-pressure nudge (increment 11): default
+            # mode has no proactive compaction, so nothing told the model WHEN
+            # to run the `compact` tool. When the assembled request crosses
+            # `context_pressure_nudge_pct` (default 80%) of the effective
+            # limit, inject ONE synthetic compact nudge per threshold
+            # crossing — hysteresis via the summary anchor. Turn-final
+            # responses only (no tool-call parts — an in-flight tool batch
+            # continues and gets the nudge after it settles). Zero cost
+            # under the threshold: reads the manifest the preflight guard
+            # already stashed this iteration. Parts-based gate is
+            # scope-safe — `tool_calls` may not be bound at this seam in
+            # the streaming path.
+            if not any(
+                getattr(p, "type", None) == "tool_call"
+                for p in (getattr(response, "parts", None) or [])
+            ):
+                _maybe_nudge_context_pressure(
+                    session,
+                    limit=int(getattr(session, "_last_effective_limit", 0) or 0),
+                    manifest=getattr(session, "_request_estimate_manifest", None),
+                )
 
             total_in += response.input_tokens
             total_out += response.output_tokens
