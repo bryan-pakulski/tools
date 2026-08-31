@@ -757,8 +757,9 @@ def test_send_message_feature_mode_injects_phased_plan_guidance(tmp_path):
     )
     assert "use save_scratchpad for temporary phase notes" in provider.last_user_text
     assert (
-        "call flush before acting on the collected context" in provider.last_user_text
+        "call flush only after a tool result reported" in provider.last_user_text
     )
+    assert "never call flush there" in provider.last_user_text
     assert "call raise_blocker" in provider.last_user_text
     assert "Do not pause after progress reports" in provider.last_user_text
     assert "without asking the user to 'continue'" in provider.last_user_text
