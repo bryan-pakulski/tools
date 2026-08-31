@@ -235,7 +235,10 @@ def build_structured_tool_result(
         },
     }
     if isinstance(envelope, dict):
-        structured["telemetry"]["tool_envelope"] = envelope
+        # Context-optimisation: no longer double-store the full envelope copy
+        # inside telemetry. It duplicated ok/error/data/message that ride on
+        # the structured envelope itself, and no consumer ever read it back
+        # (loop_body + trace path re-derive the envelope from raw_result).
         envelope_artifacts = envelope.get("artifacts")
         if isinstance(envelope_artifacts, list):
             structured["artifacts"] = [
