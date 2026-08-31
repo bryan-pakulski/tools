@@ -745,3 +745,37 @@ def test_multi_line_goal_still_deduped():
     # Dominance rule keeps payload entry: goal is <50% of its content but
     # its substance (the work note) survives without the restated goal.
     assert "fixed loader for" in filtered
+
+
+def test_l3_snapshots_deduped_against_state_capsule():
+    """L2 state capsule ('Durable decisions and findings', 'Open work
+    ledger') is authoritative: L3 memory/scratchpad snapshot lines whose
+    normalized core already appears in the capsule are dropped."""
+    from mu.agent.loop_body import _filter_state_capsule_duplicates
+
+    capsule = (
+        "### Durable decisions and findings\n"
+        "- [decision] Use lean serialization for tool results at provider call time\n"
+        "### Open work ledger\n"
+        "- [active] Finish the release checklist today\n"
+    )
+    payload = (
+        "### In-Task Memory\n"
+        "- #2 [active] (src): Use lean serialization for tool results at provider call time\n"
+        "- #3 [active] (src): Distinct fact not projected anywhere else at all\n"
+        "### Turn Scratchpad\n"
+        "- [active] [todo] Finish the release checklist today\n"
+        "- [active] [todo] Brand-new note only in scratchpad here"
+    )
+    filtered = _filter_state_capsule_duplicates(payload, capsule)
+    # Both duplicated lines dropped.
+    assert "Use lean serialization for tool results" not in filtered
+    assert "Finish the release checklist today" not in filtered
+    # Unique lines survive.
+    assert "Distinct fact not projected" in filtered
+    assert "Brand-new note only in scratchpad" in filtered
+    # No capsule -> payload unchanged.
+    assert _filter_state_capsule_duplicates(payload, "") == payload
+    # Short lines (<24-char core) are never dropped — framing noise only.
+    tiny = "- #1 [active] (s): ok"
+    assert _filter_state_capsule_duplicates(tiny, capsule) == tiny

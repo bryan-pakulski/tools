@@ -102,6 +102,35 @@ from mu.agent.teacher_watcher import (
     _run_teacher_watcher_user,
 )
 
+def _filter_state_capsule_duplicates(payload: str, state_capsule: str) -> str:
+    """Drop payload lines whose normalized text is already in L2's capsule.
+
+    The deterministic state capsule (LAYER 2) projects task-memory decisions
+    and scratchpad todos into "Durable decisions and findings" / "Open work
+    ledger". The LAYER 3 working-memory / scratchpad snapshots re-render the
+    same stores, so long sessions carried every decision and todo twice per
+    prompt. Line-level containment on whitespace-normalized text is exact:
+    a snapshot line survives only if its normalized payload is NOT already
+    present in the capsule. Frame prefixes ("- #id", "- [kind]") are the
+    layer's own rendering, not substance — the normalized core is what the
+    capsule would duplicate.
+    """
+    if not payload or not state_capsule:
+        return payload
+    cap_norm = " ".join(state_capsule.split()).lower()
+    kept: list[str] = []
+    for line in payload.splitlines():
+        norm = " ".join(line.split()).lower()
+        # Strip the snapshot frame ("- #N [status] (src):" / "- [kind] ") and
+        # any leading "key: " group before the containment check so framing
+        # differences don't hide a duplicate.
+        core = re.sub(r"^-\s*(#\d+\s*)?(\[[^\]]+\]\s*)*(\([^)]*\)\s*:\s*)?", "", norm).strip()
+        if len(core) >= 24 and core in cap_norm:
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _filter_goal_echo_entries(summary: str, goal_texts: list[str]) -> str:
     """Drop memory-snapshot entries that restate an already-rendered goal.
 
@@ -942,6 +971,24 @@ def run_turn(session, text, *, origin="user"):
             # can update feature_state / the scratchpad between iterations.
             # L1B is reused from the per-turn cache (no disk reads).
             # The memory + scratchpad snapshots are appended below as before.
+            # L2 state capsule is the authoritative structured projection;
+            # the L3 snapshots below are deduped against it so stores don't
+            # render twice per prompt.
+            try:
+                from mu.session.state_capsule import build_state_capsule
+
+                state_capsule_text = build_state_capsule(
+                    session,
+                    max_chars=int(
+                        session.variables.get(
+                            "conversation_summary_char_limit", 24000
+                        )
+                        * 0.7
+                    ),
+                    include_goal=False,
+                )
+            except Exception:
+                state_capsule_text = ""
             dynamic_system_prompt = session._inject_hierarchical_context(
                 base_persona_prompt,
                 cached_skills=session._turn_skills_block,
@@ -982,6 +1029,9 @@ def run_turn(session, text, *, origin="user"):
                             for k in ("session_goal", "loop_goal")
                         ],
                     )
+                    memory_summary = _filter_state_capsule_duplicates(
+                        memory_summary, state_capsule_text
+                    )
                 if memory_summary:
                     dynamic_system_prompt += (
                         "\n\nLAYER 3 — Persisted working memory snapshot:\n"
@@ -1009,6 +1059,9 @@ def run_turn(session, text, *, origin="user"):
                             str(session.variables.get(k, "") or "")
                             for k in ("session_goal", "loop_goal")
                         ],
+                    )
+                    scratchpad_summary = _filter_state_capsule_duplicates(
+                        scratchpad_summary, state_capsule_text
                     )
                 if scratchpad_summary:
                     dynamic_system_prompt += (
