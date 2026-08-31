@@ -576,7 +576,12 @@ def _maybe_nudge_context_pressure(
     locate the real turn boundary. Configurable via
     `context_pressure_nudge_pct` (default 80.0; 0 disables).
 
-    Never raises; silent no-op without a manifest (estimator seam absent).
+    Silent no-op when no estimate manifest exists (estimator seam absent
+    that iteration). Every runtime path reaching the archive seam passes
+    preflight in the same iteration, which is where the limit/manifest
+    are stashed — so a missing manifest simply means the nudge waits
+    for the next eligible iteration. The threshold parse is guarded;
+    append/emit are the same primitives the empty-response nudge uses.
     """
     try:
         threshold = float(session.variables.get("context_pressure_nudge_pct", 80.0))
