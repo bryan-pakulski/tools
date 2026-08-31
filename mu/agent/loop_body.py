@@ -1943,10 +1943,13 @@ def run_turn(session, text, *, origin="user"):
                                 logger.debug("Suppressed exception", exc_info=True)
                         return (
                             f"[dedup: {part.tool_name} — file unchanged; this "
-                            f"range was already read this session "
-                            f"(cache_key={ck}). Call recall({ck}) or "
-                            f"result_range/result_search if you need the content "
-                            f"again; otherwise continue with what you have.]"
+                            f"exact range was already read earlier in this "
+                            f"conversation and its full content is in the "
+                            f"message history above — use what you already "
+                            f"have instead of re-reading. If a verbatim "
+                            f"re-fetch is truly required, call "
+                            f"recall({ck}) or result_range/result_search "
+                            f"(when available in this session).]"
                         )
                 hit = None
                 try:
