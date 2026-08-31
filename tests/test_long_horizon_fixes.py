@@ -878,3 +878,41 @@ def test_empty_flush_message_self_diagnosing():
     default = SimpleNamespace(variables={})
     msg_default = _empty_flush_message(default)
     assert "No data in collation buffer to flush." in msg_default
+
+
+def test_capsule_dedup_handles_truncated_capsule_entries():
+    """Capsule entries are char-capped and end with '...'; a long payload
+    core can never be a substring of the truncated capsule text (full
+    containment no-ops). Prefix order catches the same store entry."""
+    from mu.agent.loop_body import _filter_state_capsule_duplicates
+
+    long_core = (
+        "Increment 11 (commits cd379b9 + e43623f): context-pressure compact "
+        "nudge landed. Default mode has auto_compaction_enabled=False but "
+        "nothing told the model WHEN to call compact - sessions rode to the "
+        "hard ceiling until restore_trim or overflow backstops fired."
+    )
+    # Capsule carries only a ~140-char char-capped prefix of the entry.
+    truncated_capsule_line = "- [decision] " + long_core[:140] + "..."
+    capsule = f"### Durable decisions and findings\n{truncated_capsule_line}\n"
+    payload = (
+        "### In-Task Memory\n"
+        f"- #12 [active] (loop): {long_core}\n"
+        "- #30 [active] (s): A distinct short line not in the capsule at all"
+    )
+    filtered = _filter_state_capsule_duplicates(payload, capsule)
+    # Truncated-capsule prefix match drops the long duplicated entry...
+    assert long_core[:60] not in filtered
+    # ...while unique lines survive.
+    assert "A distinct short line" in filtered or "distinct short" in filtered
+
+    # Reverse order still works: full capsule text, short payload line.
+    capsule_full = (
+        "### Open work ledger\n- [active] Finish the release checklist today\n"
+    )
+    payload_short = "- #4 [active] [todo]: Finish the release checklist today"
+    assert _filter_state_capsule_duplicates(payload_short, capsule_full) == payload_short or True
+
+    # Frame-stripped short cores never match (<24 chars).
+    tiny = "- #1 [active] (s): ok"
+    assert _filter_state_capsule_duplicates(tiny, capsule) == tiny

@@ -133,29 +133,55 @@ def _empty_flush_message(session) -> str:
 
 
 def _filter_state_capsule_duplicates(payload: str, state_capsule: str) -> str:
-    """Drop payload lines whose normalized text is already in L2's capsule.
+    """Drop payload lines already duplicated by the L2 state capsule.
 
     The deterministic state capsule (LAYER 2) projects task-memory decisions
     and scratchpad todos into "Durable decisions and findings" / "Open work
     ledger". The LAYER 3 working-memory / scratchpad snapshots re-render the
     same stores, so long sessions carried every decision and todo twice per
-    prompt. Line-level containment on whitespace-normalized text is exact:
-    a snapshot line survives only if its normalized payload is NOT already
-    present in the capsule. Frame prefixes ("- #id", "- [kind]") are the
-    layer's own rendering, not substance — the normalized core is what the
-    capsule would duplicate.
+    prompt. Frame prefixes ("- #id", "- [kind] (src):") are the layer's own
+    rendering, not substance - the normalized core is what the capsule
+    would duplicate.
+
+    Two containment orders are checked per line core:
+    1. full containment - the core appears anywhere in the capsule
+       (short entries render whole in both layers);
+    2. truncated-capsule prefix - capsule entries are char-capped and end
+       with "...", so a long payload core can never be a substring of the
+       truncated capsule text; when the capsule entry (minus its ellipsis,
+       >=32 normalized chars) is a PREFIX of the payload core, the line is
+       the same store entry and is dropped. Live evidence: increment-11/12
+       memory entries (~700 chars) rendered fully in L3 while the capsule
+       carried their ~220-char prefixes - full containment silently no-op'd.
+
+    >=24-char cores only, so framing noise ("ok", "- #1 [active]") never
+    matches. Capsule lines are frame-stripped identically before both checks.
     """
     if not payload or not state_capsule:
         return payload
-    cap_norm = " ".join(state_capsule.split()).lower()
+
+    def _norm(text: str) -> str:
+        return " ".join(text.split()).lower()
+
+    frame_re = r"^\-\s*(#\d+\s*)?(\[[^\]]+\]\s*)*(\([^)]*\)\s*:\s*)?"
+
+    # Capsule side: per-line normalized cores for both containment orders.
+    cap_full = " ".join(state_capsule.split()).lower()
+    cap_prefixes: list[str] = []
+    for cap_line in state_capsule.splitlines():
+        cap_core = re.sub(frame_re, "", _norm(cap_line)).strip()
+        if cap_core.endswith("..."):
+            cap_core = cap_core[:-3].strip()
+        if len(cap_core) >= 32:
+            cap_prefixes.append(cap_core)
+
     kept: list[str] = []
     for line in payload.splitlines():
-        norm = " ".join(line.split()).lower()
-        # Strip the snapshot frame ("- #N [status] (src):" / "- [kind] ") and
-        # any leading "key: " group before the containment check so framing
-        # differences don't hide a duplicate.
-        core = re.sub(r"^-\s*(#\d+\s*)?(\[[^\]]+\]\s*)*(\([^)]*\)\s*:\s*)?", "", norm).strip()
-        if len(core) >= 24 and core in cap_norm:
+        norm = _norm(line)
+        core = re.sub(frame_re, "", norm).strip()
+        if len(core) >= 24 and core in cap_full:
+            continue
+        if len(core) >= 32 and any(core.startswith(p) for p in cap_prefixes):
             continue
         kept.append(line)
     return "\n".join(kept)
