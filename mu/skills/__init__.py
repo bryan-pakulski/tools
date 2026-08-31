@@ -319,7 +319,7 @@ def _render_full(skills: List[Skill], budget: int) -> str:
 
 
 def _render_compact(
-    skills: List[Skill], budget: int, user_text: Optional[str]
+    skills: List[Skill], budget: int, user_text: Optional[str], budget_scale: float = 1.0
 ) -> str:
     if not skills or budget <= 0:
         return ""
@@ -332,6 +332,11 @@ def _render_compact(
         else:
             indexed.append(skill)
 
+    # Cap the per-body budget so a single auto-expanded skill cannot crowd
+    # the name+description index out of LAYER 1B. Oversized bodies drop-tail
+    # at the cap; `budget_scale` tunes (clamped to [0.1, 1.0], 1.0 = legacy).
+    cap = int(budget * min(max(budget_scale, 0.1), 1.0))
+
     out: List[str] = []
     used = 0
 
@@ -343,6 +348,9 @@ def _render_compact(
         used += len(header) + 2
         for skill in expanded:
             block = render_skills_expanded(skill)
+            if len(block) > cap:
+                trimmed = block[: cap - 3].rstrip() + "..."
+                block = f"{trimmed}\n\n[body capped: invoke via `invoke_skill {skill.name}` for the remainder]"
             if used + len(block) + 2 > budget:
                 break
             out.append(block)
@@ -373,16 +381,21 @@ def render_skills_block(
     *,
     user_text: Optional[str] = None,
     mode: str = "compact",
+    budget_scale: float = 1.0,
 ) -> str:
     """Render the discovered skills as a system-prompt block.
 
     `mode="compact"` (default) emits a name+description index and inlines
     only those skills whose trigger matches `user_text`. `mode="full"`
     inlines every skill's body up to the budget (v1 behavior).
+    `budget_scale` caps each auto-expanded body at
+    `budget * budget_scale` chars (clamped to [0.1, 1.0]) so one large
+    triggered skill cannot crowd the index out of the block; the tail is
+    recoverable on demand via `invoke_skill`.
     """
     if mode == "full":
         return _render_full(skills, budget)
-    return _render_compact(skills, budget, user_text)
+    return _render_compact(skills, budget, user_text, budget_scale)
 
 
 __all__ = [

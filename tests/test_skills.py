@@ -513,3 +513,37 @@ def test_build_skills_block_auto_expand_bumps_stats_counter():
     session._build_skills_block(announce=True)
     skills_stats = session.tool_stats.get("skills", {})
     assert skills_stats.get("commit-message", {}).get("auto_expansions") == 1
+
+
+def test_auto_expanded_body_capped_to_budget_scale(tmp_path, monkeypatch):
+    """A triggered skill's full body is capped at budget*budget_scale; the
+    tail is dropped with a pointer back to `invoke_skill` so one large
+    skill cannot crowd the compact index out of LAYER 1B."""
+    import re as _re
+    from types import SimpleNamespace
+    from mu.skills import render_skills_block
+
+    big_body = "x" * 9000
+    trigger = "bigskill"
+    skill = SimpleNamespace(
+        name="big",
+        description="A large triggered skill.",
+        body=big_body,
+        trigger=trigger,
+        trigger_regex=_re.compile(trigger, _re.IGNORECASE),
+        path="",
+        source="test",
+    )
+    # budget 2000 * scale 0.4 = 800-char cap on the body.
+    block = render_skills_block(
+        [skill], budget=2000, user_text="please run bigskill now", budget_scale=0.4
+    )
+    assert "big" in block
+    assert "[body capped" in block
+    # Body must not blow past ~cap + notice.
+    assert len(block) < 2600
+    # scale 1.0 restores legacy full-body inline.
+    legacy = render_skills_block(
+        [skill], budget=12000, user_text="please run bigskill now"
+    )
+    assert legacy.count("x") >= 9000

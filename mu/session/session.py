@@ -915,8 +915,19 @@ class Session:
             except Exception:
                 logger.debug("skill auto-expand banner failed", exc_info=True)
 
+        # Auto-expanded bodies get a fractional slice of the L1B budget by
+        # default: a multi-KB skill body inlined on trigger-match crowds the
+        # name+description index out and ships content the model can pull
+        # on demand via `invoke_skill`. 0.4 caps a body at 40% of L1B —
+        # enough head + front-matter to act on, tail dropped deliberately
+        # (context-optimisation lever). Set 1.0 to restore legacy inline-all.
+        body_budget_scale = 0.4
         return render_skills_block(
-            skills, budget=budget, user_text=user_text, mode=mode
+            skills,
+            budget=budget,
+            user_text=user_text,
+            mode=mode,
+            budget_scale=body_budget_scale,
         )
 
     def _announce_auto_expanded_skills(self, skills, user_text, announce_skill) -> None:
