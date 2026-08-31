@@ -1000,6 +1000,17 @@ def run_turn(session, text, *, origin="user"):
             if session.variables.get("scratchpad_enabled", True):
                 scratchpad_summary = session.turn_scratchpad.render_summary(limit=8)
                 if scratchpad_summary:
+                    # Same goal-echo dedup as the memory snapshot: loop-mode
+                    # notes that only restate the pinned goal duplicate the
+                    # L3 active-goal block.
+                    scratchpad_summary = _filter_goal_echo_entries(
+                        scratchpad_summary,
+                        [
+                            str(session.variables.get(k, "") or "")
+                            for k in ("session_goal", "loop_goal")
+                        ],
+                    )
+                if scratchpad_summary:
                     dynamic_system_prompt += (
                         "\n\nLAYER 3 — Turn scratchpad snapshot:\n"
                         f"{scratchpad_summary}"
