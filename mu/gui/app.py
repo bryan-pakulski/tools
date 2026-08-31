@@ -176,6 +176,7 @@ def create_app(*, args: Any, build_session_fn: Callable, port: int = 30311) -> F
     app.include_router(files_router.router, prefix="/api/files", tags=["files"])
     app.include_router(skills_router.router, prefix="/api/skills", tags=["skills"])
     app.include_router(audio_router.router, prefix="/api/audio", tags=["audio"])
+    traces_router._install_trace_gzip(app)
     app.include_router(traces_router.router, prefix="/api/traces", tags=["traces"])
     app.include_router(chat.events_router, tags=["events"])
 

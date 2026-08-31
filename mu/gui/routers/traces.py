@@ -9,12 +9,19 @@ the ``mucli trace`` CLI share one code path.
 
 from __future__ import annotations
 
+import json
+
 import asyncio
 import os
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
+
+try:
+    from fastapi.middleware.gzip import GZipMiddleware as _GZipMiddleware
+except ImportError:  # pragma: no cover - starlette always ships gzip
+    _GZipMiddleware = None
 
 from mu.trace import (
     build_series,
@@ -28,6 +35,17 @@ from mu.trace import (
 )
 
 router = APIRouter()
+
+
+def _install_trace_gzip(app: Any) -> None:
+    """Compress trace payloads on the wire (mobile/localhost win 5-10x).
+
+    Trace JSON compresses extremely well (repeated keys + hashes); with the
+    shed-messages payloads this turns the multi-MB analyzer responses into
+    a few hundred KB for mobile clients.
+    """
+    if _GZipMiddleware is not None:
+        app.add_middleware(_GZipMiddleware, minimum_size=1024)
 
 # Round-44 F7/F8: response bounds. A single run of a long session can hold
 # tens of thousands of iterations; the combined session endpoint merges
@@ -47,6 +65,51 @@ _EVENT_CATEGORIES = (
     "requests",
     "context_artifacts",
 )
+
+
+def _light_request(req: Any) -> Any:
+    """Drop `messages`/`part_details` from one request record (F7 sibling).
+
+    The full records remain available via ``full=true``; the bounded payload
+    keeps every scalar (token_estimate, component totals, messages_hash,
+    tool_names, messages_count) the dashboard summarizes.
+    """
+    if not isinstance(req, dict):
+        return req
+    light = {k: v for k, v in req.items() if k != "messages"}
+    msgs = req.get("messages")
+    if isinstance(msgs, list) and msgs:
+        light["messages_count"] = len(msgs)
+    return light
+
+
+def _dedupe_tool_names(records: List[Any]) -> List[Any]:
+    """Replace repeating `tool_names` lists with change-markers.
+
+    Perf: the active tool list is identical across most requests of a run —
+    each repetition serialized ~1.7KB × hundreds of requests (~0.5MB of the
+    bounded payload). Records keep the full list only when it DIFFERS from
+    the previous record; unchanged records carry `tool_names_unchanged: true`
+    (clients repeat the last seen list, which is what they already did with
+    the identical data).
+    """
+    out: List[Any] = []
+    prev_key: Any = None
+    prev_names: Any = None
+    for req in records:
+        names = req.get("tool_names") if isinstance(req, dict) else None
+        if names is None:
+            out.append(req)
+            continue
+        key = json.dumps(names, sort_keys=True)
+        if key == prev_key:
+            req = {k: v for k, v in req.items() if k != "tool_names"}
+            req["tool_names_unchanged"] = True
+        else:
+            prev_key = key
+            prev_names = names
+        out.append(req)
+    return out
 
 
 def _bounded_run_payload(run: Any, series: Any, snapshot: Any, summary: Any, path: str) -> Dict[str, Any]:
@@ -77,7 +140,12 @@ def _bounded_run_payload(run: Any, series: Any, snapshot: Any, summary: Any, pat
     }
     for category in _EVENT_CATEGORIES:
         events = getattr(run, category) or []
-        payload[category] = events[-_MAX_EVENTS:]
+        if category == "requests":
+            # Perf: shed messages arrays in the bounded list too (the UI
+            # drill-down table only reads the scalars).
+            payload[category] = _dedupe_tool_names([_light_request(r) for r in events[-_MAX_EVENTS:]])
+        else:
+            payload[category] = events[-_MAX_EVENTS:]
         payload[f"total_{category}"] = len(events)
     return payload
 
@@ -104,7 +172,12 @@ def _bounded_session_view(view: Dict[str, Any]) -> Dict[str, Any]:
     for category in _EVENT_CATEGORIES:
         events = view.get(category) or []
         if len(events) > _MAX_EVENTS:
-            bounded[category] = events[-_MAX_EVENTS:]
+            events = events[-_MAX_EVENTS:]
+        if category == "requests":
+            # Perf: same message-shedding as the single-run bounded payload.
+            bounded[category] = _dedupe_tool_names([_light_request(r) for r in events])
+        else:
+            bounded[category] = events
         bounded[f"total_{category}"] = len(events)
     return bounded
 

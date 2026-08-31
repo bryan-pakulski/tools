@@ -813,11 +813,39 @@ def build_series(run: TraceRun) -> Dict[str, Any]:
         "context_artifact_counts": artifact_counts,
         "context_attribution": context_attribution,
         "top_context_spikes": top_context_spikes,
-        "requests": sorted(run.requests, key=lambda req: _iter_of(req.get("iter"))),
+        # Perf (trace-viewer optimization): the UI never reads series.requests
+        # raw messages — it charts the aggregated context_attribution points
+        # instead. Each request record carries its FULL messages array (up to
+        # ~130KB per record on long sessions), which made series.requests the
+        # single biggest payload item (~2MB on a 6-run session). Shed the
+        # heavy fields here; the complete records stay available via the
+        # top-level `requests` category and `full=true`.
+        "requests": [
+            _light_request(req)
+            for req in sorted(run.requests, key=lambda req: _iter_of(req.get("iter")))
+        ],
     }
 
 
 # ----------------------------------------------------------- efficacy / reads
+
+
+def _light_request(req: Any) -> Dict[str, Any]:
+    """Copy a request record without its verbose nested arrays.
+
+    Perf (trace-viewer optimization): `messages` (and its nested
+    `part_details`) are the bulk of each request record — up to ~130KB per
+    request on long sessions. They are only consumed for the full detail
+    drill-down (`full=true`) and the approximate-attribution fallback, both
+    of which re-read the complete `run.requests` list. The light form keeps
+    every scalar the UI summarizes (token_estimate, component totals,
+    messages_hash, tool_names, ...) so charts and tables render identically.
+    """
+    light = {key: value for key, value in req.items() if key not in ("messages",)}
+    msgs = req.get("messages")
+    if isinstance(msgs, list) and msgs:
+        light["messages_count"] = len(msgs)
+    return light
 
 
 _WRITE_TOOLS = {
