@@ -143,6 +143,11 @@ VARIABLE_SCHEMA = {
         "type": bool,
         "default": False,
     },  # Remove completed-turn tool metadata after a finished conversation.
+    "trace_request_full_iters": {
+        "type": int,
+        "default": 1,
+    },  # Round-51 T6: keep full request dumps for the first N iterations of
+    # a run; later request trace records are bounded summaries (<2KB).
     "auto_compaction_enabled": {
         "type": bool,
         # Model-directed `compact` is the normal cleanup path. This opt-in
@@ -352,6 +357,9 @@ VARIABLE_SCHEMA = {
     "active_tool_phases": {
         # Spec #9: phases always exposed when `lazy_tools_enabled` is True.
         # "core" covers the always-on read/write/memory/session/agent tools.
+        # Strategy modes add their declared AGENT_MODE_METADATA.tool_phases
+        # at request time, so this persisted list need not be rewritten when
+        # the user switches modes.
         "type": list,
         "default": ["core"],
     },
@@ -1034,11 +1042,13 @@ AGENT_MODE_METADATA = {
         "description": "Phased Feature Plan Engine with approval, blockers, and review.",
         "documentation": "documentation/feature_plan_engine.md",
         "display_name": "Feature Mode",
+        "tool_phases": ["feature"],
     },
     "research": {
         "description": "Exploration and explanation mode for understanding systems.",
         "documentation": "documentation/research_mode.md",
         "display_name": "Research Mode",
+        "tool_phases": ["research"],
     },
     "loop": {
         "description": "Long-horizon autonomous loop with ongoing timeline updates.",
@@ -1052,6 +1062,7 @@ AGENT_MODE_METADATA = {
         ),
         "documentation": "documentation/security_mode.md",
         "display_name": "Security Mode",
+        "tool_phases": ["security"],
     },
     "teacher": {
         "description": (
@@ -1061,6 +1072,7 @@ AGENT_MODE_METADATA = {
         ),
         "documentation": "documentation/teacher_mode.md",
         "display_name": "Teacher Mode",
+        "tool_phases": ["teacher"],
     },
 }
 
@@ -1070,6 +1082,14 @@ AGENT_MODE_METADATA = {
 # autocomplete, and `POST /api/modes/{name}` rejects them. They drive no
 # system-prompt workflow text. Each entry: name, display_name, description.
 GUI_VIEW_PANELS = [
+    {
+        "name": "threads",
+        "display_name": "Coordination",
+        "description": (
+            "Live peer-thread roster, path ownership, messages, conflicts, "
+            "and the durable coordination audit."
+        ),
+    },
     {
         "name": "history",
         "display_name": "History",

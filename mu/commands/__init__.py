@@ -131,6 +131,7 @@ def _load_command_modules() -> None:
     from . import skills  # noqa: F401
     from . import docs  # noqa: F401
     from . import session  # noqa: F401
+    from . import thread  # noqa: F401
     from . import workspace  # noqa: F401
     from . import runtime  # noqa: F401
     from . import variables  # noqa: F401

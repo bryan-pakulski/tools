@@ -55,7 +55,12 @@ from mu.tools.capabilities import (
     tools_enabled_without_workspace,
 )
 from mu.trace.emitter import emit_nudge, emit_tool
-from mu.tools.descriptors import COLLATED_TOOLS, TOOLS
+from mu.tools.descriptors import (
+    COLLATED_TOOLS,
+    TOOLS,
+    filter_tools_by_phase,
+    resolve_active_tool_phases,
+)
 from providers.base import FileReference, ImageData, Message, MessagePart
 from utils.config import (
     NUDGE_EMPTY_RESPONSE,
@@ -91,8 +96,13 @@ from mu.agent.context_guard import (  # noqa: F401
     _aggressive_compact_for_overflow,
     _generate_with_overflow_recovery,
 )
+from mu.agent.teacher_watcher import (
+    _render_learner_profile_block,
+    _run_teacher_watcher_assistant,
+    _run_teacher_watcher_user,
+)
 
-def run_turn(session, text):
+def run_turn(session, text, *, origin="user"):
     logger.info(f"Sending message: {text[:100]}...")
     session.paused_execution_text = None
     session._loop_blocker_raised = False  # fresh turn — last turn's pause doesn't apply
@@ -110,6 +120,44 @@ def run_turn(session, text):
     # _MAX_OVERFLOW_RECOVERIES_PER_TURN recoveries).
     session._overflow_recoveries_this_turn = 0
     session.sync_runtime_state()
+    # Round-51 T7: trim oversized restored history BEFORE the first request.
+    # The traced 517-iter run resumed with L5 at 300k (another at 795k,
+    # above the 580k configured limit) because restore hydrated saved
+    # history unbounded — a resumed session's first request could already
+    # exceed the provider window. Fold overflow into the rolling summary
+    # via the existing compaction path instead of silently truncating; log
+    # loudly when the trim fires.
+    try:
+        from mu.session.budgets import (
+            drift_corrected_context_limit,
+            resolve_keep_recent,
+            resolve_response_reserve,
+        )
+        _sm = session.session_manager
+        _pre_len = len(getattr(_sm, "history", []) or [])
+        if _pre_len:
+            _tokens = _sm.estimate_runtime_history_tokens()
+            _limit = drift_corrected_context_limit(session)
+            _reserve = resolve_response_reserve(session)
+            _budget = max(1024, _limit - _reserve)
+            if _tokens > _budget:
+                _sm._pending_compaction_kind = "restore_trim"
+                _sm._pending_compaction_iter = 0
+                _sm.roll_history_summary_to_token_budget(
+                    _budget,
+                    keep_recent=max(4, int(resolve_keep_recent(session))),
+                    provider=session.provider,
+                )
+                _post = _sm.estimate_runtime_history_tokens()
+                logger.warning(
+                    "Restore trim: restored history estimated %d tokens "
+                    "(limit %d, reserve %d). Compacted to %d tokens, "
+                    "%d -> %d messages.",
+                    _tokens, _limit, _reserve, _post, _pre_len,
+                    len(getattr(_sm, "history", []) or []),
+                )
+    except Exception:
+        logger.debug("restore trim skipped", exc_info=True)
     # Staleness decay (self-management): advance the memory turn counter
     # once per turn, then demote ACTIVE task-memory entries not hit in the
     # last `memory_stale_after_turns` turns to STALE. This keeps the active
@@ -134,6 +182,14 @@ def run_turn(session, text):
     # Compute the active agent mode once — reused by scratchpad handling
     # below and by the mode-specific prompt builders that follow.
     active_mode = str(session.variables.get("agent_mode", "default")).lower()
+    active_tool_phases = resolve_active_tool_phases(
+        session.variables,
+        getattr(session, "_loaded_tool_phases", None),
+    )
+    # Runtime receipt for diagnostics/UI integrations. This is derived state,
+    # not persisted configuration: mode-required registries remain active even
+    # when a saved session has only the historical ["core"] default.
+    session._active_tool_phases = tuple(active_tool_phases)
     if session.variables.get("scratchpad_enabled", True):
         session.turn_scratchpad.max_entries = max(
             1,
@@ -193,13 +249,14 @@ def run_turn(session, text):
     # user message without requiring /goal to be set manually.
     # Pin BEFORE persistence so the first meaningful request gets its
     # task-memory audit entry (codex review finding #6).
-    if not str(session.variables.get("session_goal", "") or "").strip():
+    if origin == "user" and not str(session.variables.get("session_goal", "") or "").strip():
         raw_text = str(text or "").strip()
         if raw_text and len(raw_text) > 10 and not raw_text.startswith("/"):
             session.variables["session_goal"] = raw_text
     # Mode-agnostic: every turn, mirror the pinned session_goal into
     # task_memory so it survives history compaction.
-    session._ensure_session_goal_persistence()
+    if origin == "user":
+        session._ensure_session_goal_persistence()
     if effective_text:
         parts.append({"type": "text", "text": effective_text})
 
@@ -207,17 +264,21 @@ def run_turn(session, text):
         "role": "user",
         "parts": parts,
         "timeline_id": "turn-" + uuid.uuid4().hex,
+        "origin": origin,
+        "synthetic": origin != "user",
     }
+    if getattr(session, "_thread_turn_id", None):
+        new_user_message["timeline_id"] = session._thread_turn_id
 
     # Teacher watcher: classify the user's message as a learner reply
     # against the active lesson's most recent check, BEFORE the agent
     # runs. The watcher records learner_response/learner_question turns
     # into the engine so the transcript reflects what the user actually
     # said — not what the agent later narrates about it.
-    if active_mode == "teacher" and text:
+    if origin == "user" and active_mode == "teacher" and text:
         _run_teacher_watcher_user(session, text)
 
-    if text and session.ui and session.variables.get("verbose", False):
+    if origin == "user" and text and session.ui and session.variables.get("verbose", False):
         session.ui.render_message("user", text)
 
     workspace_context = ""
@@ -242,20 +303,7 @@ def run_turn(session, text):
             # specialist-phase tools not in the active phase set (+ any the
             # model loaded via load_tools). Default off → no filtering.
             if session.variables.get("lazy_tools_enabled", False):
-                try:
-                    from mu.tools.descriptors import filter_tools_by_phase
-
-                    _phases = list(
-                        session.variables.get("active_tool_phases", ["core"])
-                        or ["core"]
-                    )
-                    _phases += list(getattr(session, "_loaded_tool_phases", []) or [])
-                    active_tools = filter_tools_by_phase(active_tools, _phases)
-                except Exception:  # noqa: BLE001
-                    pass
-            tool_desc_str = "\n".join(
-                [f"{t.name} - {t.description}" for t in active_tools]
-            )
+                active_tools = filter_tools_by_phase(active_tools, active_tool_phases)
 
             agent_mode = str(session.variables.get("agent_mode", "default")).lower()
             # Prompt resolution priority (highest first):
@@ -286,7 +334,18 @@ def run_turn(session, text):
             workspace_context = (
                 f"{agentic_system_base}\n\n"
                 f"### SESSION TYPE: {session_type.upper()}\n{type_instruction}\n\n"
-                f"### CURRENT STRATEGY MODE: {agent_mode.upper()}\n{mode_instruction}"
+                f"### CURRENT STRATEGY MODE: {agent_mode.upper()}\n{mode_instruction}\n\n"
+                "### ACTIVE TOOL REGISTRIES\n"
+                + (
+                    f"{', '.join(active_tool_phases)}. "
+                    f"Provider schema exposes {len(active_tools)} tools; "
+                    "strategy-mode registries are activated automatically."
+                    if session.variables.get("lazy_tools_enabled", False)
+                    else (
+                        f"all registered phases. Provider schema exposes "
+                        f"{len(active_tools)} tools because lazy tool exposure is disabled."
+                    )
+                )
             )
         else:
             logger.debug(
@@ -406,17 +465,71 @@ def run_turn(session, text):
         _tr = get_emitter(session)
         if _tr is not None and not getattr(session, "_trace_started", False):
             session._trace_started = True
+            # Round-51 T1: emit BOTH the user-facing configured limit and the
+            # drift-corrected effective limit the preflight guard actually
+            # enforces. Divergence between the two was previously invisible
+            # (displayed 580k while the guard resolved a different ceiling),
+            # so runs could overflow the displayed limit with zero
+            # compaction events. Warn when they diverge >5%.
+            from mu.session.budgets import drift_corrected_context_limit
+
+            _configured_limit = int(
+                getattr(session, "_resolved_context_limit", 0)
+                or session.variables.get("context_token_limit", 0)
+                or 0
+            )
+            try:
+                _effective_limit = int(drift_corrected_context_limit(session))
+            except Exception:
+                _effective_limit = 0
+            # Round-51 T1: limit_source classifies which resolution path
+            # produced the effective limit so traces are self-describing.
+            # Precedence: a valid provider window below the configured user
+            # limit means the window drives the effective limit
+            # (provider_window); otherwise a difference between the
+            # configured and effective limits comes from drift/safety
+            # correction; when they agree the user limit stands.
+            _prov_window = 0
+            try:
+                _prov_raw = session.provider.effective_context_window(
+                    session.provider.model_name
+                )
+                if _prov_raw and int(_prov_raw) > 0:
+                    _prov_window = int(_prov_raw)
+            except Exception:
+                _prov_window = 0
+            if _effective_limit <= 0:
+                _limit_source = "user"
+            elif (
+                _prov_window > 0
+                and _configured_limit > 0
+                and _configured_limit > _prov_window
+                and _effective_limit <= _configured_limit
+            ):
+                _limit_source = "provider_window"
+            elif (
+                _configured_limit > 0
+                and _effective_limit != _configured_limit
+            ):
+                _limit_source = "drift_corrected"
+            elif (
+                _configured_limit <= 0
+                and _prov_window > 0
+                and _effective_limit != _prov_window
+            ):
+                _limit_source = "provider_window"
+            else:
+                _limit_source = "user"
+            session._effective_guard_limit = _effective_limit
             _tr.run_start(
                 {
                     "session": _tr.session_name,
                     "model": getattr(session.provider, "model_name", ""),
                     "provider": type(session.provider).__name__,
                     "mode": active_mode,
-                    "context_limit": int(
-                        getattr(session, "_resolved_context_limit", 0)
-                        or session.variables.get("context_token_limit", 0)
-                        or 0
-                    ),
+                    "context_limit": _configured_limit,
+                    "effective_limit": _effective_limit,
+                    "limit_source": _limit_source,
                     "max_iterations": int(
                         session.variables.get("max_iterations", 50) or 50
                     ),
@@ -570,16 +683,7 @@ def run_turn(session, text):
     provider_tools = active_tools if expose_tools else None
     # Spec #9: phased exposure (see the earlier filter site for details).
     if session.variables.get("lazy_tools_enabled", False):
-        try:
-            from mu.tools.descriptors import filter_tools_by_phase
-
-            _phases = list(
-                session.variables.get("active_tool_phases", ["core"]) or ["core"]
-            )
-            _phases += list(getattr(session, "_loaded_tool_phases", []) or [])
-            active_tools = filter_tools_by_phase(active_tools, _phases)
-        except Exception:  # noqa: BLE001
-            pass
+        active_tools = filter_tools_by_phase(active_tools, active_tool_phases)
     provider_tools = active_tools if expose_tools else None
 
     total_in = 0
@@ -870,6 +974,31 @@ def run_turn(session, text):
                     + _subagent_context
                 )
 
+            # L3C is rebuilt for every provider iteration. It gives the
+            # agent a live peer roster, path ownership, and newly delivered
+            # inter-thread messages without granting those messages system
+            # authority.
+            try:
+                _thread_coordinator = getattr(session, "thread_coordinator", None)
+                if _thread_coordinator is not None:
+                    _thread_coordinator.heartbeat(
+                        session.thread_meta.thread_id,
+                        session._thread_runtime_id,
+                    )
+                    _thread_context = _thread_coordinator.context_block(
+                        session.thread_meta.thread_id
+                    )
+                else:
+                    _thread_context = ""
+            except Exception:
+                _thread_context = ""
+                logger.debug("peer thread context refresh failed", exc_info=True)
+            if _thread_context:
+                dynamic_system_prompt += (
+                    "\n\nLAYER 3C — Peer thread coordination:\n"
+                    + _thread_context
+                )
+
             dynamic_system_prompt, messages = _preflight_context_check(
                 session, dynamic_system_prompt, messages,
                 turn_start_index=turn_start_index,
@@ -902,6 +1031,15 @@ def run_turn(session, text):
                         tools=provider_tools,
                         token_estimate=request_token_estimate,
                         estimate_manifest=_est,
+                        # Round-51 T6: keep only the first iteration full —
+                        # later requests emit bounded summaries (per-message
+                        # totals, no part_details). Configurable: a positive
+                        # `trace_request_full_iters` keeps that many full.
+                        summarize=iteration
+                        > max(1, int(
+                            session.variables.get("trace_request_full_iters", 1)
+                            or 1
+                        )),
                     ))
             except Exception:
                 # Defensive: best-effort path must not break the caller.
@@ -979,6 +1117,10 @@ def run_turn(session, text):
 
                 elif part.type == "tool_call":
                     has_tool_call = True
+                    # Round-51 T5: the model responded to a nudge with real
+                    # tool progress — reset the ineffective-nudge counter.
+                    if getattr(session, "_watchdog_ineffective_count", 0):
+                        session._watchdog_ineffective_count = 0
                     ai_parts_archive.append(
                         {
                             "type": "tool_call",
@@ -1133,6 +1275,66 @@ def run_turn(session, text):
                         request_token_estimate=request_token_estimate,
                     )
                     _tr.iter_record(_rec)
+                    # Round-51 T3: loud record when L5 collapses between
+                    # consecutive iterations with no compaction record in
+                    # between. The observed it200 578k→17k drop left the
+                    # trace unable to explain where ~561k tokens went.
+                    # Detection is best-effort telemetry: never break the
+                    # loop, and skip when a compaction legitimately explains
+                    # the drop (its own record carries the numbers).
+                    try:
+                        _now_l5 = int(
+                            _rec.get("context", {}).get("l5", 0) or 0
+                        )
+                        _prev_l5 = int(
+                            getattr(session, "_trace_prev_iter_l5", 0) or 0
+                        )
+                        _prev_iter = getattr(
+                            session, "_trace_prev_iter_num", -1
+                        )
+                        try:
+                            _prev_iter = int(_prev_iter)
+                        except (TypeError, ValueError):
+                            _prev_iter = -1
+                        if (
+                            _prev_iter >= 0
+                            and iteration == _prev_iter + 1
+                            and _prev_l5 > 50000
+                            and not _comps
+                            and _now_l5 < 0.5 * _prev_l5
+                        ):
+                            _tr.emit(
+                                {
+                                    "type": "context_collapse",
+                                    "run_id": _tr.run_id,
+                                    "iter": iteration,
+                                    "from_l5": _prev_l5,
+                                    "to_l5": _now_l5,
+                                    "drop_pct": round(
+                                        (_prev_l5 - _now_l5) / float(_prev_l5) * 100.0,
+                                        1,
+                                    )
+                                    if _prev_l5 > 0
+                                    else 0.0,
+                                    "probable_cause": "unknown",
+                                    "last_compaction_iter": getattr(
+                                        session,
+                                        "_trace_last_compaction_iter",
+                                        None,
+                                    ),
+                                    "hint": "silently_reset",
+                                }
+                            )
+                            logger.warning(
+                                "Context collapse: L5 fell %d -> %d tokens "
+                                "between iterations %d and %d with no "
+                                "compaction record.",
+                                _prev_l5, _now_l5, _prev_iter, iteration,
+                            )
+                        session._trace_prev_iter_l5 = _now_l5
+                        session._trace_prev_iter_num = iteration
+                    except Exception:  # noqa: BLE001 — telemetry must not break the loop
+                        logger.debug("Suppressed exception", exc_info=True)
                     try:
                         _ctx_est = int(_rec.get("context", {}).get("total_est", 0) or 0)
                     except Exception:  # noqa: BLE001
@@ -1191,6 +1393,12 @@ def run_turn(session, text):
                 logger.debug("Suppressed exception", exc_info=True)
 
             if not has_tool_call:
+                # Round-51 T5: track watchdog effectiveness — an iteration
+                # with no tool calls after a nudge counts as ineffective.
+                if getattr(session, "_watchdog_nudge_count", 0):
+                    session._watchdog_ineffective_count = int(
+                        getattr(session, "_watchdog_ineffective_count", 0) or 0
+                    ) + 1
                 if not has_text:
                     logger.warning("Assistant provided empty response. Nudging.")
 
@@ -1248,30 +1456,90 @@ def run_turn(session, text):
                         # Fall through to the normal finalize path
                         # below (no `continue`).
                     else:
-                        logger.info(
-                            "Loop mode watchdog: assistant stopped without tool calls; issuing autonomous continue nudge."
+                        # Round-51 T5: watchdog escalation ladder. In the
+                        # observed 517-iter run the watchdog nudged 15x with
+                        # accelerating intervals and zero behavioral change.
+                        # Track consecutive ineffective nudges (a nudge is
+                        # ineffective when the assistant stopped without
+                        # tool calls again), escalate to a plan-recap demand
+                        # after 3, pause for user input after 5, and hard-
+                        # cap total nudges per run at 8.
+                        _wd_ineffective = int(
+                            getattr(
+                                session, "_watchdog_ineffective_count", 0
+                            )
+                            or 0
                         )
-                        watchdog_msg = {
-                            "role": "user",
-                            "parts": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        "LOOP WATCHDOG: Continue autonomous loop execution now. "
-                                        "Re-plan the next increment, execute concrete actions with tools, "
-                                        "verify outcomes, and proceed without waiting for user confirmation. "
-                                        "Only pause if blocked, and if blocked call raise_blocker with exact unblock requirements."
-                                    ),
-                                }
-                            ],
-                        }
-                        session.session_manager.history.append(watchdog_msg)
-                        emit_nudge(session, "loop_watchdog", iteration)
-                        messages = session._build_messages_from_history(
-                            session._prepare_runtime_history(),
-                            {"role": "system", "parts": []},
-                        )[:-1]
-                        continue
+                        _wd_total = int(
+                            getattr(session, "_watchdog_nudge_count", 0) or 0
+                        )
+                        if _wd_total >= 8:
+                            # Hard cap: further watchdog triggers are no-ops.
+                            logger.info(
+                                "Loop mode watchdog: cap (%d) reached; "
+                                "falling through to finalize.",
+                                _wd_total,
+                            )
+                            if session.ui:
+                                session.ui.show_info(
+                                    "Loop watchdog nudge cap reached — falling "
+                                    "through to finalize. Set a new loop goal "
+                                    "or /mode default to continue."
+                                )
+                        else:
+                            _watchdog_text = "LOOP WATCHDOG: Continue autonomous loop execution now. Re-plan the next increment, execute concrete actions with tools, verify outcomes, and proceed without waiting for user confirmation. Only pause if blocked, and if blocked call raise_blocker with exact unblock requirements."
+                            if _wd_ineffective >= 5:
+                                # Ladder rung 2: pause for user input via the
+                                # existing raise_blocker mechanism instead of
+                                # nudging again.
+                                _watchdog_text = (
+                                    "LOOP WATCHDOG ESCALATION: The continue-nudge has been ignored "
+                                    f"{_wd_ineffective}x. Pause and ask for help: stop autonomous "
+                                    "retrying, summarize exact progress and the concrete obstacle, "
+                                    "and call raise_blocker with precise unblock requirements."
+                                )
+                                emit_nudge(
+                                    session,
+                                    "watchdog_pause",
+                                    iteration,
+                                    ineffective=_wd_ineffective,
+                                )
+                                session._watchdog_paused = True
+                            elif _wd_ineffective >= 3:
+                                # Ladder rung 1: structured re-plan demand.
+                                _watchdog_text = (
+                                    "LOOP WATCHDOG (plan recap required): Repeated continue-nudges "
+                                    "have not produced progress. STOP executing. First output a "
+                                    "structured re-plan: (1) original goal, (2) what you have "
+                                    "actually completed so far, (3) the exact obstacle, (4) the next "
+                                    "single concrete action. Then execute that one action with tools. "
+                                    "If you cannot name a concrete action, call raise_blocker."
+                                )
+                                emit_nudge(
+                                    session,
+                                    "watchdog_escalated",
+                                    iteration,
+                                    ineffective=_wd_ineffective,
+                                )
+                                session._watchdog_escalated = True
+                            watchdog_msg = {
+                                "role": "user",
+                                "parts": [
+                                    {
+                                        "type": "text",
+                                        "text": _watchdog_text,
+                                    }
+                                ],
+                                "synthetic": True,
+                            }
+                            session.session_manager.history.append(watchdog_msg)
+                            emit_nudge(session, "loop_watchdog", iteration)
+                            session._watchdog_nudge_count = _wd_total + 1
+                            messages = session._build_messages_from_history(
+                                session._prepare_runtime_history(),
+                                {"role": "system", "parts": []},
+                            )[:-1]
+                            continue
 
                 if session.ui:
                     session.ui.show_info(
@@ -1388,6 +1656,7 @@ def run_turn(session, text):
                     auto_approved = bool(
                         session.variables.get("yolo", False)
                         and approval_plan.can_approve
+                        and approval_plan.approval_policy != "always_human"
                     )
 
                     if approval_plan.preview_error and session.ui:
@@ -1571,6 +1840,13 @@ def run_turn(session, text):
                     and min(parallel_indices) > min(serial_indices)
                 ):
                     parallel_indices, serial_indices = [], list(pending_executions)
+                # One call has nothing to parallelize. Keeping it on the
+                # agent thread avoids an event-loop/default-executor round
+                # trip and preserves straightforward hook/UI ordering.
+                if len(parallel_indices) == 1:
+                    serial_indices.extend(parallel_indices)
+                    serial_indices.sort()
+                    parallel_indices = []
 
                 # Parallel batch — preserves input-order results.
                 if parallel_indices:
@@ -2061,16 +2337,53 @@ def run_turn(session, text):
                         _rd = result.get("data")
                         if isinstance(_rd, dict):
                             _eff_omitted = bool(_rd.get("omitted"))
+                    # Round-51 T4: the ok/error_code pair must come from the
+                    # tool envelope itself. The old string-prefix heuristic
+                    # (ok = not raw.startswith("Error")) recorded ok=true for
+                    # every JSON-envelope failure (545 invalid_args in one
+                    # trace run) because envelopes never start with "Error".
+                    _envelope, _ = session._unwrap_tool_envelope(
+                        raw_result
+                        if isinstance(raw_result, str)
+                        else str(raw_result)
+                    )
+                    if isinstance(_envelope, dict):
+                        _tool_ok = bool(_envelope.get("ok", True))
+                        _tool_error_code = (
+                            str(_envelope.get("error_code") or "") or None
+                        )
+                        if not _tool_ok and not _tool_error_code:
+                            # Backstop: some handlers return ok=false with a
+                            # message but no error_code. Classify from the
+                            # message text so trace records always carry a
+                            # code for failures (T4).
+                            try:
+                                from mu.tools._envelope import (
+                                    infer_tool_error_code,
+                                )
+                                _tool_error_code = infer_tool_error_code(
+                                    part.tool_name, raw_result
+                                )
+                            except Exception:  # noqa: BLE001
+                                _tool_error_code = None
+                    else:
+                        _tool_ok = not str(raw_result).startswith("Error")
+                        _tool_error_code = (
+                            str(
+                                getattr(
+                                    session, "_last_retryable_error_code", ""
+                                )
+                                or ""
+                            )
+                            or None
+                        )
                     emit_tool(
                         session,
                         iteration=iteration,
                         name=part.tool_name,
                         arg_fp=_arg_fp,
-                        ok=not str(raw_result).startswith("Error"),
-                        error_code=str(
-                            getattr(session, "_last_retryable_error_code", "") or ""
-                        )
-                        or None,
+                        ok=_tool_ok,
+                        error_code=_tool_error_code,
                         latency_ms=_lat,
                         cache_hit=bool(_auto_recall_hits.get(i)),
                         result_bytes=len(str(source_result or "")),

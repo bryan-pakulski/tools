@@ -163,6 +163,17 @@ def build_create_command(
     host_trace_dir = os.path.join(os.path.abspath(os.path.expanduser(HISTORY_DIR)), "trace")
     os.makedirs(host_trace_dir, exist_ok=True)
     command += ["-v", f"{host_trace_dir}:{ref.container_volume}/trace:rw"]
+    # Peer threads may be split across host and container runtimes. Mount the
+    # coordination journals so both sides share one durable message/claim
+    # ledger without exposing unrelated session transcripts.
+    host_thread_dir = os.path.join(
+        os.path.abspath(os.path.expanduser(HISTORY_DIR)), "thread-groups"
+    )
+    os.makedirs(host_thread_dir, exist_ok=True)
+    command += [
+        "-v",
+        f"{host_thread_dir}:{ref.container_volume}/thread-groups:rw",
+    ]
     if ref.workspace_volume:
         command += ["-v", f"{ref.workspace_volume}:/workspace:rw"]
     for mount in ref.mounts:

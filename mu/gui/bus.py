@@ -53,12 +53,13 @@ _REPLACEABLE_KINDS = frozenset({
 
 
 class _Subscriber:
-    __slots__ = ("queue", "filters", "last_seq")
+    __slots__ = ("queue", "filters", "group_filters", "last_seq")
 
     def __init__(self, queue: "asyncio.Queue[Dict[str, Any]]",
-                 filters: Optional[set]) -> None:
+                 filters: Optional[set], group_filters: Optional[set] = None) -> None:
         self.queue = queue
         self.filters = filters
+        self.group_filters = group_filters
         self.last_seq = 0
 
 
@@ -98,6 +99,7 @@ class EventBus:
     def subscribe(
         self,
         session_name: Optional[str] = None,
+        thread_group_id: Optional[str] = None,
         last_event_id: Optional[int] = None,
     ) -> "asyncio.Queue[Dict[str, Any]]":
         """Subscribe. With session_name, the queue only receives events
@@ -114,7 +116,11 @@ class EventBus:
             except RuntimeError:
                 pass
         queue: asyncio.Queue = asyncio.Queue(maxsize=2048)
-        sub = _Subscriber(queue, {session_name} if session_name else None)
+        sub = _Subscriber(
+            queue,
+            {session_name} if session_name else None,
+            {thread_group_id} if thread_group_id else None,
+        )
         self._subscribers.append(sub)
         self._session_filters[queue] = sub.filters
         if last_event_id is not None:
@@ -129,19 +135,30 @@ class EventBus:
         self._session_filters.pop(queue, None)
 
     @staticmethod
-    def _event_matches(event: Dict[str, Any], allowed: Optional[set]) -> bool:
+    def _event_matches(
+        event: Dict[str, Any],
+        allowed: Optional[set],
+        groups: Optional[set] = None,
+    ) -> bool:
         if allowed is None:
             return True
         name = event.get("session_name")
         # Session-agnostic events (no session stamp) always pass.
-        return name is None or name in allowed
+        return (
+            name is None
+            or name in allowed
+            or (
+                bool(groups)
+                and event.get("thread_group_id") in groups
+            )
+        )
 
     def _replay_into(self, sub: _Subscriber, last_event_id: int) -> None:
         """Re-queue replayed events newer than last_event_id (F2)."""
         for seq, event in list(self._replay):
             if seq <= last_event_id:
                 continue
-            if not self._event_matches(event, sub.filters):
+            if not self._event_matches(event, sub.filters, sub.group_filters):
                 continue
             try:
                 sub.queue.put_nowait(dict(event, replayed=True))
@@ -169,7 +186,7 @@ class EventBus:
         stamp["seq"] = next(self._seq)
         self._replay.append((stamp["seq"], stamp))
         for sub in list(self._subscribers):
-            if not self._event_matches(stamp, sub.filters):
+            if not self._event_matches(stamp, sub.filters, sub.group_filters):
                 continue
             sub.last_seq = stamp["seq"]
             try:

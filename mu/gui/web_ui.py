@@ -288,6 +288,7 @@ class WebUI(BaseUI):
         description=None,
         risk=None,
         display_args=None,
+        approval_policy="default",
         **_kwargs,
     ):
         result = self._ask_prompt(
@@ -297,6 +298,7 @@ class WebUI(BaseUI):
                 "tool_args": tool_args or display_args,
                 "description": description,
                 "risk": risk,
+                "approval_policy": approval_policy,
             }
         )
         if isinstance(result, dict) and result.get("cancelled"):

@@ -137,44 +137,69 @@
                 <span class="sidebar-wordmark">MuCLI</span>
             </div>
 
-            <button class="sidebar-primary-action" @click="$store.sessions.deactivate()">
+            <button class="sidebar-primary-action" @click="$store.threads.create()">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>
-                <span>New session</span>
+                <span>New thread</span>
             </button>
 
             <div class="sidebar-scroll">
-                <section class="nav-section sessions-only-section">
+                <section class="nav-section sessions-only-section"
+                         x-show="$store.threads.groupRoster.length > 1"
+                         x-cloak>
+                    <div class="nav-section-title">
+                        <span>Threads</span>
+                        <span class="count" x-text="$store.threads.groupRoster.length"></span>
+                    </div>
+                    <template x-for="t in $store.threads.groupRoster" :key="t.thread_id">
+                        <div class="nav-item"
+                             :class="{
+                                active: t.session_name === $store.chat.currentName,
+                                loaded: $store.sessions.isLoaded(t.session_name),
+                                busy: $store.sessions.isBusy(t.session_name) || $store.threads.statusClass(t.status)
+                             }"
+                             @click="t.session_name !== $store.chat.currentName && $store.threads.switchTo(t)"
+                             :title="t.title + ' · ' + t.status + (t.current_goal ? ' · ' + t.current_goal : '')">
+                            <span class="thread-status-dot" :class="$store.threads.statusClass(t.status)"></span>
+                            <span class="name" x-text="t.title || t.session_name"></span>
+                            <span class="thread-unread" x-show="t.unread_count" x-text="t.unread_count"></span>
+                            <span class="prompt-badge"
+                                  x-show="$store.prompts.queue.some(p => p.session_name === t.session_name) && t.session_name !== $store.chat.currentName"
+                                  title="Awaiting your input">!</span>
+                            <button class="row-action thread-delete"
+                                    x-show="t.session_name !== $store.chat.currentName && !$store.sessions.isBusy(t.session_name) && !$store.threads.statusClass(t.status)"
+                                    @click.stop="$store.confirm.ask(`Delete thread '${t.title || t.session_name}'?`, $event, () => $store.threads.remove(t), {danger:true})"
+                                    title="Delete thread"
+                                    aria-label="Delete thread">×</button>
+                        </div>
+                    </template>
+                </section>
+                <section class="nav-section sessions-only-section sidebar-other-sessions">
                     <div class="nav-section-title">
                         <span>Sessions</span>
                         <span class="count" x-text="$store.sessions.list.length"></span>
                     </div>
                     <template x-for="s in $store.sessions.list" :key="s.name">
                         <div class="nav-item"
-                             :class="{
-                                active: s.name === $store.chat.currentName,
-                                loaded: $store.sessions.isLoaded(s.name),
-                                busy: $store.sessions.isBusy(s.name)
-                             }"
-                             @click="s.name !== $store.chat.currentName && $store.sessions.switchTo(s.name)"
-                             :title="(s.name === $store.chat.currentName ? s.name + ' (current)' : 'Switch to ' + s.name)
-                                + ($store.sessions.isBusy(s.name) ? ' · working' : '')">
+                             :class="{ active: s.name === $store.chat.currentName, busy: $store.sessions.isBusy(s.name) }"
+                             @click="$store.sessions.switchTo(s.name)"
+                             tabindex="0"
+                             :title="s.name + ($store.sessions.isLoaded(s.name) ? ' · loaded' : '') + ($store.sessions.isBusy(s.name) ? ' · busy' : '')">
                             <span class="sidebar-session-type"
-                                  :class="{ busy: $store.sessions.isBusy(s.name), loaded: $store.sessions.isLoaded(s.name) && !$store.sessions.isBusy(s.name) }"
-                                  x-html="sessionTypeIconMarkup(s.session_type, 'session-type-svg')"
-                                  aria-hidden="true"></span>
+                                  x-html="sessionTypeIconMarkup(s.session_type, 'session-type-svg')"></span>
                             <span class="name" x-text="s.name"></span>
-                            <span class="prompt-badge"
-                                  x-show="$store.prompts.queue.some(p => p.session_name === s.name) && s.name !== $store.chat.currentName"
-                                  title="Awaiting your input">!</span>
-                            <span class="u"
-                                  x-show="$store.sessions.isLoaded(s.name) && s.name !== $store.chat.currentName"
-                                  @click.stop="$store.sessions.unload(s.name)"
-                                  title="Unload session">⌫</span>
-                            <span class="x"
-                                  @click.stop="$store.confirm.ask(`Delete session '${s.name}'?`, $event, () => $store.sessions.remove(s.name), {danger:true})"
-                                  title="Delete session">×</span>
+                            <span class="row-actions">
+                                <button class="row-action"
+                                        x-show="$store.sessions.isLoaded(s.name) && s.name !== $store.chat.currentName"
+                                        title="Unload session"
+                                        @click.stop="$store.sessions.unload(s.name)">unload</button>
+                                <button class="row-action row-action-danger"
+                                        :disabled="s.name === $store.chat.currentName"
+                                        title="Delete session"
+                                        @click.stop="$store.confirm.ask(`Delete session '${s.name}'?`, $event, () => $store.sessions.remove(s.name), {danger:true})">×</button>
+                            </span>
                         </div>
                     </template>
+                    <button class="nav-action sidebar-new-session" @click="$store.sessions.deactivate()">+ new session</button>
                 </section>
             </div>
         </div>
@@ -196,6 +221,7 @@
             {% include "fragments/loop_panel.html" %}
             {% include "fragments/debug_panel.html" %}
             {% include "fragments/history_panel.html" %}
+            {% include "fragments/threads_panel.html" %}
             {% include "fragments/memory_panel.html" %}
             {% include "fragments/system_prompts_panel.html" %}
             {% include "fragments/files_panel.html" %}

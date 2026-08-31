@@ -194,6 +194,11 @@ def _enforce_trace_retention(active_path: str) -> None:
         logger.debug("trace retention prune failed: %s", exc)
 
 
+# Round-51 T2: run-level run_end idempotency across emitter rebuilds.
+_RUN_END_REGISTRY: set = set()
+_RUN_END_REGISTRY_LOCK = threading.Lock()
+
+
 class TraceEmitter:
     """Append-only JSONL writer for one run. Thread-safe; lazy-opens the file."""
 
@@ -343,7 +348,36 @@ class TraceEmitter:
         self.emit(out)
         self.flush()
 
+    def run_end(self, rec: Dict[str, Any]) -> None:
+        """Terminal run bootstrap record (Round-51 T2).
 
+        Written exactly once per emitter: emitted by the ``send_message``
+        finally block on every exit path (completion, max-iterations,
+        exception, stop/unblock). The ``status`` field records how the run
+        terminated so the parser can retire the eternal 'running' default.
+        Guards + flush + mark closed so late emitters cannot re-open or
+        double-append.
+        """
+        if getattr(self, "_run_end_emitted", False):
+            return
+        # Round-51 T2: run-level idempotency survives emitter rebuilds —
+        # a late caller that re-acquires a (fresh) emitter for the same
+        # run id must not append a second terminal record into the run's
+        # trace file.
+        with _RUN_END_REGISTRY_LOCK:
+            if self.run_id in _RUN_END_REGISTRY:
+                self._run_end_emitted = True
+                return
+            _RUN_END_REGISTRY.add(self.run_id)
+        self._run_end_emitted = True
+        out = {"type": "run_end", "run_id": self.run_id}
+        out.update(rec)
+        self.emit(out)
+        self.flush()
+        self.close()
+
+
+# Round-51 T2: run-level run_end idempotency across emitter rebuilds.
 # ----------------------------------------------------------- accessor
 
 def get_emitter(session: Any) -> Optional[TraceEmitter]:
@@ -470,6 +504,57 @@ def emit_context_artifact(session: Any, *, iteration: int, artifact_id: str,
         pass
 
 
+def _summarize_messages(message_parts, keep_recent=20):
+    """Bounded per-message summary for iterations > 1 (Round-51 T6).
+
+    Keeps per-message totals for the most recent ``keep_recent`` messages;
+    older messages collapse into one aggregate row (role=older, count and
+    byte/token totals). This bounds a request record to O(keep) independent
+    of history length — the 517-iter run's 92KB-per-record request dumps
+    become <2KB.
+    """
+    try:
+        n = len(message_parts)
+        if n <= keep_recent:
+            return [
+                {
+                    "index": msg.get("index"),
+                    "role": msg.get("role"),
+                    "parts": msg.get("parts"),
+                    "bytes": msg.get("bytes"),
+                    "tokens": msg.get("tokens"),
+                }
+                for msg in message_parts
+            ]
+        newer = message_parts[-keep_recent:]
+        older = message_parts[:-keep_recent]
+        agg = {
+            "index": 0,
+            "role": "older",
+            "parts": 0,
+            "bytes": 0,
+            "tokens": 0,
+            "collapsed_count": 0,
+        }
+        for m in message_parts[:-keep_recent]:
+            agg["bytes"] += int(m.get("bytes") or 0)
+            agg["tokens"] += int(m.get("tokens") or 0)
+            agg["collapsed_count"] += 1
+        agg["parts"] = 0
+        return [agg] + [
+            {
+                "index": msg.get("index"),
+                "role": msg.get("role"),
+                "parts": msg.get("parts"),
+                "bytes": msg.get("bytes"),
+                "tokens": msg.get("tokens"),
+            }
+            for msg in newer
+        ]
+    except Exception:  # noqa: BLE001
+        return message_parts
+
+
 def build_request_record(
     *,
     iteration: int,
@@ -478,6 +563,7 @@ def build_request_record(
     tools: Any,
     token_estimate: int,
     estimate_manifest: Optional[Dict[str, int]] = None,
+    summarize: bool = False,
 ) -> Dict[str, Any]:
     """Privacy-preserving immutable manifest of the exact provider request.
 
@@ -675,7 +761,18 @@ def build_request_record(
         "iter": iteration,
         "system_prompt_bytes": len(system_prompt.encode("utf-8", errors="replace")),
         "system_prompt_hash": _hash(system_prompt),
-        "messages": message_parts,
+        "messages": (
+            # Round-51 T6: bounded summary — per-message totals only, no
+            # part_details, and older messages beyond the most recent 50
+            # collapse to a single total row. Keeps size/token drift
+            # diagnostics derivable; full dumps are it1-only.
+            (
+                _summarize_messages(message_parts)
+            )
+            if summarize
+            else message_parts
+        ),
+        "summarized": summarize,
         "messages_hash": _hash([(msg["role"], msg["bytes"]) for msg in message_parts]),
         "tool_names": tool_names,
         "tool_schema_bytes": meta["bytes"],

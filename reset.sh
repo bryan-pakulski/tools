@@ -12,4 +12,4 @@ setsid --wait "$MUCLI" --gui-stop >/dev/null 2>&1 || true
 sleep 3
 
 # restart — this stays in our background session
-exec "$MUCLI" --gui --host 0.0.0.0
+exec env MUCLI_GUI_ALLOW_REMOTE=1 "$MUCLI" --gui --host 0.0.0.0

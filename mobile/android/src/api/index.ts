@@ -18,3 +18,17 @@ export { skillsApi, Skill } from './skills';
 export { audioApi } from './audio';
 export { tracesApi, TraceRun, TraceSummary } from './traces';
 export { providersApi, ProviderInfo, CurrentProvider } from './providers';
+export {
+  threadsApi,
+  ThreadStatus,
+  ThreadSummary,
+  ThreadListItem,
+  ThreadListResponse,
+  ThreadsListResponse,
+  ThreadActivityEvent,
+  ThreadActivityResponse,
+  ThreadMeta,
+  CreateThreadOptions,
+  CreateThreadResult,
+  DeleteThreadResponse,
+} from './threads';

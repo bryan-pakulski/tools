@@ -29,7 +29,7 @@ count, and responsibility. Char counts are the source literal lengths
 | `AGENTIC_MODES["loop"]` | `utils/config.py:569` | 2 637 | Long-horizon autonomous loop: goal lock, user-visible backlog, per-increment re-orient→gather→act→verify→reflect, memory discipline, timeline updates. |
 | `AGENTIC_MODES["security"]` | `utils/config.py:611` | 4 356 | Security audit engine: anti-hallucination contract (PoC + patch both verified), discovery→per-finding proof-and-patch→final report, refutation of failed hypotheses. |
 | `AGENTIC_MODES["teacher"]` | `utils/config.py:657` | 14 483 | One-on-one tutor: personalization contract, chat-based teaching (watcher records), curriculum + per-lesson loop, dual-presentation artifacts, spaced review. |
-| `AGENT_MODE_METADATA` | `utils/config.py:814` | — | Real-mode registry (display_name, description, documentation path). Not prompt text; drives `/mode`, the GUI modes list, and the splash banner. The read-only view panels (history, memory, systemPrompts) are NOT here — they live in `GUI_VIEW_PANELS` and are surfaced through the GUI Tools menu, not as settable agent modes. |
+| `AGENT_MODE_METADATA` | `utils/config.py:814` | — | Real-mode registry (display_name, description, documentation path, and optional specialist `tool_phases`). Mode tool phases are added to the effective provider schema automatically when lazy tool exposure is enabled. The remaining metadata drives `/mode`, the GUI modes list, and the splash banner. The read-only view panels (history, memory, systemPrompts) are NOT here — they live in `GUI_VIEW_PANELS` and are surfaced through the GUI Tools menu, not as settable agent modes. |
 | `GUI_VIEW_PANELS` | `utils/config.py` | — | GUI-only view-panel registry (history, memory, systemPrompts). Read-only; never agent modes — `POST /api/modes/{name}` rejects them and they never appear in `/mode`, the splash banner, or `--mode-prompt`. Surfaced as the `views` array in `GET /api/modes`. |
 | `NUDGE_EMPTY_RESPONSE` | `utils/config.py:788` | 161 | Injected as a user message when the model returns no text after tool calls (`loop_body.py:845`). |
 | Feature-mode dynamic block | `loop_body.py:475-489` | ~1 100 | Appended to `base_system_prompt` when `active_mode == "feature"`: FEATURE MODE SYSTEM PROMPT instructions (staged engine, exit criteria, one task at a time). |
@@ -48,7 +48,8 @@ count, and responsibility. Char counts are the source literal lengths
 2. Append feature/loop/teacher dynamic block (`loop_body.py:474-507`).
 3. Append `workspace_context` =
    `{agentic_system_base}\n\n### CURRENT STRATEGY MODE: {MODE}\n{mode_instruction}`
-   (`loop_body.py:457`) — only when agentic.
+   plus an `ACTIVE TOOL REGISTRIES` receipt describing the effective provider
+   schema (`loop_body.py:457`) — only when agentic.
 4. Append resumption block (`loop_body.py:531`).
 5. `inject_hierarchical_context` → L0–L5 (`loop_body.py:532`).
 6. Append L3 memory + scratchpad snapshots + eviction notices

@@ -17,6 +17,7 @@ from prompt_toolkit.completion import (
 from prompt_toolkit.document import Document
 from prompt_toolkit.styles import Style
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.formatted_text import HTML
 
 from utils.config import HISTORY_DIR, KNOWN_MODELS, VARIABLE_SCHEMA
@@ -446,6 +447,15 @@ class InputHandler:
                 "delete": session_completer,
             }
         )
+        thread_completer = NestedCompleter.from_nested_dict(
+            {
+                "list": None,
+                "new": None,
+                "switch": session_completer,
+                "delete": session_completer,
+                "activity": None,
+            }
+        )
         plan_completer = NestedCompleter.from_nested_dict(
             {"on": None, "off": None, "toggle": None}
         )
@@ -481,6 +491,7 @@ class InputHandler:
             "/clear": None,
             "/history": NestedCompleter.from_nested_dict({"clear": None, "show": None}),
             "/session": session_subcommand_completer,
+            "/thread": thread_completer,
             "/container": container_completer,
             "/template": template_completer,
             "/templates": template_completer,
@@ -596,6 +607,13 @@ class InputHandler:
             self.toggle_yolo_mode()
             if event.app:
                 event.app.invalidate()
+
+        @self.kb.add(Keys.ShiftLeft)
+        def _(event):
+            # Shift+Left is deliberately distinct from ordinary cursor
+            # navigation. Returning the command sentinel keeps the picker on
+            # the main REPL thread where interactive prompts are safe.
+            event.app.exit(result="/thread")
 
         self.session = self._build_prompt_session(
             self._history_file_for_session("default")
@@ -723,7 +741,7 @@ class InputHandler:
         yolo_status = "ON" if self.is_yolo_enabled() else "OFF"
         plan_segment = " | 🔒 PLAN MODE ACTIVE — writes blocked" if self.is_plan_mode_enabled() else ""
         return (
-            "[Meta+Enter] or [Esc] [Enter] to submit | "
+            "[Meta+Enter] or [Esc] [Enter] to submit | [Shift+Left] threads | "
             f"[Shift+Tab] toggles YOLO ({yolo_status})"
             f"{plan_segment} | "
             "/help for commands"

@@ -468,6 +468,33 @@ body.resizing * { cursor: col-resize !important; user-select: none !important; }
 .nav-item:hover .u { opacity: 0.85; }
 .nav-item .u:hover { color: var(--text); }
 
+/* Sidebar session row actions: hidden until the row is hovered or receives
+   keyboard focus (.nav-item has tabindex="0"). Delete uses danger color. */
+.nav-item .row-actions {
+    margin-left: auto;
+    display: inline-flex;
+    gap: 2px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s;
+}
+.nav-item:hover .row-actions,
+.nav-item:focus-within .row-actions,
+.nav-item:focus .row-actions { opacity: 1; pointer-events: auto; }
+.nav-item .row-action {
+    border: 0;
+    background: transparent;
+    color: var(--text-dimmer);
+    font: inherit;
+    font-size: 11px;
+    padding: 2px 4px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.nav-item .row-action:hover { color: var(--text); background: var(--bg-hover); }
+.nav-item .row-action-danger:hover { color: var(--err); }
+.nav-item .row-action:disabled { opacity: 0.35; cursor: not-allowed; }
+
 .nav-item .prompt-badge {
     color: var(--accent);
     font-weight: 700;
@@ -518,6 +545,68 @@ body.resizing * { cursor: col-resize !important; user-select: none !important; }
     transition: color 0.12s, background 0.12s;
 }
 .nav-action:hover { color: var(--accent); background: var(--bg-hover); }
+
+.thread-status-dot {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 7px;
+    border-radius: 50%;
+    background: var(--text-dimmer);
+    margin-right: 8px;
+}
+.thread-status-dot.busy {
+    background: var(--accent);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 14%, transparent);
+    animation: dotPulse 1.4s ease-in-out infinite;
+}
+.thread-unread {
+    min-width: 18px;
+    padding: 2px 5px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font: 600 9px/1.2 var(--mono);
+    text-align: center;
+}
+.sidebar-other-sessions { margin-top: 18px; }
+.sidebar-new-session { width: 100%; text-align: left; border: 0; background: transparent; }
+
+.thread-panel-head,
+.thread-activity-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+}
+.thread-panel-head h2,
+.thread-activity-head h3 { margin: 0; }
+.thread-roster-panel { margin: 22px 0 30px; border-top: 1px solid var(--hairline); }
+.thread-roster-row {
+    width: 100%;
+    display: flex;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 12px 2px;
+    border: 0;
+    border-bottom: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--text);
+    text-align: left;
+}
+.thread-roster-row:hover,
+.thread-roster-row.active { background: var(--bg-hover); }
+.thread-roster-copy { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.thread-roster-copy strong { font-size: 12px; font-weight: 600; }
+.thread-roster-copy small { color: var(--text-dim); font-size: 10px; overflow-wrap: anywhere; }
+.thread-activity-head { align-items: baseline; margin-bottom: 10px; }
+.thread-activity-list { display: flex; flex-direction: column; }
+.thread-event { padding: 12px 2px; border-top: 1px solid var(--hairline); }
+.thread-event header { display: flex; gap: 5px; color: var(--text-dimmer); font: 9px/1.35 var(--mono); }
+.thread-event header time { margin-left: auto; }
+.thread-event > strong { display: block; margin-top: 5px; font-size: 11px; font-weight: 600; }
+.thread-event p { margin: 6px 0 0; font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.thread-event-thread_conflict,
+.thread-event-thread_claim_override { border-left: 2px solid var(--err); padding-left: 9px; }
 
 /* ------------------------------------------------------------ main + chat */
 

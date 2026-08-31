@@ -38,6 +38,7 @@ import { SecurityScreen } from '../screens/SecurityScreen';
 import { LoopScreen } from '../screens/LoopScreen';
 import { DebugScreen } from '../screens/DebugScreen';
 import { HistoryScreen } from '../screens/HistoryScreen';
+import { ThreadsScreen } from '../screens/ThreadsScreen';
 import { ShellScreen } from '../screens/ShellScreen';
 import { ArtifactsScreen } from '../screens/ArtifactsScreen';
 
@@ -55,6 +56,7 @@ export type RootStackParamList = {
   Loop: undefined;
   Debug: undefined;
   History: undefined;
+  Threads: undefined;
   SystemPrompts: undefined;
   Memory: undefined;
   Files: undefined;
@@ -84,6 +86,7 @@ const PANEL_SCREENS: {
   { name: 'Loop', title: 'Loop', component: LoopScreen },
   { name: 'Debug', title: 'Debug', component: DebugScreen },
   { name: 'History', title: 'History', component: HistoryScreen },
+  { name: 'Threads', title: 'Agent conversations', component: ThreadsScreen },
   { name: 'SystemPrompts', title: 'System prompts', component: SystemPromptsScreen },
   { name: 'Memory', title: 'Memory Center', component: MemoryScreen },
   { name: 'Files', title: 'Files', component: FilesScreen },
@@ -144,6 +147,7 @@ function ChatScreenWithChrome() {
           onOpenWork={() => isConnected ? navRef.current?.navigate('Work') : navRef.current?.navigate('Connection')}
           onOpenWorkspace={() => activeSessionName ? navRef.current?.navigate('Workspace') : openSessions()}
           onOpenTraces={() => activeSessionName ? navRef.current?.navigate('Traces') : openSessions()}
+          onOpenThreads={() => activeSessionName ? navRef.current?.navigate('Threads') : openSessions()}
           onOpenConnection={() => navRef.current?.navigate('Connection')}
           onOpenModes={() => activeSessionName ? navRef.current?.navigate('Modes') : openSessions()}
           onOpenProviders={() => navRef.current?.navigate('Providers')}

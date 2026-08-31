@@ -209,8 +209,14 @@ class SubagentUI:
     # -------------------------------------------------- interactive (YOLO)
 
     def request_tool_approval(self, **kwargs: Any):
-        # Subagents run with yolo=True, but the contract is still called
-        # in unusual error paths. Auto-approve.
+        if kwargs.get("approval_policy") == "always_human":
+            root = self._root()
+            if root is not None and hasattr(root, "request_tool_approval"):
+                return root.request_tool_approval(**kwargs)
+            # No human surface is attached; fail closed.
+            return "n", "Human approval is unavailable."
+        # Ordinary subagent writes remain covered by the spawn's YOLO
+        # authorization; only always-human tools escape this path.
         return "y", None
 
     def confirm(self, message: Any, default: bool = True) -> bool:

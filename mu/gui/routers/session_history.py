@@ -9,12 +9,14 @@ throwing away newer in-memory turns that have not yet reached disk.
 
 from __future__ import annotations
 
-import asyncio
 import os
+from functools import partial
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Query, Request
+
+from mu.gui.async_utils import run_sync_responsive
 
 from . import sessions as sessions_router
 from ._session_summary import read_session_summary
@@ -107,10 +109,12 @@ async def get_authoritative_history(
         # A saved session can be very large. Keep both the bounded summary scan
         # and the occasional full recovery decode off the ASGI event loop so a
         # history page never stalls SSE, interrupts, or the rest of the GUI.
-        saved_session = await asyncio.to_thread(
-            _saved_history_candidate,
-            session_name,
-            live_session,
+        saved_session = await run_sync_responsive(
+            partial(
+                _saved_history_candidate,
+                session_name,
+                live_session,
+            )
         )
         live_count = _history_length(live_session)
         saved_count = _history_length(saved_session)

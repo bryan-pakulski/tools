@@ -592,6 +592,7 @@ class ContainerSupervisor:
         model: str,
         agent_mode: str = "default",
         system_instruction: str = "You are a helpful assistant.",
+        origin: str = "user",
     ) -> dict[str, Any]:
         ref = self.container_for_session(session_name)
         if ref is None:
@@ -606,6 +607,7 @@ class ContainerSupervisor:
                 "model": model,
                 "agent_mode": agent_mode,
                 "system_instruction": system_instruction,
+                "origin": origin,
             },
         )
 
@@ -619,6 +621,7 @@ class ContainerSupervisor:
         agent_mode: str = "default",
         system_instruction: str = "You are a helpful assistant.",
         timeout: float | None = None,
+        origin: str = "user",
     ) -> dict[str, Any]:
         """Run one worker turn synchronously for terminal clients.
 
@@ -640,6 +643,7 @@ class ContainerSupervisor:
                     "model": model,
                     "agent_mode": agent_mode,
                     "system_instruction": system_instruction,
+                    "origin": origin,
                 },
                 headers={"X-MuCLI-Worker-Token": ref.worker_token},
             )

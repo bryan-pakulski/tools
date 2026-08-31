@@ -1940,6 +1940,7 @@ ${problem.text}`, "error", 14000);
                 Alpine.store("mode").load();
                 // Refresh model selector for the newly-focused session.
                 await Alpine.store("inspector").loadCurrentProvider();
+                await Alpine.store("threads").load(name);
                 return;
             }
             // Not loaded yet — POST /load (which is idempotent).
@@ -1962,6 +1963,7 @@ ${problem.text}`, "error", 16000);
             await Alpine.store("mode").load();
             // Refresh model selector for the newly-loaded session.
             await Alpine.store("inspector").loadCurrentProvider();
+            await Alpine.store("threads").load(name);
         },
         async remove(name) {
             const r = await fetch(`/api/sessions/${encodeURIComponent(name)}`, { method: "DELETE" });
@@ -1998,6 +2000,120 @@ ${problem.text}`, "error", 16000);
             }
             location.reload();
             return true;
+        },
+    });
+
+    Alpine.store("threads", {
+        groupId: null,
+        currentThreadId: null,
+        roster: [],
+        activity: [],
+        loading: false,
+        error: "",
+        lastEventId: 0,
+        get currentName() {
+            return Alpine.store("chat").currentName || Alpine.store("sessions").current;
+        },
+        statusClass(status) {
+            return ["running", "waiting_peer", "awaiting_approval"].includes(status)
+                ? "busy" : "";
+        },
+        get groupRoster() {
+            // Threads sidebar section = current session's thread-group roster
+            // ONLY. The /api/threads roster is the whole group (current thread
+            // included); singleton groups mean "no threads yet", so the
+            // session stays in the Sessions section instead of masquerading
+            // as a thread.
+            return this.roster || [];
+        },
+        async load(name = null) {
+            const target = name || this.currentName;
+            if (!target) return;
+            this.loading = true;
+            this.error = "";
+            try {
+                const params = new URLSearchParams({ session_name: target });
+                const r = await fetch("/api/threads?" + params.toString(), { cache: "no-store" });
+                const d = await r.json();
+                if (!r.ok) throw new Error(d.detail || `thread load failed (${r.status})`);
+                this.groupId = d.thread_group_id;
+                this.currentThreadId = d.current_thread_id;
+                this.roster = d.threads || [];
+                await this.loadActivity(true);
+            } catch (e) {
+                this.error = String(e || "thread load failed");
+            } finally {
+                this.loading = false;
+            }
+        },
+        async loadActivity(reset = false) {
+            const target = this.currentName;
+            if (!target) return;
+            const params = new URLSearchParams({
+                session_name: target,
+                after_id: reset ? "0" : String(this.lastEventId || 0),
+                limit: "300",
+            });
+            try {
+                const r = await fetch("/api/threads/activity?" + params.toString(), { cache: "no-store" });
+                const d = await r.json();
+                if (!r.ok) throw new Error(d.detail || `activity load failed (${r.status})`);
+                const events = d.events || [];
+                this.activity = reset ? events : this.activity.concat(events).slice(-500);
+                this.lastEventId = Number(d.last_event_id || this.lastEventId || 0);
+            } catch (e) {
+                this.error = String(e || "activity load failed");
+            }
+        },
+        async create() {
+            const title = window.prompt("New thread title", "New thread");
+            if (title == null || !title.trim()) return;
+            try {
+                const r = await fetch("/api/threads", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        parent_session_name: this.currentName,
+                        title: title.trim(),
+                        activate: true,
+                    }),
+                });
+                const d = await r.json();
+                if (!r.ok) throw new Error(d.detail || `thread create failed (${r.status})`);
+                await Alpine.store("sessions").load();
+                await Alpine.store("sessions").switchTo(d.session_name);
+                await this.load(d.session_name);
+                Alpine.store("toast").show(`Thread '${title.trim()}' created`, "success");
+            } catch (e) {
+                Alpine.store("toast").show(String(e || "thread create failed"), "error", 9000);
+            }
+        },
+        async switchTo(thread) {
+            if (!thread || !thread.session_name) return;
+            await Alpine.store("sessions").switchTo(thread.session_name);
+            await this.load(thread.session_name);
+        },
+        async remove(thread) {
+            if (!thread || !thread.thread_id) return;
+            try {
+                const params = new URLSearchParams({
+                    session_name: this.currentName || "",
+                });
+                const r = await fetch(
+                    `/api/threads/${encodeURIComponent(thread.thread_id)}?${params.toString()}`,
+                    { method: "DELETE", cache: "no-store" },
+                );
+                const d = await r.json().catch(() => ({}));
+                if (!r.ok) throw new Error(d.detail || `thread delete failed (${r.status})`);
+                Alpine.store("toast").show(
+                    `Thread '${thread.title || thread.session_name}' deleted`,
+                    "success",
+                );
+                await Alpine.store("sessions").load();
+                await this.load(this.currentName);
+            } catch (e) {
+                Alpine.store("toast").show(String(e || "thread delete failed"), "error", 9000);
+            }
         },
     });
 
@@ -2557,7 +2673,7 @@ ${problem.text}`, "error", 16000);
         views: [],
         sessionType: "workspace",
         hasExecutionWorkspace: false,
-        panelModes: ["teacher", "feature", "research", "security", "loop", "debug", "history", "systemPrompts", "memory", "files", "artifacts", "shell"],
+        panelModes: ["teacher", "feature", "research", "security", "loop", "debug", "threads", "history", "systemPrompts", "memory", "files", "artifacts", "shell"],
         async load() {
             const r = await fetch("/api/modes");
             const data = await r.json();
@@ -6320,6 +6436,17 @@ function routeEvent(ev) {
             }
             break;
         }
+        case "thread_message":
+        case "thread_status":
+        case "thread_claim":
+        case "thread_claim_released":
+        case "thread_claim_handoff":
+        case "thread_conflict":
+        case "thread_claim_override":
+        case "thread_created":
+        case "thread_wake_started":
+            Alpine.store("threads").load();
+            break;
         case "mode_changed": {
             if (isFocused) {
                 const mode = Alpine.store("mode");
@@ -6952,6 +7079,7 @@ document.addEventListener("DOMContentLoaded", () => {
     bootSSE();
     Alpine.store("chat").loadHistory();
     Alpine.store("sessions").load();
+    Alpine.store("threads").load();
     Alpine.store("tts").load();
     Alpine.store("stt").load();
     // mode.load() preloads the active mode's panel store via panelModes —
@@ -6967,6 +7095,7 @@ document.addEventListener("DOMContentLoaded", () => {
     Alpine.store("cmdComplete").load();
     Alpine.store("inspector").loadProviders();
     setInterval(() => Alpine.store("sessions").load(), 5000);
+    setInterval(() => Alpine.store("threads").load(), 3000);
     setInterval(() => Alpine.store("loop").load(), 5000);
     // Live clock: bump while ANY session's turn is in flight so the
     // running trace header re-renders its elapsed time. (One global tick

@@ -1426,6 +1426,13 @@ def load_tools(args: Dict[str, Any], context) -> str:
     loaded = set(getattr(session, "_loaded_tool_phases", []) or [])
     loaded.add(phase)
     session._loaded_tool_phases = sorted(loaded)
+    from mu.tools.descriptors import resolve_active_tool_phases
+
+    effective_phases = resolve_active_tool_phases(
+        getattr(session, "variables", None),
+        session._loaded_tool_phases,
+    )
+    session._active_tool_phases = tuple(effective_phases)
     # Count how many tools are now newly exposed in this phase.
     try:
         from mu.tools.descriptors import TOOL_DESCRIPTORS
@@ -1438,5 +1445,5 @@ def load_tools(args: Dict[str, Any], context) -> str:
     return (
         f"Activated tool phase '{phase}'. {count} tool(s) tagged with that "
         f"phase will appear in the next request's schema. Active phases: "
-        f"{', '.join(sorted(loaded))}."
+        f"{', '.join(effective_phases)}."
     )

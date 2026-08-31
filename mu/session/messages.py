@@ -60,6 +60,45 @@ def _compact_tool_result_ref(part: dict) -> str:
     return f"← tool call - name: {name}, result: {result_state}, ref: {cache_key}"
 
 
+def _lean_tool_result(tool_result: Any) -> Any:
+    """Collapse a structured tool-result dict for provider serialization.
+
+    In-history structured envelopes carry duplicated content: ``summary``
+    (a 220-char echo of ``raw``), ``error.message`` (an echo of raw),
+    ``data.preview`` (a 240-char echo for read/get_chunk), the full
+    ``telemetry.tool_envelope`` copy, and boolean bookkeeping flags. When
+    the verbatim result ships in L5, all of that rides along on top of
+    ``raw`` — pure duplication.
+
+    This keeps the substance: ``ok``/``error_code``, the full ``raw``,
+    per-tool structured ``data`` (minus preview/omitted flags), typed
+    ``artifacts``, and compact telemetry counts. The original envelope in
+    history is untouched — this applies only at serialization time, so
+    GUI/metrics/state-capsule views keep their full fidelity.
+    """
+    if not isinstance(tool_result, dict) or "raw" not in tool_result:
+        return tool_result
+    lean: dict = {"ok": bool(tool_result.get("ok"))}
+    if tool_result.get("error_code"):
+        lean["error_code"] = tool_result["error_code"]
+    raw = tool_result.get("raw")
+    if raw is not None:
+        lean["raw"] = raw
+    data = tool_result.get("data")
+    if isinstance(data, dict):
+        data = {
+            k: v for k, v in data.items()
+            if k not in ("preview", "omitted", "stored_ref", "retrievable_via", "omission_note")
+        }
+        if data:
+            lean["data"] = data
+    if tool_result.get("artifacts"):
+        lean["artifacts"] = tool_result["artifacts"]
+    if tool_result.get("modified_files"):
+        lean["modified_files"] = tool_result["modified_files"]
+    return lean
+
+
 def build_messages_from_history(
     recent_history_dicts: List[dict],
     new_user_message_dict: dict,
@@ -172,7 +211,9 @@ def build_messages_from_history(
                         MessagePart(
                             type="tool_result",
                             tool_name=p.get("tool_name", "tool"),
-                            tool_result=p.get("tool_result", ""),
+                            tool_result=_lean_tool_result(
+                                p.get("tool_result", "")
+                            ),
                             thought_signature=p.get("thought_signature"),
                         )
                     )

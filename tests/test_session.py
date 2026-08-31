@@ -705,12 +705,14 @@ def test_send_message_feature_mode_injects_phased_plan_guidance(tmp_path):
             super().__init__("dummy")
             self.last_user_text = ""
             self.last_system_prompt = ""
+            self.last_tools = []
 
         def get_available_models(self):
             return ["dummy"]
 
         def generate(self, messages, system_prompt=None, thinking=False, tools=None):
             self.last_system_prompt = system_prompt or ""
+            self.last_tools = list(tools or [])
             for message in reversed(messages):
                 if message.role == "user":
                     for part in message.parts:
@@ -730,11 +732,13 @@ def test_send_message_feature_mode_injects_phased_plan_guidance(tmp_path):
             return None
 
     provider = CaptureProvider()
-    sm = SessionManager(session_name="feature-mode-prompt")
+    sm = SessionManager()
     session = Session(provider, False, "system instruction", sm)
     session.folder_context.add_folder(str(tmp_path))
     session.sync_runtime_state()
     session.variables["agent_mode"] = "feature"
+    session.variables["lazy_tools_enabled"] = True
+    session.variables["active_tool_phases"] = ["core"]
 
     session.send_message("Implement an approvals dashboard")
 
@@ -763,7 +767,55 @@ def test_send_message_feature_mode_injects_phased_plan_guidance(tmp_path):
     assert "gather read-only context first" in provider.last_system_prompt
     assert "Do not stall on status-only updates" in provider.last_system_prompt
     assert "until all phases and tasks are completed" in provider.last_system_prompt
+    assert "### ACTIVE TOOL REGISTRIES" in provider.last_system_prompt
+    assert "core, feature" in provider.last_system_prompt
+    assert "create_feature" in {tool.name for tool in provider.last_tools}
+    assert "get_execution_state" in {tool.name for tool in provider.last_tools}
     assert provider.last_user_text.endswith("Implement an approvals dashboard")
+
+
+@pytest.mark.parametrize(
+    ("mode", "representative_tool"),
+    [
+        ("research", "web_search"),
+        ("security", "create_security_report"),
+        ("teacher", "create_course"),
+    ],
+)
+def test_strategy_modes_expose_their_tool_registry_to_provider(
+    tmp_path, mode, representative_tool
+):
+    class CaptureProvider(DummyProvider):
+        def __init__(self):
+            super().__init__("dummy")
+            self.last_tools = []
+            self.last_system_prompt = ""
+
+        def generate(self, messages, system_prompt=None, thinking=False, tools=None):
+            self.last_tools = list(tools or [])
+            self.last_system_prompt = system_prompt or ""
+            return ProviderResponse(
+                text="done",
+                parts=[MessagePart(type="text", text="done")],
+                input_tokens=1,
+                output_tokens=1,
+                total_tokens=2,
+            )
+
+    provider = CaptureProvider()
+    sm = SessionManager()
+    session = Session(provider, False, "system instruction", sm)
+    session.folder_context.add_folder(str(tmp_path))
+    session.sync_runtime_state()
+    session.variables["agent_mode"] = mode
+    session.variables["lazy_tools_enabled"] = True
+    session.variables["active_tool_phases"] = ["core"]
+
+    session.send_message(f"Run in {mode} mode")
+
+    assert representative_tool in {tool.name for tool in provider.last_tools}
+    assert f"core, {mode}" in provider.last_system_prompt
+    assert session._active_tool_phases == ("core", mode)
 
 
 def test_feature_mode_blocks_direct_feature_plan_access(tmp_path, monkeypatch):
@@ -1341,3 +1393,72 @@ def test_session_manager_can_rename_session(tmp_path, monkeypatch):
     sessions = sm.get_session_list()
     assert "rename-src" not in sessions
     assert "renamed-session" in sessions
+
+
+def test_build_messages_strips_duplicate_envelope_echoes():
+    """In-floor structured tool results must not echo content twice.
+
+    The verbatim envelope carries `summary` (echo of raw), `data.preview`
+    (echo of raw), and a full `telemetry.tool_envelope` copy. Provider
+    serialization keeps `ok`/`error_code`/`raw`/`data` substance and drops
+    the echoes.
+    """
+    sm = SessionManager()
+    session = Session(DummyProvider("dummy"), False, "system instruction", sm)
+
+    structured = {
+        "ok": True,
+        "error_code": None,
+        "message": "ok",
+        "raw": "line one\nline two\nline three",
+        "summary": "line one\nline two\nline three",
+        "data": {
+            "preview": "line one\nline two",
+            "line_count": 3,
+            "omitted": False,
+            "stored_ref": "abc123",
+        },
+        "artifacts": [],
+        "telemetry": {
+            "tool_name": "get_chunk",
+            "tool_envelope": {"message": "duplicated echo", "raw": "huge"},
+        },
+    }
+    history_dicts = [
+        {
+            "role": "tool",
+            "parts": [
+                {
+                    "type": "tool_result",
+                    "tool_name": "get_chunk",
+                    "tool_result": structured,
+                    "cache_key": "k1",
+                }
+            ],
+        }
+    ]
+    new_user_msg = {"role": "user", "parts": [{"type": "text", "text": "hi"}]}
+
+    messages = session._build_messages_from_history(history_dicts, new_user_msg)
+
+    result = messages[0].parts[0].tool_result
+    assert isinstance(result, dict)
+    assert result["ok"] is True
+    assert result["raw"] == "line one\nline two\nline three"
+    assert result["data"] == {"line_count": 3}
+    # Echoes gone.
+    assert "summary" not in result
+    assert "message" not in result
+    assert "preview" not in result["data"]
+    assert "telemetry" not in result
+    # Plain-string and non-envelope dict results pass through untouched.
+    plain_history = [
+        {
+            "role": "tool",
+            "parts": [
+                {"type": "tool_result", "tool_name": "t", "tool_result": "plain"}
+            ],
+        }
+    ]
+    plain_msgs = session._build_messages_from_history(plain_history, new_user_msg)
+    assert plain_msgs[0].parts[0].tool_result == "plain"

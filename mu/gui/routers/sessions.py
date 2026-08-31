@@ -13,6 +13,7 @@ import re
 import shutil
 import tempfile
 import time
+from functools import partial
 from typing import Any, Dict, Optional
 
 from mu.artifact import ArtifactRegistry
@@ -25,8 +26,10 @@ from mu.agent.subagent_artifacts import SubagentArtifactStore
 from mu.container.docker_cli import ContainerRuntimeError
 from mu.container.load_errors import describe_container_load_error
 from mu.container.network import DEFAULT_EGRESS_ALLOW
+from mu.gui.async_utils import run_sync_responsive
 from mu.tools.capabilities import normalize_session_type
 from mu.gui.routers._session_summary import read_session_summary
+from mu.threads.model import ensure_thread_meta
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.params import Header as HeaderParam
@@ -490,6 +493,7 @@ def _summarize(
     data = read_session_summary(path)
     variables = data.get("variables") or {}
     container_config = data.get("container_config") or {}
+    thread_meta = ensure_thread_meta(name, data.get("thread_meta"))
     try:
         revision = int(data.get("revision", 0) or 0)
     except (TypeError, ValueError):
@@ -520,6 +524,9 @@ def _summarize(
         "modified_unix": mtime,
         "session_type": normalize_session_type(variables.get("session_type")),
         "container_name": container_config.get("container_name"),
+        "thread_id": thread_meta.thread_id,
+        "thread_group_id": thread_meta.group_id,
+        "thread_title": thread_meta.title,
     }
 
 
@@ -599,6 +606,89 @@ def _read_session_data(name: str) -> Dict[str, Any] | None:
     except (OSError, ValueError):
         return None
 
+
+
+def _iter_thread_group_dbs() -> list[str]:
+    """All coordination DBs across every thread group (deletion cleanup)."""
+    return sorted(
+        glob.glob(
+            os.path.join(
+                str(_config.HISTORY_DIR),
+                "thread-groups",
+                "tg-*",
+                "coordination.sqlite3",
+            )
+        )
+    )
+
+
+def _thread_row_for_session(name: str) -> str | None:
+    """Return the thread_id registered for ``name`` in ANY group, else None."""
+    import sqlite3 as _sqlite3
+
+    for db_path in _iter_thread_group_dbs():
+        try:
+            conn = _sqlite3.connect(db_path, timeout=5.0)
+            try:
+                row = conn.execute(
+                    "SELECT thread_id FROM threads WHERE session_name=?", (name,)
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is not None:
+                return str(row[0])
+        except Exception:
+            continue
+    return None
+
+
+def _provider_from_thread_group(name: str) -> Dict[str, Any] | None:
+    """Resolve provider/model for a providerless thread from its group peers.
+
+    Old thread sessions can predate provider_config inheritance; a group
+    member without its own provider falls back to the first sibling with a
+    saved provider so old threads reload after refresh instead of 400-ing.
+    """
+    import sqlite3 as _sqlite3
+
+    for db_path in _iter_thread_group_dbs():
+        try:
+            group_id = os.path.basename(os.path.dirname(db_path))
+            try:
+                conn = _sqlite3.connect(db_path, timeout=5.0)
+                try:
+                    row = conn.execute(
+                        "SELECT 1 FROM threads WHERE session_name=?", (name,)
+                    ).fetchone()
+                finally:
+                    conn.close()
+            except Exception:
+                continue
+            if row is None:
+                continue
+            siblings = []
+            conn2 = _sqlite3.connect(db_path, timeout=5.0)
+            try:
+                siblings = [
+                    str(r[0])
+                    for r in conn2.execute(
+                        "SELECT session_name FROM threads WHERE session_name<>?",
+                        (name,),
+                    )
+                ]
+            finally:
+                conn2.close()
+            for sibling in siblings:
+                data = _read_session_data(sibling)
+                if not isinstance(data, dict):
+                    continue
+                saved = data.get("provider_config") or {}
+                if saved.get("provider") and saved.get("model"):
+                    return {"provider": saved["provider"], "model": saved["model"]}
+            break  # found the group; no sibling had a provider
+        except Exception:
+            continue
+    return None
 
 
 def _normalize_workspace_paths(values: Any) -> list[str]:
@@ -949,18 +1039,20 @@ async def get_history(
     # artifact matching, JSON conversion, and preview construction. Keep it
     # off the ASGI event loop so SSE heartbeats/deltas, interrupts, and other
     # UI actions remain serviceable while a large session page is prepared.
-    return await asyncio.to_thread(
-        _get_history_sync,
-        request,
-        session_name=session_name,
-        limit_turns=limit_turns,
-        artifact_limit=artifact_limit,
-        before_index=before_index,
-        after_index=after_index,
-        checkpoint_count=(
-            checkpoint_count if isinstance(checkpoint_count, int) else None
-        ),
-        full=full,
+    return await run_sync_responsive(
+        partial(
+            _get_history_sync,
+            request,
+            session_name=session_name,
+            limit_turns=limit_turns,
+            artifact_limit=artifact_limit,
+            before_index=before_index,
+            after_index=after_index,
+            checkpoint_count=(
+                checkpoint_count if isinstance(checkpoint_count, int) else None
+            ),
+            full=full,
+        )
     )
 
 
@@ -1514,6 +1606,7 @@ async def create_session(request: Request, payload: Dict[str, Any]):
         "history": [],
         "provider_config": {"provider": provider, "model": model},
         "variables": variables,
+        "thread_meta": ensure_thread_meta(name).to_dict(),
     }
     if workspace and session_type == "workspace":
         data["folder_context"] = {"folders": [workspace]}
@@ -1743,18 +1836,44 @@ async def load_session(
         }
 
     existing = _read_session_data(name)
+    # Threads load-resilience (bug 1): a registered thread whose session dir
+    # is gone is an orphan — 404 with actionable detail instead of the
+    # misleading "provider and model are required to create it" creation hint.
     if existing is None and (not provider or not model):
-        raise HTTPException(
-            status_code=400,
-            detail="Session does not exist; provider and model are required to create it.",
-        )
+        if _thread_row_for_session(name) is not None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Thread session '{name}' is orphaned — its data was "
+                    "deleted. Remove it from the threads panel."
+                ),
+            )
+        # Group-cohesion fallback (bug 1 part 2): a thread whose session.json
+        # exists but predates provider inheritance can still resolve its
+        # provider from another member of its thread group.
+        inherited = _provider_from_thread_group(name)
+        if inherited:
+            existing = {
+                "provider_config": dict(inherited),
+                "thread_inherited_provider": True,
+            }
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Session does not exist; provider and model are required to create it.",
+            )
     if existing is not None:
         saved = existing.get("provider_config") or {}
         if not (provider and model) and not (saved.get("provider") and saved.get("model")):
-            raise HTTPException(
-                status_code=400,
-                detail="Session has no saved provider; supply provider and model.",
-            )
+            # Same group fallback for on-disk-but-providerless thread sessions.
+            inherited = _provider_from_thread_group(name)
+            if inherited:
+                saved = dict(inherited)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Session has no saved provider; supply provider and model.",
+                )
         provider = provider or saved.get("provider")
         model = model or saved.get("model")
 
@@ -1957,6 +2076,42 @@ async def delete_session(
             # while it persists).
             try:
                 shutil.rmtree(session_dir)
+                # Threads parity: if the deleted session was a member of a
+                # thread group, drop its coordination row now — otherwise the
+                # group roster keeps a ghost row pointing at a deleted session
+                # (surfaced later as 'unknown thread' errors on delete).
+                try:
+                    from mu.threads.coordinator import ThreadCoordinator as _TC
+
+                    group_dbs = glob.glob(
+                        os.path.join(
+                            str(_config.HISTORY_DIR),
+                            "thread-groups",
+                            "tg-*",
+                            "coordination.sqlite3",
+                        )
+                    )
+                    import sqlite3 as _sqlite3
+
+                    for db_path in group_dbs:
+                        try:
+                            conn = _sqlite3.connect(db_path, timeout=5.0)
+                            try:
+                                row = conn.execute(
+                                    "SELECT thread_id FROM threads WHERE session_name=?",
+                                    (name,),
+                                ).fetchone()
+                            finally:
+                                conn.close()
+                            if row is None:
+                                continue
+                            group_id = os.path.basename(os.path.dirname(db_path))
+                            coord = _TC(group_id)
+                            coord.delete_thread(str(row[0]), force=True)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
             except OSError as exc:
                 raise HTTPException(
                     status_code=500,

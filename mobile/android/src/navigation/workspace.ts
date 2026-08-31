@@ -13,6 +13,7 @@ export type WorkspaceScreenName =
   | 'Skills'
   | 'SystemPrompts'
   | 'History'
+  | 'Threads'
   | 'Prompts'
   | 'Traces'
   | 'Audio'
@@ -71,6 +72,7 @@ export const WORKSPACE_CATEGORIES: readonly WorkspaceCategory[] = [
     description: 'See decisions, activity, and pending input.',
     icon: 'pulse-outline',
     items: [
+      { screen: 'Threads', title: 'Agent threads', description: 'Review peer conversations, ownership, and coordination activity.', icon: 'git-branch-outline' },
       { screen: 'History', title: 'History', description: 'Review earlier conversation turns.', icon: 'time-outline' },
       { screen: 'Prompts', title: 'Pending prompts', description: 'Answer requests waiting for your input.', icon: 'chatbox-ellipses-outline' },
       { screen: 'Traces', title: 'Traces', description: 'Inspect run telemetry and context growth.', icon: 'analytics-outline' },

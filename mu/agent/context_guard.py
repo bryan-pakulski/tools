@@ -186,11 +186,69 @@ def _preflight_context_check(
         resolve_tool_result_floor,
     )
 
-    # Use the drift-corrected limit so the last-line proactive defense fires
-    # at the right point once real-token drift has been learned (see
-    # budgets.effective_drift_ratio). Falls back to resolve_context_limit's
-    # static safety factor when no drift has been observed yet.
-    context_limit = drift_corrected_context_limit(session)
+    # Round-51 T1: resolve-guarded effective limit. The drift-corrected
+    # limit is re-derived every iteration; a >5% rise vs the previously
+    # observed value means the guard ceiling moved (e.g. learned drift
+    # ratcheted down or the provider window resolved late). Re-resolve once
+    # and use the stable value so the budget decision is not made against
+    # an estimate that changed mid-flight, then track it on the session
+    # for run-start comparability.
+    _candidate_limit = drift_corrected_context_limit(session)
+    _prev_limit = getattr(session, "_last_effective_limit", None)
+    if (
+        isinstance(_prev_limit, int)
+        and _prev_limit > 0
+        and _candidate_limit > _prev_limit * 1.05
+    ):
+        logger.warning(
+            "Context governance: effective guard limit rose %d -> %d; "
+            "re-resolving once for a stable budget.",
+            _prev_limit, _candidate_limit,
+        )
+        try:
+            _recheck = drift_corrected_context_limit(session)
+            context_limit = int(_recheck) if _recheck else int(_candidate_limit)
+        except Exception:
+            context_limit = int(_candidate_limit)
+    else:
+        context_limit = int(_candidate_limit)
+    try:
+        session._last_effective_limit = int(context_limit)
+    except Exception:
+        pass
+    # Round-51 T1: divergence telemetry — configured (user-visible)
+    # context_token_limit vs the guard-effective limit. Recorded on the
+    # session every iteration; warned once per run. This is the seam the
+    # trace emitter reads so the run_start header can carry both limits.
+    try:
+        _configured = int(session.variables.get("context_token_limit", 0) or 0)
+        if _configured > 0 and context_limit > 0:
+            _delta_pct = (context_limit - _configured) / float(_configured) * 100.0
+            if abs(_delta_pct) > 5.0:
+                session._context_limit_divergence = {
+                    "configured_limit": _configured,
+                    "effective_limit": int(context_limit),
+                    "delta_pct": round(_delta_pct, 2),
+                }
+                if not getattr(session, "_context_limit_divergence_warned", False):
+                    session._context_limit_divergence_warned = True
+                    logger.warning(
+                        "Context governance divergence: configured "
+                        "context_token_limit=%d but drift-corrected effective "
+                        "guard limit is %d (%+.1f%%); the guard value "
+                        "governs compaction.",
+                        _configured, context_limit, _delta_pct,
+                    )
+                    if session.ui and hasattr(session.ui, "show_info"):
+                        try:
+                            session.ui.show_info(
+                                f"Context limit divergence: configured {_configured}, "
+                                f"effective guard {context_limit} ({_delta_pct:+.1f}%)."
+                            )
+                        except Exception:
+                            pass
+    except Exception:
+        pass
     response_reserve = resolve_response_reserve(session)
     max_prompt = context_limit - response_reserve
 

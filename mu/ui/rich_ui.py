@@ -229,14 +229,16 @@ class RichUI:
         modifications=None,
         preview_error=None,
         error_code=None,
+        approval_policy="default",
         prompt_text,
         choices,
         default,
     ):
         self.console.print(prompt_text)
-        self.console.print(
-            "[dim]Tip: press Shift+Tab here to toggle YOLO for this and subsequent approvals in the current loop.[/dim]"
-        )
+        if approval_policy != "always_human":
+            self.console.print(
+                "[dim]Tip: press Shift+Tab here to toggle YOLO for this and subsequent approvals in the current loop.[/dim]"
+            )
         choice = self.input_handler.prompt_choice(
             "Approval choice",
             choices=choices,
@@ -1029,4 +1031,3 @@ class _GenerationLive:
             spinner = Spinner("dots", text=Text(f" {self._status_message}", style="dim"))
             parts.append(spinner)
         return Group(*parts) if parts else Text("")
-

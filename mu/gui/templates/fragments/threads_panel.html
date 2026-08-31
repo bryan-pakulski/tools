@@ -1,0 +1,55 @@
+<aside class="mode-panel thread-panel"
+       data-mode="threads"
+       x-show="$store.mode.active === 'threads'"
+       x-transition.opacity.duration.200ms>
+    <div class="thread-panel-head">
+        <div>
+            <p class="eyebrow">thread group</p>
+            <h2>Coordination</h2>
+        </div>
+        <button class="history-search-btn" @click="$store.threads.load()">refresh</button>
+    </div>
+    <p class="muted mono" x-text="$store.threads.groupId || 'loading…'"></p>
+    <p class="history-error err-text" x-show="$store.threads.error" x-text="$store.threads.error"></p>
+
+    <section class="thread-roster-panel">
+        <template x-for="thread in $store.threads.roster" :key="thread.thread_id">
+            <button class="thread-roster-row"
+                    :class="{ active: thread.thread_id === $store.threads.currentThreadId }"
+                    @click="$store.threads.switchTo(thread)">
+                <span class="thread-status-dot" :class="$store.threads.statusClass(thread.status)"></span>
+                <span class="thread-roster-copy">
+                    <strong x-text="thread.title || thread.session_name"></strong>
+                    <small x-text="thread.status + (thread.current_goal ? ' · ' + thread.current_goal : '')"></small>
+                    <small x-show="thread.claimed_paths && thread.claimed_paths.length"
+                           x-text="'owns ' + thread.claimed_paths.join(', ')"></small>
+                </span>
+                <span class="thread-unread" x-show="thread.unread_count" x-text="thread.unread_count"></span>
+            </button>
+        </template>
+    </section>
+
+    <div class="thread-activity-head">
+        <h3>Agent conversations</h3>
+        <span class="muted mono" x-text="$store.threads.activity.length + ' events'"></span>
+    </div>
+    <div class="thread-activity-list">
+        <template x-for="event in $store.threads.activity.slice().reverse()" :key="event.event_id">
+            <article class="thread-event" :class="'thread-event-' + event.kind">
+                <header>
+                    <span x-text="event.actor_title || event.actor_thread_id || 'system'"></span>
+                    <span>→</span>
+                    <span x-text="event.target_title || event.target_thread_id || 'group'"></span>
+                    <time x-text="new Date(event.created_at * 1000).toLocaleTimeString()"></time>
+                </header>
+                <strong x-text="event.kind.replaceAll('_', ' ')"></strong>
+                <p x-show="event.payload && event.payload.content" x-text="event.payload && event.payload.content"></p>
+                <p class="muted mono" x-show="event.payload && event.payload.path" x-text="event.payload && event.payload.path"></p>
+            </article>
+        </template>
+        <div class="panel-empty" x-show="!$store.threads.loading && !$store.threads.activity.length">
+            <h3>no coordination yet</h3>
+            <p class="muted">Peer messages, path claims, conflicts, handoffs and wake-ups appear here.</p>
+        </div>
+    </div>
+</aside>

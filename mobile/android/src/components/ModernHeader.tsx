@@ -14,6 +14,7 @@ export type ModernHeaderProps = {
   onOpenWork: () => void;
   onOpenWorkspace: () => void;
   onOpenTraces: () => void;
+  onOpenThreads: () => void;
   onOpenConnection: () => void;
   onOpenModes: () => void;
   onOpenProviders: () => void;
@@ -26,6 +27,7 @@ export function ModernHeader({
   onOpenWork,
   onOpenWorkspace,
   onOpenTraces,
+  onOpenThreads,
   onOpenConnection,
   onOpenModes,
   onOpenProviders,
@@ -201,6 +203,12 @@ export function ModernHeader({
 
         <SettingsSection title="Session">
           <MenuRow icon="options-outline" label="Mode" detail="Choose the active agent strategy" onPress={() => openFromMenu(onOpenModes)} />
+          <MenuRow
+            icon="git-branch-outline"
+            label="Agent threads"
+            detail={activeSessionName ? 'Switch conversations and review coordination activity' : 'Load a session to see its threads'}
+            onPress={() => openFromMenu(onOpenThreads)}
+          />
           <MenuRow icon="server-outline" label="Provider and model" detail={[activeProvider, activeModel].filter(Boolean).join(' · ') || 'Not selected'} onPress={() => openFromMenu(onOpenProviders)} />
           <MenuRow icon="wifi-outline" label="Connection" detail={isConnected ? 'Connected to MuCLI' : 'Not connected'} onPress={() => openFromMenu(onOpenConnection)} />
           <MenuRow

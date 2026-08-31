@@ -50,6 +50,8 @@ def infer_tool_error_code(tool_name: str, result: Any) -> Optional[str]:
         return "unsupported"
     if "unknown tool" in lowered or "tool_name missing" in lowered:
         return "not_found"
+    if "does not exist" in lowered or "no such file" in lowered:
+        return "not_found"
     if "field '" in lowered and "required" in lowered:
         return "invalid_args"
     if "argument is empty" in lowered or "must be a list" in lowered:

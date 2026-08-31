@@ -18,6 +18,7 @@ from .loop import AgentLoop, TurnResult
 from . import compactor  # noqa: F401 — auto_compact_pre_call
 from . import plan_mode  # noqa: F401 — plan_mode pre_tool guard
 from . import secret_guard  # noqa: F401 — bash secret-path pre_tool guard
+from . import thread_guard  # noqa: F401 — peer path ownership guard
 from . import usage_tracker  # noqa: F401 — per-session usage counters
 
 __all__ = ["AgentLoop", "HookRegistry", "HookSpec", "TurnResult", "default_registry"]

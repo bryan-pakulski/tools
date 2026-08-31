@@ -301,8 +301,21 @@ class WorkerBridgeUI(BaseUI):
     def set_variables(self, variables_dict):
         self.variables = dict(variables_dict or {})
 
-    # Container sessions auto-approve modifying tools by design.
-    def request_tool_approval(self, *_args, **_kwargs):
+    # Container sessions auto-approve normal modifying tools by design.
+    # Claim overrides are the exception: peer work can be overwritten, so
+    # this policy must reach the human supervisor even in a YOLO container.
+    def request_tool_approval(self, *_args, **kwargs):
+        if kwargs.get("approval_policy") == "always_human":
+            return self._ask_prompt(
+                {
+                    "shape": "tool_approval",
+                    "tool_name": kwargs.get("tool_name"),
+                    "tool_args": kwargs.get("tool_args")
+                    or kwargs.get("display_args")
+                    or {},
+                    "approval_policy": "always_human",
+                }
+            )
         return {"approved": True, "remember": True}
 
     def _ask_prompt(self, prompt: dict[str, Any], timeout: float = 600.0) -> Any:
@@ -399,6 +412,7 @@ class SendRequest(BaseModel):
     model: str
     agent_mode: str = "default"
     system_instruction: str = "You are a helpful assistant."
+    origin: str = "user"
 
 
 class RuntimeRequest(BaseModel):
@@ -632,7 +646,7 @@ def _run_turn(session, request: SendRequest) -> None:
     _threads[name] = threading.current_thread().ident or 0
     try:
         with _locks[name]:
-            result = session.send_message(request.text)
+            result = session.send_message(request.text, origin=request.origin)
             # Round-18 F29: CAS the turn save — a host GUI write between
             # our load and here must not be silently clobbered.
             try:
@@ -747,7 +761,7 @@ def send_sync(request: SendRequest, x_mucli_worker_token: str | None = Header(de
     start_index = len(session.session_manager.history)
     try:
         with _locks[name]:
-            result = session.send_message(request.text)
+            result = session.send_message(request.text, origin=request.origin)
             # Round-18 F29: CAS the turn save — a host GUI write between
             # our load and here must not be silently clobbered.
             try:

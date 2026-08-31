@@ -44,6 +44,8 @@ class ToolDescriptor:
     # Default "core" so untagged tools stay visible under the phase filter.
     phase: str = "core"
     group: str = ""
+    # "always_human" cannot be bypassed by YOLO/container automation.
+    approval_policy: str = "default"
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,7 @@ def _build_descriptor(
     summary_builder: str | None = None,
     phase: str = "core",
     group: str = "",
+    approval_policy: str = "default",
 ) -> ToolDescriptor:
     return ToolDescriptor(
         definition=definition,
@@ -79,6 +82,7 @@ def _build_descriptor(
         summary_builder=summary_builder,
         phase=phase,
         group=group,
+        approval_policy=approval_policy,
     )
 
 
@@ -127,6 +131,46 @@ def filter_tools_by_phase(tools, active_phases) -> list:
         return out
     except Exception:  # noqa: BLE001
         return list(tools)
+
+
+def resolve_active_tool_phases(
+    variables: dict | None,
+    loaded_phases: list[str] | set[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    """Return effective lazy-tool phases for one provider request.
+
+    Explicit ``active_tool_phases`` and phases activated through ``load_tools``
+    remain additive.  A strategy mode's declared ``tool_phases`` are always
+    included, so selecting feature/research/security/teacher mode cannot leave
+    its engine absent from the provider schema.
+    """
+    values = variables or {}
+    phases = {
+        str(phase).strip().lower()
+        for phase in (values.get("active_tool_phases") or ["core"])
+        if str(phase).strip()
+    }
+    phases.update(
+        str(phase).strip().lower()
+        for phase in (loaded_phases or [])
+        if str(phase).strip()
+    )
+    phases.add("core")
+
+    mode = str(values.get("agent_mode", "default") or "default").strip().lower()
+    try:
+        from utils.config import AGENT_MODE_METADATA
+
+        metadata = AGENT_MODE_METADATA.get(mode, {})
+        phases.update(
+            str(phase).strip().lower()
+            for phase in (metadata.get("tool_phases") or [])
+            if str(phase).strip()
+        )
+    except (ImportError, AttributeError, TypeError):
+        pass
+
+    return ["core", *sorted(phase for phase in phases if phase != "core")]
 
 
 _COLLATED_TOOL_NAMES = {
@@ -209,6 +253,9 @@ def serialize_tool_descriptor(tool_name: str) -> dict | None:
         "handler_key": descriptor.handler_key,
         "error_mode": descriptor.error_mode,
         "summary_builder": descriptor.summary_builder,
+        "phase": descriptor.phase,
+        "group": descriptor.group,
+        "approval_policy": descriptor.approval_policy,
     }
 
 
@@ -229,6 +276,25 @@ def tool_requires_approval(tool_name: str, args: dict) -> bool:
         return False
 
     return tool_def.requires_approval
+
+
+def tool_approval_policy(tool_name: str, args: dict) -> str:
+    """Return the strongest approval policy for a call and its children."""
+
+    descriptor = get_tool_descriptor(tool_name)
+    policy = descriptor.approval_policy if descriptor is not None else "default"
+    if tool_name != "batch_job":
+        return policy
+    for command in args.get("commands", []) or []:
+        if not isinstance(command, dict):
+            continue
+        child_policy = tool_approval_policy(
+            str(command.get("tool_name") or ""),
+            command.get("tool_args") or {},
+        )
+        if child_policy == "always_human":
+            return child_policy
+    return policy
 
 
 def get_modifications(

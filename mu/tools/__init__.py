@@ -74,6 +74,7 @@ def tool(
     summary_builder: Optional[str] = None,
     phase: str = "core",
     group: str = "",
+    approval_policy: str = "default",
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator that registers a handler as a tool in the registry.
 
@@ -129,6 +130,7 @@ def tool(
             summary_builder=summary_builder,
             phase=phase,
             group=group,
+            approval_policy=approval_policy,
         )
         _REGISTRY[name] = descriptor
         _HANDLERS[name] = func
@@ -247,6 +249,13 @@ def _load_builtin_tools() -> None:
         import logging
         logging.getLogger("mucli").warning(
             "mu.tools: failed to load task tool package: %s", exc
+        )
+    try:
+        from . import thread as _thread_tools  # noqa: F401
+    except Exception as exc:  # pragma: no cover — defensive
+        import logging
+        logging.getLogger("mucli").warning(
+            "mu.tools: failed to load thread tool package: %s", exc
         )
     try:
         from . import agent as _agent_tools  # noqa: F401 — registers spawn_agent

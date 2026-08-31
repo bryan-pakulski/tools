@@ -31,6 +31,11 @@ from typing import Any
 
 from mu.agent.collation import CollationBuffer
 from mu.memory.stores import MemoryEntry, ScratchpadStore, TaskMemoryStore
+from mu.threads.model import (
+    ThreadMeta,
+    ensure_thread_meta,
+    new_child_thread_meta,
+)
 from mu.workspace.folder_context import FolderContext
 from utils.config import (
     DEFAULT_VARIABLES,
@@ -171,6 +176,9 @@ class SessionManager(HistoryMixin, HistorySearchMixin):
         self.tool_stats = _empty_tool_stats()
         self.variables = DEFAULT_VARIABLES.copy()
         self.container_config: dict[str, Any] = {}
+        self.thread_meta: ThreadMeta = ensure_thread_meta(
+            self.current_session_name or "unsaved"
+        )
 
         if session_name:
             self._load_session(session_name)
@@ -270,6 +278,7 @@ class SessionManager(HistoryMixin, HistorySearchMixin):
         self.research_sources = []
         self.tool_stats = _empty_tool_stats()
         self.container_config = {}
+        self.thread_meta = ensure_thread_meta(name)
         self.variables.update(DEFAULT_VARIABLES)
 
         data = self.read_session_data(name)
@@ -278,6 +287,9 @@ class SessionManager(HistoryMixin, HistorySearchMixin):
                 if isinstance(data, list):
                     self.history = data
                 elif isinstance(data, dict):
+                    self.thread_meta = ensure_thread_meta(
+                        name, data.get("thread_meta")
+                    )
                     self.history = data.get("history", [])
                     self.conversation_summary = str(
                         data.get("conversation_summary", "") or ""
@@ -988,6 +1000,7 @@ class SessionManager(HistoryMixin, HistorySearchMixin):
                 # file is irrelevant to json.load semantics.
                 "variables": self.variables,
                 "container_config": self.container_config,
+                "thread_meta": self.thread_meta.to_dict(),
                 "conversation_summary": self.conversation_summary,
                 "summary_anchor": self.summary_anchor,
                 "protected_indices": sorted(self.protected_indices),
@@ -1385,6 +1398,7 @@ class SessionManager(HistoryMixin, HistorySearchMixin):
             name = f"chat_{int(time.time())}"
         self.folder_context = FolderContext()
         self.current_session_name = name
+        self.thread_meta = ensure_thread_meta(name)
         self.collation_buffer = CollationBuffer()
         self.task_memory = TaskMemoryStore()
         self.turn_scratchpad = ScratchpadStore()
@@ -1422,6 +1436,90 @@ class SessionManager(HistoryMixin, HistorySearchMixin):
         self.save_history()
         if self.ui:
             self.ui.show_info(f"Started new session: '{name}'")
+
+    def create_thread(
+        self,
+        *,
+        title: str,
+        session_name: str | None = None,
+        parent_session_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a clean peer run that shares this session's environment.
+
+        Conversation history, summaries, task memory, feature/course state,
+        and transient execution state are deliberately not copied. Provider,
+        workspace/container configuration, and user settings are copied so
+        the peer starts in the same execution environment.
+        """
+
+        parent_name = self._validate_session_name(
+            parent_session_name or self.current_session_name
+        )
+        if not parent_name:
+            raise ValueError("A saved parent session is required.")
+        if parent_name == self.current_session_name:
+            # Use the live manager snapshot so a newly created peer inherits
+            # settings/workspaces changed since the most recent disk save.
+            parent_data = {
+                "variables": deepcopy(self.variables),
+                "provider_config": deepcopy(self.provider_config),
+                "container_config": deepcopy(self.container_config),
+                "folder_context": deepcopy(self.folder_context.to_dict()),
+            }
+            parent_meta = self.thread_meta
+        else:
+            parent_data = self.read_session_data(parent_name)
+            if not isinstance(parent_data, dict):
+                raise FileNotFoundError(f"Session '{parent_name}' not found.")
+            parent_meta = ensure_thread_meta(
+                parent_name, parent_data.get("thread_meta")
+            )
+
+        clean_title = str(title or "New thread").strip()[:120] or "New thread"
+        if session_name:
+            child_name = self._validate_session_name(session_name)
+        else:
+            base = re.sub(r"[^A-Za-z0-9._-]+", "-", clean_title).strip("-.")
+            base = (base or "thread")[:72]
+            child_name = base
+            suffix = 2
+            while os.path.exists(self._get_session_dir(child_name)):
+                child_name = f"{base[:68]}-{suffix}"
+                suffix += 1
+        if os.path.exists(self._get_session_dir(child_name)):
+            raise FileExistsError(f"Session '{child_name}' already exists.")
+
+        child = SessionManager(ui=None)
+        child.current_session_name = child_name
+        child.thread_meta = new_child_thread_meta(parent_meta, title=clean_title)
+        child.variables.clear()
+        child.variables.update(deepcopy(parent_data.get("variables") or DEFAULT_VARIABLES))
+        child.provider_config = deepcopy(parent_data.get("provider_config") or {})
+        child.container_config = deepcopy(parent_data.get("container_config") or {})
+        child.folder_context = FolderContext()
+        child.folder_context.from_dict(deepcopy(parent_data.get("folder_context") or {}))
+        child.history = []
+        child.conversation_summary = ""
+        child.summary_anchor = 0
+        child.protected_indices = set()
+        child.revision = 0
+        child.save_history(expected_revision=0)
+
+        from mu.threads.coordinator import ThreadCoordinator
+
+        coordinator = ThreadCoordinator(parent_meta.group_id)
+        coordinator.register_thread(parent_meta, parent_name)
+        coordinator.register_thread(child.thread_meta, child_name)
+        coordinator.record_event(
+            "thread_created",
+            actor_thread_id=parent_meta.thread_id,
+            target_thread_id=child.thread_meta.thread_id,
+            payload={"session_name": child_name, "title": clean_title},
+        )
+        return {
+            "session_name": child_name,
+            "thread_meta": child.thread_meta.to_dict(),
+        }
 
     def list_sessions(self):
         logger.debug("Listing sessions")

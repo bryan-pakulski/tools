@@ -33,12 +33,28 @@ def test_product_assets_are_loaded_by_main_web_shell():
     assert 'fragments/panel_tabs.html' in text
 
 
-def test_left_navigation_is_sessions_only():
+def test_left_navigation_groups_threads_and_sessions():
+    """Sidebar contract: Threads section = current session's thread-group roster
+    (hidden for singleton groups); Sessions section = the FULL sessions list
+    (main session always visible) with hover unload/delete row actions."""
     text = INDEX.read_text(encoding="utf-8")
     sidebar = text.split('<aside class="sidebar product-sidebar"', 1)[1].split('</aside>', 1)[0]
+    assert '<span>Threads</span>' in sidebar
     assert '<span>Sessions</span>' in sidebar
+    # Threads scoped to the group roster and hidden when it is a singleton.
+    assert '$store.threads.groupRoster.length > 1' in sidebar
+    assert 'x-for="t in $store.threads.groupRoster"' in sidebar
+    # Sessions section iterates the full store list, not a roster-filtered view.
+    assert 'x-for="s in $store.sessions.list"' in sidebar
+    assert 'otherSessions' not in sidebar
+    # Row actions: switch on row click, unload + confirm-guarded delete.
+    assert '$store.threads.switchTo(t)' in sidebar
     assert '$store.sessions.switchTo(s.name)' in sidebar
-    assert 'New session' in sidebar
+    assert '$store.sessions.unload(s.name)' in sidebar
+    assert '$store.sessions.remove(s.name)' in sidebar
+    assert '$store.confirm.ask(' in sidebar
+    assert 'New thread' in sidebar
+    assert '+ new session' in sidebar
     assert '<span>Work</span>' not in sidebar
     assert '<span>Workspace</span>' not in sidebar
     assert '$store.mode.setView(m.name)' not in sidebar

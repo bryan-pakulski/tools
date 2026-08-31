@@ -52,7 +52,9 @@ class TraceRun:
     compactions: List[Dict[str, Any]] = field(default_factory=list)
     requests: List[Dict[str, Any]] = field(default_factory=list)
     context_artifacts: List[Dict[str, Any]] = field(default_factory=list)
+    context_collapses: List[Dict[str, Any]] = field(default_factory=list)
     turn_end: Optional[Dict[str, Any]] = None
+    run_end: Optional[Dict[str, Any]] = None
     bytes: int = 0
 
     @property
@@ -84,6 +86,7 @@ _PARSE_CATEGORY_CAPS: Dict[str, Optional[int]] = {
     "compactions": _DEFAULT_EVENT_CAP,
     "requests": _DEFAULT_EVENT_CAP,
     "context_artifacts": _DEFAULT_EVENT_CAP,
+    "context_collapses": _DEFAULT_EVENT_CAP,
 }
 
 
@@ -131,13 +134,20 @@ def parse_trace(path: str, *, max_events: Optional[int] = _DEFAULT_EVENT_CAP) ->
             lists["requests"].append(obj)
         elif t == "context_artifact":
             lists["context_artifacts"].append(obj)
+        elif t == "context_collapse":
+            lists["context_collapses"].append(obj)
         elif t == "turn_end":
             run.turn_end = obj
+            if not run.run_id:
+                run.run_id = obj.get("run_id", "")
+        elif t == "run_end":
+            run.run_end = obj
             if not run.run_id:
                 run.run_id = obj.get("run_id", "")
     run.iters = lists["iters"]
     run.tools = lists["tools"]
     run.nudges = lists["nudges"]
+    run.context_collapses = lists["context_collapses"]
     run.compactions = lists["compactions"]
     run.requests = lists["requests"]
     run.context_artifacts = lists["context_artifacts"]
@@ -343,6 +353,7 @@ def combine_runs(runs: List["TraceRun"]) -> "TraceRun":
     merged.run_id = runs[0].run_id
     merged.header = dict(runs[0].header)
     merged.turn_end = runs[-1].turn_end
+    merged.run_end = next((r.run_end for r in runs if r.run_end), None)
     global_iter = 0
     for run in runs:
         iter_map: Dict[Any, int] = {}
@@ -416,8 +427,12 @@ def build_session_view(
     summary["total_in"] = int(total_in)
     summary["total_out"] = int(total_out)
     summary["total_cost"] = round(total_cost, 6)
-    # Session status: completed only if every run completed.
-    statuses = [(r.turn_end or {}).get("status") for r in runs]
+    # Session status: completed only if every run completed. Round-51 T2:
+    # prefer the terminal run_end record when present; legacy traces fall
+    # back to turn_end, and only fully headless traces stay 'running'.
+    statuses = [
+        (r.run_end or r.turn_end or {}).get("status") for r in runs
+    ]
     summary["status"] = "completed" if all(s == "completed" for s in statuses) else (
         statuses[-1] if statuses and statuses[-1] else "running"
     )
@@ -434,7 +449,7 @@ def build_session_view(
                 "iters": n,
                 "model": run.header.get("model", ""),
                 "mode": run.header.get("mode", ""),
-                "status": (run.turn_end or {}).get("status", "running"),
+                "status": (run.run_end or run.turn_end or {}).get("status", "running"),
             }
         )
         gi += n
@@ -1037,7 +1052,7 @@ def build_summary(run: TraceRun, series: Dict[str, Any]) -> Dict[str, Any]:
         )),
         "context_artifact_counts": series.get("context_artifact_counts", {}),
         "redundant_reads": len(series["redundant_reads"]),
-        "status": (run.turn_end or {}).get("status", "running"),
+        "status": (run.run_end or run.turn_end or {}).get("status", "running"),
         "bytes": run.bytes,
         # Tool-output efficiency (spec #12). Run-wide aggregates from the
         # per-iteration efficiency series, merged with the cache counters

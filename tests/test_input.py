@@ -84,6 +84,7 @@ def test_input_toolbar_shows_plain_yolo_status_text():
 
     assert toolbar == (
         "[Meta+Enter] or [Esc] [Enter] to submit | "
+        "[Shift+Left] threads | "
         "[Shift+Tab] toggles YOLO (ON) | "
         "/help for commands"
     )

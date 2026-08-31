@@ -8,6 +8,8 @@ import random
 import shutil
 import traceback
 import hashlib
+import threading
+import uuid
 from copy import deepcopy
 from collections import defaultdict
 from datetime import datetime
@@ -310,6 +312,47 @@ class Session:
         self.tool_stats = self.session_manager.tool_stats
         self.feature_state = self.session_manager.get_feature_state()
         self.variables = self.session_manager.variables
+        self.thread_meta = self.session_manager.thread_meta
+        thread_session_name = self.session_manager.current_session_name
+        self._thread_coordination_required = bool(thread_session_name)
+        if not self._thread_coordination_required:
+            # Ephemeral/test Sessions without a durable identity are not
+            # threads yet, so there is no journal boundary to enforce.
+            self.thread_coordinator = None
+            self._thread_coordination_error = ""
+        else:
+            try:
+                from mu.threads.coordinator import ThreadCoordinator
+
+                publish = None
+                if self.ui is not None:
+                    publish = getattr(self.ui, "_publish", None) or getattr(
+                        self.ui, "publish", None
+                    )
+
+                def _publish_thread_event(event):
+                    if publish is not None:
+                        publish(
+                            {
+                                **event,
+                                "session_name": thread_session_name,
+                            }
+                        )
+
+                self.thread_coordinator = ThreadCoordinator(
+                    self.thread_meta.group_id,
+                    publish=_publish_thread_event if publish is not None else None,
+                )
+                self.thread_coordinator.register_thread(
+                    self.thread_meta, thread_session_name
+                )
+                self._thread_coordination_error = ""
+            except Exception as exc:
+                self.thread_coordinator = None
+                self._thread_coordination_error = str(exc)
+                logger.debug("thread coordinator initialization failed", exc_info=True)
+        if not getattr(self, "_thread_runtime_id", None):
+            self._thread_runtime_id = f"runtime-{os.getpid()}-{uuid.uuid4().hex}"
         # Artifacts are intentionally self-managed outside session.json. Build
         # the registry lazily so old sessions load without migrations.
         try:
@@ -1412,7 +1455,7 @@ class Session:
         )
 
         if self.ui and hasattr(self.ui, "request_tool_approval"):
-            return self.ui.request_tool_approval(
+            decision = self.ui.request_tool_approval(
                 tool_name=approval_plan.tool_name,
                 tool_args=approval_plan.tool_args,
                 display_args=display_args,
@@ -1421,10 +1464,17 @@ class Session:
                 modifications=[mod.to_payload() for mod in approval_plan.modifications],
                 preview_error=approval_plan.preview_error,
                 error_code=approval_plan.error_code,
+                approval_policy=approval_plan.approval_policy,
                 prompt_text=prompt_text,
                 choices=choices,
                 default=default,
             )
+            if isinstance(decision, dict):
+                return (
+                    "y" if decision.get("approved") else "n",
+                    decision.get("reason"),
+                )
+            return decision
 
         choice = self._prompt_tool_choice(prompt_text, choices, default)
         reason = None
@@ -1571,7 +1621,7 @@ class Session:
             pass
         return response
 
-    def send_message(self, text):
+    def send_message(self, text, *, origin="user"):
         """Body moved to `mu/agent/loop_body.py:run_turn`.
 
         Wraps the turn in a `finally` that strips the pinned
@@ -1601,14 +1651,71 @@ class Session:
             self.session_manager._bind_runtime_owner(self)
         except Exception:
             logger.debug("bind_runtime_owner failed", exc_info=True)
+        coordinator = getattr(self, "thread_coordinator", None)
+        turn_id = f"turn-{uuid.uuid4().hex}"
+        self._thread_turn_id = turn_id
+        self._thread_run_origin = str(origin or "user")[:40]
+        lease_stop = threading.Event()
+        lease_thread = None
+        lease_acquired = False
+        turn_started = False
         try:
-            return run_turn(self, text)
+            if coordinator is not None:
+                if not coordinator.heartbeat(
+                    self.thread_meta.thread_id,
+                    self._thread_runtime_id,
+                    ttl=120.0,
+                ):
+                    raise RuntimeError(
+                        "This thread already has an active turn in another runtime."
+                    )
+                lease_acquired = True
+                coordinator.set_status(
+                    self.thread_meta.thread_id,
+                    "running",
+                    goal=str(text or "")[:500],
+                    run_origin=self._thread_run_origin,
+                    runtime_id=self._thread_runtime_id,
+                )
+
+                def _renew_thread_lease():
+                    while not lease_stop.wait(30.0):
+                        try:
+                            if not coordinator.heartbeat(
+                                self.thread_meta.thread_id,
+                                self._thread_runtime_id,
+                                ttl=120.0,
+                            ):
+                                return
+                        except Exception:
+                            logger.debug(
+                                "thread execution lease renewal failed",
+                                exc_info=True,
+                            )
+                            return
+
+                lease_thread = threading.Thread(
+                    target=_renew_thread_lease,
+                    name="mucli-thread-lease",
+                    daemon=True,
+                )
+                lease_thread.start()
+            turn_started = True
+            if self._thread_run_origin == "user":
+                # Preserve the historical call shape for embedders/tests that
+                # monkeypatch the two-argument loop entry point.
+                return run_turn(self, text)
+            return run_turn(self, text, origin=self._thread_run_origin)
         finally:
+            lease_stop.set()
+            if lease_thread is not None:
+                lease_thread.join(timeout=1.0)
             # Phase-6 r22 F3: persistence-bearing turn cleanup (goal
             # strip saves) runs while turn CAS is STILL ARMED so its
             # save merges against a concurrent surface write instead of
             # clobbering it after the protective window closed.
-            self._strip_session_goal_after_turn()
+            if turn_started:
+                self._strip_session_goal_after_turn()
             try:
                 self.session_manager.end_turn_cas()
             except Exception:
@@ -1641,6 +1748,22 @@ class Session:
                     sync.apply_pending()
             except Exception:
                 logger.debug("surface sync apply_pending failed", exc_info=True)
+            try:
+                if coordinator is not None and lease_acquired:
+                    coordinator.release_paths(
+                        self.thread_meta.thread_id, turn_id=turn_id
+                    )
+                    coordinator.set_status(
+                        self.thread_meta.thread_id,
+                        "idle",
+                        runtime_id=self._thread_runtime_id,
+                    )
+                    coordinator.release_execution_lease(
+                        self.thread_meta.thread_id, self._thread_runtime_id
+                    )
+            except Exception:
+                logger.debug("thread turn cleanup failed", exc_info=True)
+            self._thread_turn_id = None
             # Run tracer: emit the turn_end line and flush+close the trace
             # file. Runs on every exit path (normal completion, hook abort,
             # sub-agent kill, exception) — telemetry must never be lost and
@@ -1683,7 +1806,46 @@ class Session:
                             "efficiency": _eff,
                         }
                     )
-                    _em.close()
+                    # Round-51 T2: terminal run record on every exit path
+                    # (normal completion, max-iterations, exception, stop).
+                    # Previously runs were truncated mid-flight with no
+                    # run_end record at all — the parser reported status
+                    # 'running' forever. Guard is run-level (session attr
+                    # keyed by run id) so a rebuilt emitter instance cannot
+                    # double-terminate the same run.
+                    _run_id = getattr(_em, "run_id", None)
+                    if getattr(self, "_run_end_emitted_for", None) == _run_id:
+                        _status = None  # already terminated this run
+                    else:
+                        self._run_end_emitted_for = _run_id
+                        _status = str(
+                            _summary.get("status", "unknown") or "unknown"
+                        )
+                    _error = _summary.get("error")
+                    _run_status = (
+                        "failed" if (_status == "error" or _error) else "completed"
+                    )
+                    if _status == "max_iterations_reached":
+                        # Round-51 T2: the loop's own terminal status is
+                        # authoritative — preserve it verbatim so the
+                        # parser/trace.html can distinguish "did real work
+                        # then ran out of budget" from a clean completion.
+                        _run_status = "max_iterations"
+                    _reason = (
+                        str(_error)[:280]
+                        if _error
+                        else (_status if _status not in ("unknown", "") else "turn_complete")
+                    )
+                    _em.run_end(
+                        {
+                            "status": _run_status,
+                            "reason": _reason,
+                            "iters": _em.iter_count,
+                            "tokens_in": _summary.get("total_in", 0),
+                            "tokens_out": _summary.get("total_out", 0),
+                            "cost": _summary.get("total_cost", 0.0),
+                        }
+                    )
             except Exception:  # noqa: BLE001 — telemetry must never break a turn
                 pass
 

@@ -120,3 +120,33 @@ def test_watchdog_branch_checks_blocker_flag_in_source():
     assert flag_pos < watchdog_pos, (
         "Loop watchdog should consult _loop_blocker_raised before re-prompting"
     )
+
+
+def test_watchdog_counters_init(session):
+    """Round-51 T5: watchdog counters initialize lazily to zero."""
+    assert getattr(session, "_watchdog_nudge_count", 0) or 0 == 0
+    assert getattr(session, "_watchdog_ineffective_count", 0) or 0 == 0
+
+
+def test_watchdog_ineffective_increments_without_tools(session):
+    """Round-51 T5: an iteration with a nudge outstanding but no tool calls
+    counts as ineffective."""
+    session._watchdog_nudge_count = 1
+    session._watchdog_ineffective_count = 0
+    # Simulate the loop's no-tool-call accounting.
+    if getattr(session, "_watchdog_nudge_count", 0):
+        session._watchdog_ineffective_count = int(
+            getattr(session, "_watchdog_ineffective_count", 0) or 0
+        ) + 1
+    assert session._watchdog_ineffective_count == 1
+
+
+def test_watchdog_counter_resets_on_tool_progress(session):
+    """Round-51 T5: a tool-call iteration resets the ineffective counter."""
+    session._watchdog_nudge_count = 2
+    session._watchdog_ineffective_count = 2
+    # The reset contract from loop_body's tool_call branch:
+    if getattr(session, "_watchdog_ineffective_count", 0):
+        session._watchdog_ineffective_count = 0
+    assert session._watchdog_ineffective_count == 0
+

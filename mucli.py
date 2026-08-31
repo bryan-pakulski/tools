@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 
 import argparse
+import copy
 import json
 import os
 import re
 import sys
 import time
+import threading
 
 from rich.console import Console
 from rich.panel import Panel
@@ -950,6 +952,10 @@ def main():
     # Reloads are deferred to the turn boundary while a turn executes.
     _surface_sync = None
     _presence_toucher = None
+    _thread_wake_scheduler = None
+    _thread_runtime_cache = {}
+    _thread_runtime_lock = threading.RLock()
+    _thread_turn_locks = {}
     try:
         from mu.session.presence import BeaconToucher
         from mu.session.surface_sync import SurfaceSync
@@ -969,8 +975,61 @@ def main():
         _presence_toucher = None
 
     try:
+        from mu.threads.scheduler import ThreadWakeScheduler
+
+        def _run_tui_thread_wake(coordinator, wake):
+            target = coordinator.get_thread(
+                str(wake.get("target_thread_id") or "")
+            )
+            if not target:
+                return True
+            name = str(target.get("session_name") or "")
+            if not name:
+                return True
+            with _thread_runtime_lock:
+                peer = _thread_runtime_cache.get(name)
+                if peer is None:
+                    peer_args = copy.copy(args)
+                    peer_args.session = name
+                    peer_args.workspace = []
+                    peer = build_session(peer_args, ui, allow_prompt=False)
+                    _thread_runtime_cache[name] = peer
+                turn_lock = _thread_turn_locks.setdefault(name, threading.RLock())
+            with turn_lock:
+                wake_text = (
+                    "A peer thread sent coordination updates. Inspect LAYER 3C, "
+                    "respond or acknowledge each incoming message, and continue "
+                    "your existing task where appropriate."
+                )
+                if peer.variables.get("session_type") == "container":
+                    from mu.container.tui import send_tui_container_message
+
+                    result = send_tui_container_message(
+                        peer, wake_text, origin="thread_wake"
+                    )
+                else:
+                    result = peer.send_message(wake_text, origin="thread_wake")
+            coordinator.record_event(
+                "thread_wake_completed",
+                actor_thread_id=target["thread_id"],
+                message_id=str(wake.get("message_id") or ""),
+                payload={"status": (result or {}).get("status") if isinstance(result, dict) else "complete"},
+            )
+            try:
+                ui.set_variables(session.variables)
+            except Exception:
+                pass
+            return True
+
+        _thread_wake_scheduler = ThreadWakeScheduler(_run_tui_thread_wake)
+        _thread_wake_scheduler.start()
+    except Exception:
+        logger.debug("TUI thread wake scheduler failed to start", exc_info=True)
+
+    try:
         while True:
             try:
+                ui.set_variables(session.variables)
                 current_task = get_current_feature_task_label(session)
                 feature_context = get_feature_prompt_context(session)
                 user_input = ui.get_input(
@@ -993,9 +1052,15 @@ def main():
                 if session.variables.get("session_type") == "container":
                     from mu.container.tui import send_tui_container_message
 
-                    send_result = send_tui_container_message(session, user_input)
+                    name = session.session_manager.current_session_name
+                    turn_lock = _thread_turn_locks.setdefault(name, threading.RLock())
+                    with turn_lock:
+                        send_result = send_tui_container_message(session, user_input)
                 else:
-                    send_result = session.send_message(user_input)
+                    name = session.session_manager.current_session_name
+                    turn_lock = _thread_turn_locks.setdefault(name, threading.RLock())
+                    with turn_lock:
+                        send_result = session.send_message(user_input)
                 if send_result.get("status") == "interrupted":
                     console.print(
                         "[dim]Execution paused. Type /continue to resume, or enter a new prompt to re-guide the agent.[/dim]"
@@ -1015,6 +1080,16 @@ def main():
                 console.print("\nGoodbye!")
                 break
     finally:
+        if _thread_wake_scheduler is not None:
+            try:
+                _thread_wake_scheduler.stop(wait=False)
+            except Exception:
+                pass
+        for _peer in list(_thread_runtime_cache.values()):
+            try:
+                _peer.shutdown()
+            except Exception:
+                pass
         if _surface_sync is not None:
             try:
                 _surface_sync.stop()

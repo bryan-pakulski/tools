@@ -15,7 +15,7 @@ import json
 _MAX_BYTES = 262_144
 # Fields the six-field session card needs. Everything else is skipped, so a
 # multi-MB `history` value in the head window costs one scan, not one decode.
-_CARD_KEYS = ("revision", "variables", "container_config")
+_CARD_KEYS = ("revision", "variables", "container_config", "thread_meta")
 
 
 def _skip_value(blob: str, index: int) -> tuple[object, int] | None:

@@ -1,5 +1,6 @@
 """Shared pytest fixtures for test isolation.
 
+- Redirects every MuCLI runtime write to a disposable suite-owned home.
 - Resets SemanticCodeIndex singleton between tests to prevent cross-test state leaks.
 - Cleans up FolderContext snapshots to prevent memory accumulation.
 - Scrubs any `courses/*` directories created during the session —
@@ -7,10 +8,29 @@
   `folder_context=None`, which in CI is the repo root, so tests that
   don't explicitly chdir end up polluting the working tree.
 """
+import atexit
 import glob
 import os
 import shutil
+import tempfile
 from pathlib import Path
+
+
+# This must happen before importing any project module. ``utils.config``
+# resolves and creates HISTORY_DIR at import time; setting MUCLI_HOME from a
+# fixture is therefore too late and lets tests write sessions/traces into the
+# user's real ~/.mucli. Subprocesses inherit this environment automatically.
+_TEST_MUCLI_HOME = tempfile.mkdtemp(prefix="mucli-pytest-")
+os.environ["MUCLI_HOME"] = _TEST_MUCLI_HOME
+
+
+def _remove_test_mucli_home() -> None:
+    shutil.rmtree(_TEST_MUCLI_HOME, ignore_errors=True)
+
+
+# The session fixture handles normal shutdown. The atexit fallback also covers
+# collection failures and interrupted runs where fixture teardown is skipped.
+atexit.register(_remove_test_mucli_home)
 
 import pytest
 from mu.retrieval.index import SemanticCodeIndex
@@ -47,16 +67,19 @@ def _cleanup_repo_test_artifacts():
     per-module autouse chdir fixtures that prevent the writes in the
     first place."""
     pre_existing = _snapshot_artifacts()
-    yield
-    post = _snapshot_artifacts()
-    for path in sorted(post - pre_existing):
-        try:
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            elif os.path.isfile(path):
-                os.remove(path)
-        except OSError:
-            pass
+    try:
+        yield
+    finally:
+        post = _snapshot_artifacts()
+        for path in sorted(post - pre_existing):
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                elif os.path.isfile(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        _remove_test_mucli_home()
 
 
 @pytest.fixture(autouse=True)

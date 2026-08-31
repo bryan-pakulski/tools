@@ -37,6 +37,15 @@ CHAT_TOOLS = frozenset(
         "list_attachments",
         "read_attachment",
         "search_attachments",
+        "list_threads",
+        "get_thread_activity",
+        "send_thread_message",
+        "acknowledge_thread_message",
+        "wait_for_thread_reply",
+        "claim_thread_paths",
+        "release_thread_paths",
+        "handoff_thread_paths",
+        "request_thread_claim_override",
     }
 )
 

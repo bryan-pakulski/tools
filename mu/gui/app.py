@@ -46,12 +46,14 @@ from .routers import (
     system_prompts as system_prompts_router,
     teacher as teacher_router,
     traces as traces_router,
+    threads as threads_router,
 )
 from .watcher import SessionWatcher
 from .web_ui import WebUI
 from mu.container import ContainerSupervisor
 from mu.jobs import get_default_job_service
 from mu.jobs.controller import JobController
+from mu.threads.scheduler import ThreadWakeScheduler
 
 
 def _register_memory_snapshot_hook() -> None:
@@ -117,6 +119,7 @@ def create_app(*, args: Any, build_session_fn: Callable, port: int = 30311) -> F
     app.state.current_session_name = None
     app.state._fallback_lock = threading.Lock()
     app.state._fallback_busy = threading.Event()
+    app.state.session_registry_lock = threading.RLock()
     app.state.container_creation_status = {}
     app.state.container_creation_lock = threading.Lock()
     app.state.container_creation_tasks = {}
@@ -156,6 +159,7 @@ def create_app(*, args: Any, build_session_fn: Callable, port: int = 30311) -> F
     app.include_router(containers_router.router, tags=["containers"])
     app.include_router(providers_router.router, prefix="/api/providers", tags=["providers"])
     app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
+    app.include_router(threads_router.router, prefix="/api/threads", tags=["threads"])
     app.include_router(modes.router, prefix="/api/modes", tags=["modes"])
     app.include_router(prompts_router.router, prefix="/api/prompts", tags=["prompts"])
     app.include_router(system_prompts_router.router, prefix="/api/system-prompts", tags=["system-prompts"])
@@ -222,11 +226,18 @@ def create_app(*, args: Any, build_session_fn: Callable, port: int = 30311) -> F
     @app.on_event("startup")
     async def _bind_loop():
         bus.bind_loop(asyncio.get_running_loop())
+        app.state.thread_wake_scheduler = ThreadWakeScheduler(
+            lambda coordinator, wake: _run_thread_wake(app, coordinator, wake)
+        )
+        app.state.thread_wake_scheduler.start()
         app.state.job_controller.start()
         app.state.watcher.start()
 
     @app.on_event("shutdown")
     async def _stop_services():
+        scheduler = getattr(app.state, "thread_wake_scheduler", None)
+        if scheduler is not None:
+            scheduler.stop(wait=False)
         app.state.watcher.stop()
         # Active worker processes are intentionally not killed here. Their own
         # heartbeat/lease lets them survive daemon/browser restarts.
@@ -242,26 +253,36 @@ def create_app(*, args: Any, build_session_fn: Callable, port: int = 30311) -> F
     return app
 
 
-def _load_session(app: FastAPI, *, name: str, provider: Optional[str] = None, model: Optional[str] = None):
-    if name in app.state.sessions:
-        app.state.current_session_name = name
-        return app.state.sessions[name]
-    web_ui = WebUI(app.state.bus, app.state.prompts, session_name=name)
-    app.state.web_uis[name] = web_ui
-    args = copy.copy(app.state.args)
-    args.session = name
-    if provider is not None:
-        args.provider = provider
-    if model is not None:
-        args.model = model
-    session = app.state.build_session_fn(args, web_ui, allow_prompt=False)
-    session.ui = web_ui
-    session.session_manager.ui = web_ui
-    app.state.sessions[name] = session
-    app.state.session_locks.setdefault(name, threading.Lock())
-    app.state.session_busy.setdefault(name, threading.Event())
-    app.state.current_session_name = name
-    return session
+def _load_session(
+    app: FastAPI,
+    *,
+    name: str,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    focus: bool = True,
+):
+    with app.state.session_registry_lock:
+        if name in app.state.sessions:
+            if focus:
+                app.state.current_session_name = name
+            return app.state.sessions[name]
+        web_ui = WebUI(app.state.bus, app.state.prompts, session_name=name)
+        app.state.web_uis[name] = web_ui
+        args = copy.copy(app.state.args)
+        args.session = name
+        if provider is not None:
+            args.provider = provider
+        if model is not None:
+            args.model = model
+        session = app.state.build_session_fn(args, web_ui, allow_prompt=False)
+        session.ui = web_ui
+        session.session_manager.ui = web_ui
+        app.state.sessions[name] = session
+        app.state.session_locks.setdefault(name, threading.Lock())
+        app.state.session_busy.setdefault(name, threading.Event())
+        if focus:
+            app.state.current_session_name = name
+        return session
 
 
 def _unload_session(app: FastAPI, *, name: Optional[str] = None) -> bool:
@@ -280,3 +301,84 @@ def _unload_session(app: FastAPI, *, name: Optional[str] = None) -> bool:
         remaining = list(app.state.sessions.keys())
         app.state.current_session_name = remaining[-1] if remaining else None
     return True
+
+
+_THREAD_WAKE_PROMPT = (
+    "A peer thread sent coordination updates. Inspect LAYER 3C, respond or "
+    "acknowledge each incoming message, and then continue your existing task "
+    "where appropriate."
+)
+
+
+def _run_thread_wake(app: FastAPI, coordinator, wake: dict) -> bool:
+    """Run one coalesced idle-peer wake without changing GUI focus."""
+
+    target = coordinator.get_thread(str(wake.get("target_thread_id") or ""))
+    if not target:
+        return True
+    name = str(target.get("session_name") or "")
+    if not name:
+        return True
+    session = _load_session(app, name=name, focus=False)
+    busy = app.state.session_busy_for(name)
+    if busy.is_set():
+        return False
+    app.state.bus.publish_threadsafe(
+        {
+            "kind": "thread_wake_started",
+            "session_name": name,
+            "thread_group_id": coordinator.group_id,
+            "thread_id": target["thread_id"],
+        }
+    )
+    session_type = str(
+        session.variables.get("session_type", "workspace") or "workspace"
+    ).lower()
+    try:
+        if session_type == "container":
+            busy.set()
+            try:
+                app.state.container_supervisor.send_sync(
+                    name,
+                    _THREAD_WAKE_PROMPT,
+                    provider=session.provider.name,
+                    model=session.provider.model_name,
+                    agent_mode=str(session.variables.get("agent_mode", "default")),
+                    system_instruction=session.system_instruction,
+                    timeout=None,
+                    origin="thread_wake",
+                )
+                session.session_manager._load_session(name)
+                session.sync_runtime_state()
+            finally:
+                busy.clear()
+        else:
+            chat._run_send(
+                session,
+                _THREAD_WAKE_PROMPT,
+                lock=app.state.session_lock_for(name),
+                busy=busy,
+                session_name=name,
+                origin="thread_wake",
+            )
+        coordinator.record_event(
+            "thread_wake_completed",
+            actor_thread_id=target["thread_id"],
+            message_id=str(wake.get("message_id") or ""),
+        )
+        app.state.bus.publish_threadsafe(
+            {
+                "kind": "history_refresh",
+                "session_name": name,
+                "thread_group_id": coordinator.group_id,
+            }
+        )
+        return True
+    except Exception as exc:
+        coordinator.record_event(
+            "thread_wake_failed",
+            actor_thread_id=target["thread_id"],
+            message_id=str(wake.get("message_id") or ""),
+            payload={"error": str(exc)[:1000]},
+        )
+        return False

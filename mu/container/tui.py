@@ -659,7 +659,9 @@ def ensure_tui_container(session: Any) -> Any:
     return ref
 
 
-def send_tui_container_message(session: Any, text: str) -> dict[str, Any]:
+def send_tui_container_message(
+    session: Any, text: str, *, origin: str = "user"
+) -> dict[str, Any]:
     supervisor = getattr(session, "_container_supervisor", None) or ContainerSupervisor()
     session._container_supervisor = supervisor
     try:
@@ -671,6 +673,7 @@ def send_tui_container_message(session: Any, text: str) -> dict[str, Any]:
             model=session.provider.model_name,
             agent_mode=str(session.variables.get("agent_mode", "default")),
             system_instruction=session.system_instruction,
+            origin=origin,
         )
     except (ContainerRuntimeError, OSError, RuntimeError, ValueError) as exc:
         failure = describe_container_load_error(

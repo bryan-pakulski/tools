@@ -49,13 +49,14 @@ def _run_send(
     lock: threading.Lock,
     busy: threading.Event,
     session_name: str = "",
+    origin: str = "user",
 ):
     _agent_threads[session_name] = threading.current_thread().ident
     busy.set()
     try:
         with lock:
             try:
-                result = session.send_message(text)
+                result = session.send_message(text, origin=origin)
             except KeyboardInterrupt:
                 result = {"status": "interrupted", "error": "User interrupted execution."}
             except Exception as exc:
@@ -552,7 +553,24 @@ async def stream_events(request: Request, session: str | None = None):
             last_id = int(raw_last)
         except ValueError:
             last_id = None
-    queue = bus.subscribe(session_name=session, last_event_id=last_id)
+    thread_group_id = None
+    if session:
+        try:
+            from mu.session.manager import SessionManager
+            from mu.threads.model import ensure_thread_meta
+
+            _data = SessionManager().read_session_data(session)
+            if isinstance(_data, dict):
+                thread_group_id = ensure_thread_meta(
+                    session, _data.get("thread_meta")
+                ).group_id
+        except Exception:
+            thread_group_id = None
+    queue = bus.subscribe(
+        session_name=session,
+        thread_group_id=thread_group_id,
+        last_event_id=last_id,
+    )
 
     async def generator():
         try:

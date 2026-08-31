@@ -1,7 +1,11 @@
 from dataclasses import dataclass
 
 from mu.tools._envelope import infer_tool_error_code
-from mu.tools.descriptors import get_modifications, tool_requires_approval
+from mu.tools.descriptors import (
+    get_modifications,
+    tool_approval_policy,
+    tool_requires_approval,
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,7 @@ class ApprovalPlan:
     modifications: list[ModificationPreview]
     preview_error: str | None = None
     error_code: str | None = None
+    approval_policy: str = "default"
 
     def to_payload(self) -> dict:
         return {
@@ -51,6 +56,7 @@ class ApprovalPlan:
             "preview_error": self.preview_error,
             "error_code": self.error_code,
             "modifications": [mod.to_payload() for mod in self.modifications],
+            "approval_policy": self.approval_policy,
         }
 
 
@@ -80,7 +86,8 @@ def build_approval_plan(
     strict_mode: bool = False,
     yolo: bool = False,
 ) -> ApprovalPlan:
-    requires_approval = (
+    approval_policy = tool_approval_policy(tool_name, tool_args)
+    requires_approval = approval_policy == "always_human" or (
         False if yolo else (strict_mode or tool_requires_approval(tool_name, tool_args))
     )
     if not requires_approval:
@@ -90,6 +97,7 @@ def build_approval_plan(
             requires_approval=False,
             can_approve=True,
             modifications=[],
+            approval_policy=approval_policy,
         )
 
     normalized_modifications = [
@@ -111,6 +119,7 @@ def build_approval_plan(
         modifications=normalized_modifications,
         preview_error=preview_failure.preview_error if preview_failure else None,
         error_code=preview_failure.error_code if preview_failure else None,
+        approval_policy=approval_policy,
     )
 
 
