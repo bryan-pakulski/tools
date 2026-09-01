@@ -7,7 +7,8 @@ pytest
 black
 playwright
 pypdf
-ddgs
+ddgs==9.16.0
+primp==2.0.0
 beautifulsoup4
 httpx
 tiktoken
