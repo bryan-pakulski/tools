@@ -879,6 +879,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--headless-prompt",
+        type=str,
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Run ONE agent turn with TEXT as the user prompt, save, and exit "
+            "without the TUI (benchmark/CI mode). Requires --provider and "
+            "--model (or a saved --session with a provider)."
+        ),
+    )
+    parser.add_argument(
         "--mode-prompt",
         type=str,
         action="append",
@@ -934,6 +945,35 @@ def main():
         return
 
     ui = RichUI()
+
+    # Headless one-shot mode (benchmark/CI): run a single agent turn and exit.
+    if getattr(args, "headless_prompt", None):
+        from mu.session.ui_headless import HeadlessUI
+
+        try:
+            headless_ui = HeadlessUI()
+            session = build_session(args, headless_ui, allow_prompt=False)
+        except Exception as exc:
+            console.print(
+                f"[red]Headless init failed: {safe_markup(str(exc))}[/red]"
+            )
+            sys.exit(1)
+        exit_code = 0
+        try:
+            result = session.send_message(args.headless_prompt)
+            status = (result or {}).get("status", "complete")
+            if status not in ("complete", "paused"):
+                exit_code = 1
+            console.print(f"[dim]headless turn status: {status}[/dim]")
+        except Exception as exc:
+            console.print(f"[red]Headless turn failed: {safe_markup(str(exc))}[/red]")
+            exit_code = 1
+        finally:
+            try:
+                session.shutdown()
+            except Exception:
+                pass
+        sys.exit(exit_code)
 
     try:
         session = build_session(args, ui, allow_prompt=True)

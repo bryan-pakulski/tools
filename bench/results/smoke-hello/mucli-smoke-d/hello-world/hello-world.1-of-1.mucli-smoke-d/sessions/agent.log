@@ -1,0 +1,18 @@
+[?2004hroot@a519a88b9866:/app# asciinema rec --stdin /logs/agent.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@a519a88b9866:/app# clear
+[?2004l[H[J[3J[?2004hroot@a519a88b9866:/app# source /installed-agent/setup-env.sh; tmux wait -S done
+[?2004l[?2004hroot@a519a88b9866:/app# source /installed-agent/install-agent.sh || echo 'INSTALL_FAIL_STATUS'; tmux wait -S done
+[?2004l
+[1m[[0m[34;49mnotice[0m[1;39;49m][0m[39;49m A new release of pip is available: [0m[31;49m24.3.1[0m[39;49m -> [0m[32;49m26.2.1[0m
+[1m[[0m[34;49mnotice[0m[1;39;49m][0m[39;49m To update, run: [0m[32;49mpip install --upgrade pip[0m
+[31mERROR: Invalid requirement: '\\': Expected package name at the start of dependency specifier
+    \
+    ^[0m[31m
+[0mbash: openai>=1.59: command not found
+bash: httpx: command not found
+MUCLI_SOURCE_MISSING: mount the mucli repo as /mucli-src
+[0;32masciinema: recording finished[0m
+[0;32masciinema: asciicast saved to /logs/agent.cast[0m
+[?2004hroot@a519a88b9866:/app# 

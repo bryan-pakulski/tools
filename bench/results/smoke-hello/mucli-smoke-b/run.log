@@ -1,0 +1,42 @@
+Processing tasks in duration order (longest first):
++-----+-------------+------------+------------+
+|   # | Task Name   | Duration   | Source     |
++=====+=============+============+============+
+|   1 | hello-world | 3m 30s     | calculated |
++-----+-------------+------------+------------+
+Total tasks: 1
+Starting harness run
+Run ID: mucli-smoke-b
+Running task: hello-world
+Running docker compose command: docker compose -p hello-world-1-of-1-mucli-smoke-b -f /home/bryanp/.cache/terminal-bench/terminal-bench-core/0.1.1/hello-world/docker-compose.yaml build
+Running docker compose command: docker compose -p hello-world-1-of-1-mucli-smoke-b -f /home/bryanp/.cache/terminal-bench/terminal-bench-core/0.1.1/hello-world/docker-compose.yaml up -d
+Starting recording.
+Sending keys: ['asciinema rec --stdin /logs/agent.cast', 'Enter'] min_timeout_sec: 3.0 max_timeout_sec: 180.0
+Sending keys: ['clear', 'Enter'] min_timeout_sec: 0.0 max_timeout_sec: 180.0
+Sending keys: ['source /installed-agent/setup-env.sh', '; tmux wait -S done', 'Enter'] min_timeout_sec: 0.0 max_timeout_sec: inf
+Blocking command completed in 0.05s.
+Sending keys: ["source /installed-agent/install-agent.sh || echo 'INSTALL_FAIL_STATUS'", '; tmux wait -S done', 'Enter'] min_timeout_sec: 0.0 max_timeout_sec: inf
+Agent timed out after 360.0s for task hello-world.
+Agent failed with mode FailureMode.AGENT_TIMEOUT, continuing with test execution
+Stopping recording.
+Sending keys: ['C-d'] min_timeout_sec: 0.1 max_timeout_sec: 180.0
+Running docker compose command: docker compose -p hello-world-1-of-1-mucli-smoke-b -f /home/bryanp/.cache/terminal-bench/terminal-bench-core/0.1.1/hello-world/docker-compose.yaml down
+Harness execution failed for /home/bryanp/.cache/terminal-bench/terminal-bench-core/0.1.1/hello-world: tmux is not installed in the container. Please install tmux in the container to run Terminal-Bench.
+Traceback (most recent call last):
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/harness/harness.py", line 1011, in _execute_single_trial
+    trial_results = self._run_trial(trial_handler)
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/harness/harness.py", line 767, in _run_trial
+    session = terminal.create_session(
+        "tests", is_active_stream=self._livestream, as_configured_user=False
+    )
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/terminal.py", line 78, in create_session
+    session = TmuxSession(
+        session_name=session_name,
+    ...<3 lines>...
+        user=user,
+    )
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/tmux_session.py", line 45, in __init__
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: tmux is not installed in the container. Please install tmux in the container to run Terminal-Bench.

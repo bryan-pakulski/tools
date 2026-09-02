@@ -1,0 +1,30 @@
+{
+    "run_id": "mucli-smoke-c",
+    "uuid": "1b834c5f-023e-4c83-9bda-c1ad6804b89a",
+    "dataset_path": null,
+    "dataset_name": "terminal-bench-core",
+    "dataset_version": "0.1.1",
+    "output_path": "/home/bryanp/dev/projects/ai/Mu-CLI/bench/results/smoke-hello",
+    "agent_name": "mucli",
+    "no_rebuild": false,
+    "cleanup": false,
+    "log_level": 20,
+    "task_ids": [
+        "hello-world"
+    ],
+    "exclude_task_ids": null,
+    "n_tasks": null,
+    "n_concurrent_trials": 4,
+    "n_attempts": 1,
+    "dataset_size": 1,
+    "accuracy": null,
+    "model_name": "openai/gpt-4o-mini",
+    "start_time": "2026-09-02T12:55:04.825764+00:00",
+    "end_time": null,
+    "commit_hash": "ca9eb72895b44aa4b6cf7fdfcdce5ae521df91f1",
+    "username": "Bryan Pakulski",
+    "s3_bucket": null,
+    "agent_kwargs": null,
+    "pass_at_k": null,
+    "resumed_at": null
+}

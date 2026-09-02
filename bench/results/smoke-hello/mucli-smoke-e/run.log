@@ -1,0 +1,141 @@
+Processing tasks in duration order (longest first):
++-----+-------------+------------+------------+
+|   # | Task Name   | Duration   | Source     |
++=====+=============+============+============+
+|   1 | hello-world | 3m 30s     | calculated |
++-----+-------------+------------+------------+
+Total tasks: 1
+Starting harness run
+Run ID: mucli-smoke-e
+Running task: hello-world
+Running docker compose command: docker compose -p hello-world-1-of-1-mucli-smoke-e -f /home/bryanp/.cache/terminal-bench/terminal-bench-core/0.1.1/hello-world/docker-compose.yaml build
+Running docker compose command: docker compose -p hello-world-1-of-1-mucli-smoke-e -f /home/bryanp/.cache/terminal-bench/terminal-bench-core/0.1.1/hello-world/docker-compose.yaml up -d
+Starting recording.
+Sending keys: ['asciinema rec --stdin /logs/agent.cast', 'Enter'] min_timeout_sec: 3.0 max_timeout_sec: 180.0
+Sending keys: ['clear', 'Enter'] min_timeout_sec: 0.0 max_timeout_sec: 180.0
+Sending keys: ['source /installed-agent/setup-env.sh', '; tmux wait -S done', 'Enter'] min_timeout_sec: 0.0 max_timeout_sec: inf
+Blocking command completed in 0.05s.
+Sending keys: ["source /installed-agent/install-agent.sh || echo 'INSTALL_FAIL_STATUS'", '; tmux wait -S done', 'Enter'] min_timeout_sec: 0.0 max_timeout_sec: inf
+Agent timed out after 360.0s for task hello-world.
+Stopping recording.
+Sending keys: ['C-d'] min_timeout_sec: 0.1 max_timeout_sec: 180.0
+Harness execution failed for /home/bryanp/.cache/terminal-bench/terminal-bench-core/0.1.1/hello-world: 409 Client Error for http+docker://localhost/v1.55/containers/87fd9e6518c9cfb244e1749143814c04093efad9778ee2cae4a0ed944b517e0d/exec: Conflict ("container 87fd9e6518c9cfb244e1749143814c04093efad9778ee2cae4a0ed944b517e0d is not running")
+Traceback (most recent call last):
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/api/client.py", line 275, in _raise_for_status
+    response.raise_for_status()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/requests/models.py", line 1167, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 409 Client Error: Conflict for url: http+docker://localhost/v1.55/containers/87fd9e6518c9cfb244e1749143814c04093efad9778ee2cae4a0ed944b517e0d/exec
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/terminal.py", line 177, in spin_up_terminal
+    yield terminal
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/harness/harness.py", line 749, in _run_trial
+    post_agent_pane = session.capture_pane(capture_entire=True)
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/tmux_session.py", line 318, in capture_pane
+    result = self._exec_run(self._tmux_capture_pane(capture_entire=capture_entire))
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/tmux_session.py", line 310, in _exec_run
+    return self.container.exec_run(cmd, user=self._user)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/models/containers.py", line 209, in exec_run
+    resp = self.client.api.exec_create(
+        self.id, cmd, stdout=stdout, stderr=stderr, stdin=stdin, tty=tty,
+        privileged=privileged, user=user, environment=environment,
+        workdir=workdir,
+    )
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/api/exec_api.py", line 78, in exec_create
+    return self._result(res, True)
+           ~~~~~~~~~~~~^^^^^^^^^^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/api/client.py", line 281, in _result
+    self._raise_for_status(response)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/api/client.py", line 277, in _raise_for_status
+    raise create_api_error_from_http_exception(e) from e
+          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/errors.py", line 39, in create_api_error_from_http_exception
+    raise cls(e, response=response, explanation=explanation) from e
+docker.errors.APIError: 409 Client Error for http+docker://localhost/v1.55/containers/87fd9e6518c9cfb244e1749143814c04093efad9778ee2cae4a0ed944b517e0d/exec: Conflict ("container 87fd9e6518c9cfb244e1749143814c04093efad9778ee2cae4a0ed944b517e0d is not running")
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/api/client.py", line 275, in _raise_for_status
+    response.raise_for_status()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/requests/models.py", line 1167, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 409 Client Error: Conflict for url: http+docker://localhost/v1.55/containers/87fd9e6518c9cfb244e1749143814c04093efad9778ee2cae4a0ed944b517e0d/exec
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/harness/harness.py", line 1011, in _execute_single_trial
+    trial_results = self._run_trial(trial_handler)
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/harness/harness.py", line 717, in _run_trial
+    with spin_up_terminal(
+         ~~~~~~~~~~~~~~~~^
+        client_container_name=trial_handler.client_container_name,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<9 lines>...
+        disable_recording=trial_handler.task.disable_asciinema,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ) as terminal:
+    ^
+  File "/home/bryanp/.local/share/uv/python/cpython-3.13.15-linux-x86_64-gnu/lib/python3.13/contextlib.py", line 162, in __exit__
+    self.gen.throw(value)
+    ~~~~~~~~~~~~~~^^^^^^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/terminal.py", line 179, in spin_up_terminal
+    terminal.stop()
+    ~~~~~~~~~~~~~^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/terminal.py", line 106, in stop
+    session.stop()
+    ~~~~~~~~~~~~^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/tmux_session.py", line 150, in stop
+    self.send_keys(
+    ~~~~~~~~~~~~~~^
+        keys=["C-d"],
+        ^^^^^^^^^^^^^
+        min_timeout_sec=0.1,
+        ^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/tmux_session.py", line 291, in send_keys
+    self._send_non_blocking_keys(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        keys=prepared_keys,
+        ^^^^^^^^^^^^^^^^^^^
+        min_timeout_sec=min_timeout_sec,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/tmux_session.py", line 230, in _send_non_blocking_keys
+    self._exec_run(self._tmux_send_keys(keys))
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/terminal_bench/terminal/tmux_session.py", line 310, in _exec_run
+    return self.container.exec_run(cmd, user=self._user)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/models/containers.py", line 209, in exec_run
+    resp = self.client.api.exec_create(
+        self.id, cmd, stdout=stdout, stderr=stderr, stdin=stdin, tty=tty,
+        privileged=privileged, user=user, environment=environment,
+        workdir=workdir,
+    )
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/utils/decorators.py", line 19, in wrapped
+    return f(self, resource_id, *args, **kwargs)
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/api/exec_api.py", line 78, in exec_create
+    return self._result(res, True)
+           ~~~~~~~~~~~~^^^^^^^^^^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/api/client.py", line 281, in _result
+    self._raise_for_status(response)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/api/client.py", line 277, in _raise_for_status
+    raise create_api_error_from_http_exception(e) from e
+          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/home/bryanp/.venvs/tb/lib/python3.13/site-packages/docker/errors.py", line 39, in create_api_error_from_http_exception
+    raise cls(e, response=response, explanation=explanation) from e
+docker.errors.APIError: 409 Client Error for http+docker://localhost/v1.55/containers/87fd9e6518c9cfb244e1749143814c04093efad9778ee2cae4a0ed944b517e0d/exec: Conflict ("container 87fd9e6518c9cfb244e1749143814c04093efad9778ee2cae4a0ed944b517e0d is not running")
