@@ -950,6 +950,10 @@ def main():
     if getattr(args, "headless_prompt", None):
         from mu.session.ui_headless import HeadlessUI
 
+        # Bench runs operate on the TB task dir (/app). Default the workspace
+        # to the CWD so write/bash tools are exposed without --workspace.
+        if not args.workspace:
+            args.workspace = [os.getcwd()]
         try:
             headless_ui = HeadlessUI()
             session = build_session(args, headless_ui, allow_prompt=False)
