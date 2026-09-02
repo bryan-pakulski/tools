@@ -962,7 +962,7 @@ def main():
         try:
             result = session.send_message(args.headless_prompt)
             status = (result or {}).get("status", "complete")
-            if status not in ("complete", "paused"):
+            if status not in ("complete", "completed", "paused"):
                 exit_code = 1
             console.print(f"[dim]headless turn status: {status}[/dim]")
         except Exception as exc:
