@@ -35,7 +35,10 @@ class HeadlessUI:
         raise EOFError("headless: interactive prompt unavailable")
 
     def prompt_choices(self, *args, **kwargs):
-        raise EOFError("headless: interactive choice unavailable")
+        """Return the default choice instead of raising — provider-error
+        recovery and tool-approval flows treat an interactive headless run
+        as 'use the default' (retry), matching server-mode behavior."""
+        return kwargs.get("default") or (args[2] if len(args) > 2 else "retry")
 
     def confirm(self, *args, **kwargs):
         return bool(self.approve_all)
