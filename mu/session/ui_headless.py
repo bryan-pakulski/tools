@@ -78,6 +78,21 @@ class HeadlessUI:
         """No-op context manager for the TUI status spinner."""
         yield self
 
+    def build_live_status(self, *args, **kwargs):
+        return "headless"
+
+    def render_message(self, *args, **kwargs):
+        return None
+
+    def show_tool_result(self, *args, **kwargs):
+        return None
+
+    def show_diff(self, *args, **kwargs):
+        return None
+
+    def emit_tool_trace(self, *args, **kwargs):
+        return None
+
     def set_variables(self, variables):  # TUI HUD sync
         return None
 
