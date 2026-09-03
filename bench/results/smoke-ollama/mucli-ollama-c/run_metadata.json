@@ -1,0 +1,30 @@
+{
+    "run_id": "mucli-ollama-c",
+    "uuid": "105c561c-7129-4f11-8e61-c4875d6c8a76",
+    "dataset_path": null,
+    "dataset_name": "terminal-bench-core",
+    "dataset_version": "0.1.1",
+    "output_path": "/home/bryanp/dev/projects/ai/Mu-CLI/bench/results/smoke-ollama",
+    "agent_name": "mucli",
+    "no_rebuild": false,
+    "cleanup": false,
+    "log_level": 20,
+    "task_ids": [
+        "hello-world"
+    ],
+    "exclude_task_ids": null,
+    "n_tasks": null,
+    "n_concurrent_trials": 4,
+    "n_attempts": 1,
+    "dataset_size": 1,
+    "accuracy": 0.0,
+    "model_name": "ollama/glm-5.3-flash",
+    "start_time": "2026-09-03T01:54:13.545828+00:00",
+    "end_time": "2026-09-03T02:05:37.348904+00:00",
+    "commit_hash": "96166a5af18af4629f6f040b4fdbc5842fb03253",
+    "username": "Bryan Pakulski",
+    "s3_bucket": null,
+    "agent_kwargs": null,
+    "pass_at_k": {},
+    "resumed_at": null
+}
