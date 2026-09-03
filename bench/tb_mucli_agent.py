@@ -112,17 +112,24 @@ class MucliAgent(AbstractInstalledAgent):
 
     def _run_agent_commands(self, instruction: str) -> list[TerminalCommand]:
         escaped = shlex.quote(instruction)
-        model_part = (
-            f" --provider-model {shlex.quote(self._model_name)}"
-            if self._model_name
-            else ""
-        )
+        provider_part = ""
+        if self._model_name and "/" in self._model_name:
+            provider, model = self._model_name.split("/", 1)
+            if provider == "ollama":
+                # Ollama cloud: the api key resolves the host; model id is bare.
+                provider_part = (
+                    f" --provider ollama --model {shlex.quote(model)}"
+                )
+            else:
+                provider_part = (
+                    f" --provider {shlex.quote(provider)}"
+                    f" --model {shlex.quote(model)}"
+                )
         return [
             TerminalCommand(
                 command=(
-                    "mucli bench-run "
-                    f"--instruction {escaped}{model_part} "
-                    "--working-dir /app"
+                    "mucli --headless-prompt "
+                    f"{escaped}{provider_part} --yolo"
                 ),
                 min_timeout_sec=0.0,
                 max_timeout_sec=float("inf"),
