@@ -1,0 +1,5 @@
+['asciinema rec --stdin /logs/agent.cast', 'Enter']
+['clear', 'Enter']
+['source /installed-agent/setup-env.sh', 'Enter']
+["source /installed-agent/install-agent.sh || echo 'INSTALL_FAIL_STATUS'", 'Enter']
+['mucli bench-run --instruction \'Create a file called hello.txt in the current directory. Write "Hello, world!" to it. Make sure it ends in a newline. Don\'"\'"\'t make any other files or folders.\' --provider-model ollama/glm-5.3-flash --working-dir /app', 'Enter']

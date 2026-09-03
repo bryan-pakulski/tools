@@ -1,0 +1,25 @@
+[?2004hroot@6a97d45d770f:/app# asciinema rec --stdin /logs/agent.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@6a97d45d770f:/app# clear
+[?2004l[H[J[3J[?2004hroot@6a97d45d770f:/app# source /installed-agent/setup-env.sh; tmux wait -S done
+[?2004l[?2004hroot@6a97d45d770f:/app# source /installed-agent/install-agent.sh || echo 'INSTALL_FAIL_STATUS'; tmux wait -S done
+[?2004l[33mWARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable.It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.[0m[33m
+[0m
+[1m[[0m[34;49mnotice[0m[1;39;49m][0m[39;49m A new release of pip is available: [0m[31;49m24.3.1[0m[39;49m -> [0m[32;49m26.2.1[0m
+[1m[[0m[34;49mnotice[0m[1;39;49m][0m[39;49m To update, run: [0m[32;49mpip install --upgrade pip[0m
+[33mWARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable.It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.[0m[33m
+[0m
+[1m[[0m[34;49mnotice[0m[1;39;49m][0m[39;49m A new release of pip is available: [0m[31;49m24.3.1[0m[39;49m -> [0m[32;49m26.2.1[0m
+[1m[[0m[34;49mnotice[0m[1;39;49m][0m[39;49m To update, run: [0m[32;49mpip install --upgrade pip[0m
+mucli install OK
+[?2004hroot@6a97d45d770f:/opt/mucli# mucli bench-run --instruction 'Create a file called hello.txt in the current directory. Write "Hello, world!" to it. Make sure it ends in a newline. Don'"'"'t make any other files or folders.' --provider-model ollama/glm-5.3-flash --working-dir /app; tmux wait -S done
+[?2004lTraceback (most recent call last):
+  File [35m"/opt/mucli/mucli.py"[0m, line [35m20[0m, in [35m<module>[0m
+    from providers.gemini import GeminiProvider
+  File [35m"/opt/mucli/providers/gemini.py"[0m, line [35m15[0m, in [35m<module>[0m
+    from google import genai
+[1;35mModuleNotFoundError[0m: [35mNo module named 'google'[0m
+[0;32masciinema: recording finished[0m
+[0;32masciinema: asciicast saved to /logs/agent.cast[0m
+[?2004hroot@6a97d45d770f:/app# 

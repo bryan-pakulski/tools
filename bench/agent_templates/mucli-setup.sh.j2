@@ -7,7 +7,7 @@ apt-get update -qq && apt-get install -y -qq git python3-pip >/dev/null 2>&1 || 
 
 python3 -m pip install --quiet --no-input \
     "openai>=1.59" "fastapi" "uvicorn" "pydantic" "rich" "prompt_toolkit" \
-    "httpx" "python-dotenv" "psutil" || true
+    "httpx" "python-dotenv" "psutil" "google-genai" "pathspec" "tiktoken" || true
 
 # Copy the host-mounted mucli checkout if present (git archive tarballs have
 # no .git dir — check for mucli.py instead), else clone from origin.

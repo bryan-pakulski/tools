@@ -1,0 +1,40 @@
+root@9214feb4819a:/app# source /installed-agent/setup-env.sh; tmux wait -S done
+root@9214feb4819a:/app# source /installed-agent/install-agent.sh || echo 'INSTALL_FAIL_STATUS'; tmux wait -S done
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your syst
+em unusable.It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you ar
+e doing and want to suppress this warning.
+
+[notice] A new release of pip is available: 24.3.1 -> 26.2.1
+[notice] To update, run: pip install --upgrade pip
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your syst
+em unusable.It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you ar
+e doing and want to suppress this warning.
+
+[notice] A new release of pip is available: 24.3.1 -> 26.2.1
+[notice] To update, run: pip install --upgrade pip
+mucli install OK
+root@9214feb4819a:/opt/mucli# mucli bench-run --instruction 'Create a file called hello.txt in the current directory. Write "Hello, world!" to it. Make sure it
+ends in a newline. Don'"'"'t make any other files or folders.' --provider-model ollama/glm-5.3-flash --working-dir /app; tmux wait -S done
+Traceback (most recent call last):
+  File "/opt/mucli/mucli.py", line 20, in <module>
+    from providers.gemini import GeminiProvider
+  File "/opt/mucli/providers/gemini.py", line 15, in <module>
+    from google import genai
+ModuleNotFoundError: No module named 'google'
+asciinema: recording finished
+asciinema: asciicast saved to /logs/agent.cast
+root@9214feb4819a:/app#
+
+
+
+
+
+
+
+
+
+
+
+
+
+

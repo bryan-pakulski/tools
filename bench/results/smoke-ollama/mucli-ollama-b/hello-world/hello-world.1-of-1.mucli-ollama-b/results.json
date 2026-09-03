@@ -1,0 +1,21 @@
+{
+    "id": "04f42f3d-2848-4539-b78a-e8a3c932bfad",
+    "trial_name": "hello-world.1-of-1.mucli-ollama-b",
+    "task_id": "hello-world",
+    "instruction": "Create a file called hello.txt in the current directory. Write \"Hello, world!\" to it. Make sure it ends in a newline. Don't make any other files or folders.",
+    "is_resolved": false,
+    "failure_mode": "agent_timeout",
+    "parser_results": {
+        "test_hello_file_exists": "failed",
+        "test_hello_file_content": "failed"
+    },
+    "recording_path": "mucli-ollama-b/hello-world/hello-world.1-of-1.mucli-ollama-b/sessions/agent.cast",
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "trial_started_at": "2026-09-03T01:28:04.965905+00:00",
+    "trial_ended_at": "2026-09-03T01:39:28.809088+00:00",
+    "agent_started_at": "2026-09-03T01:28:10.363805+00:00",
+    "agent_ended_at": "2026-09-03T01:39:10.516870+00:00",
+    "test_started_at": "2026-09-03T01:39:13.762209+00:00",
+    "test_ended_at": "2026-09-03T01:39:17.303148+00:00"
+}
