@@ -128,7 +128,7 @@ class MucliAgent(AbstractInstalledAgent):
         return [
             TerminalCommand(
                 command=(
-                    "mucli --headless-prompt "
+                    "cd /app && mucli --headless-prompt "
                     f"{escaped}{provider_part} --yolo"
                 ),
                 min_timeout_sec=0.0,
