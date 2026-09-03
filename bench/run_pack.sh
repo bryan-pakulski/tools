@@ -13,7 +13,7 @@ TB_PY="${TB_PY:-$HOME/.venvs/tb/bin/tb}"
 [ -x "$TB_PY" ] || { echo "tb not found at $TB_PY (set TB_PY=...)"; exit 1; }
 
 DATASET="terminal-bench-core==0.1.1"
-AGENT_PATH="bench.tb_mucli_agent.MucliAgent"
+AGENT_PATH="bench.tb_mucli_agent:MucliAgent"
 MODEL="${MODEL:-}"
 EXTRA=()
 if [ -n "$MODEL" ]; then EXTRA+=(--model "$MODEL"); fi
