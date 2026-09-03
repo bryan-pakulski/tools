@@ -25,6 +25,8 @@ import os
 import shlex
 from pathlib import Path
 
+from terminal_bench.agents.base_agent import AgentResult
+from terminal_bench.agents.failure_mode import FailureMode
 from terminal_bench.agents.installed_agents.abstract_installed_agent import (
     AbstractInstalledAgent,
 )
@@ -74,11 +76,13 @@ class MucliAgent(AbstractInstalledAgent):
         return out
 
     def perform_task(self, instruction, session, logging_dir=None):
-        """Copy the mucli repo tarball into the container before install.
+        """Copy, install, and preflight mucli before running the task.
 
         The base implementation only copies the setup script; mucli's source
         must also land at /mucli-src (extracted) so the offline install works
-        without a registry round-trip.
+        without a registry round-trip. This follows the base installation flow
+        so a container-level import can be checked after setup and before the
+        benchmark command is allowed to run.
         """
         tarball = self._build_repo_tarball()
         session.copy_to_container(
@@ -86,10 +90,73 @@ class MucliAgent(AbstractInstalledAgent):
             container_dir="/tmp",
             container_filename="mucli-src.tar.gz",
         )
-        session.container.exec_run(
+        extraction = session.container.exec_run(
             ["sh", "-c", "mkdir -p /mucli-src && tar -xzf /tmp/mucli-src.tar.gz -C /mucli-src"]
         )
-        return super().perform_task(instruction, session, logging_dir)
+        if extraction.exit_code != 0:
+            return AgentResult(
+                total_input_tokens=0,
+                total_output_tokens=0,
+                failure_mode=FailureMode.AGENT_INSTALLATION_FAILED,
+            )
+
+        session.copy_to_container(
+            self._install_agent_script_path,
+            container_dir="/installed-agent",
+            container_filename="install-agent.sh",
+        )
+
+        env_setup_content = self._create_env_setup_file()
+        session.container.exec_run(
+            [
+                "sh",
+                "-c",
+                (
+                    f"echo {shlex.quote(env_setup_content)} > "
+                    "/installed-agent/setup-env.sh"
+                ),
+            ]
+        )
+        session.send_keys(
+            ["source /installed-agent/setup-env.sh", "Enter"],
+            block=True,
+            max_timeout_sec=float("inf"),
+        )
+        session.send_keys(
+            [
+                (
+                    "bash /installed-agent/install-agent.sh || "
+                    "echo 'INSTALL_FAIL_STATUS'"
+                ),
+                "Enter",
+            ],
+            block=True,
+            max_timeout_sec=float("inf"),
+        )
+
+        installation_output = session.capture_pane()
+        if "INSTALL_FAIL_STATUS" in installation_output.split("\n"):
+            return AgentResult(
+                total_input_tokens=0,
+                total_output_tokens=0,
+                failure_mode=FailureMode.AGENT_INSTALLATION_FAILED,
+            )
+
+        preflight = session.container.exec_run(
+            ["sh", "-c", "cd /mucli-src && python3 -c 'import mucli'"]
+        )
+        if preflight.exit_code != 0:
+            return AgentResult(
+                total_input_tokens=0,
+                total_output_tokens=0,
+                failure_mode=FailureMode.AGENT_INSTALLATION_FAILED,
+            )
+
+        rendered_instruction = self._render_instruction(instruction)
+        for command in self._run_agent_commands(rendered_instruction):
+            session.send_command(command)
+
+        return AgentResult(total_input_tokens=0, total_output_tokens=0)
 
     # -- AbstractInstalledAgent contract ---------------------------------
 
@@ -143,25 +210,37 @@ class MucliAgent(AbstractInstalledAgent):
 MUCLI_SETUP_TEMPLATE = """#!/bin/bash
 set -euo pipefail
 
-# mucli TB agent install: minimal python deps + mucli source into /opt/mucli.
+# mucli TB agent install {{ version }}: dependencies + source into /opt/mucli.
 mkdir -p /opt/mucli
-apt-get update -qq && apt-get install -y -qq git python3-pip >/dev/null 2>&1 || true
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git python3-pip
 
-python3 -m pip install --quiet --no-input \
-    "openai>=1.59" "fastapi" "uvicorn" "pydantic" "rich" "prompt_toolkit" \
-    "httpx" "python-dotenv" "psutil" "google-genai" "pathspec" "tiktoken" || true
+export PIP_BREAK_SYSTEM_PACKAGES=1
+pip_install() {
+    local attempt
+    for attempt in 1 2; do
+        if python3 -m pip install --retries 3 --quiet --no-input "$@"; then
+            return 0
+        fi
+        echo "pip install attempt ${attempt}/2 failed" >&2
+    done
+    echo "pip install failed after 2 attempts: $*" >&2
+    return 1
+}
 
-# Copy the host-mounted mucli checkout if present (git archive tarballs have
-# no .git dir — check for mucli.py instead), else clone from origin.
-if [ -f /mucli-src/mucli.py ]; then
-    cp -r /mucli-src/. /opt/mucli/
-else
-    echo "MUCLI_SOURCE_MISSING: mount the mucli repo as /mucli-src" >&2
+if [ ! -f /mucli-src/mucli.py ] || [ ! -f /mucli-src/requirements.txt ]; then
+    echo "MUCLI_SOURCE_MISSING: /mucli-src must contain mucli.py and requirements.txt" >&2
     exit 1
 fi
 
+# Install the repository's complete dependency set first. These extra packages
+# are imported by mucli but are not currently declared in requirements.txt.
+pip_install -r /mucli-src/requirements.txt
+pip_install "pathspec" "python-dotenv" "psutil"
+
+cp -r /mucli-src/. /opt/mucli/
 cd /opt/mucli
-python3 -m pip install --quiet -e . --no-deps || true
+pip_install -e . --no-deps
 cat > /usr/local/bin/mucli <<'EOF'
 #!/bin/sh
 exec python3 /opt/mucli/mucli.py "$@"
@@ -175,6 +254,35 @@ cd "$MUCLI_WORKING_DIR"
 mucli --session "tb-$$" --headless "$MUCLI_TASK_INSTRUCTION"
 EOF
 chmod +x /usr/local/bin/mucli-bench-wrapper
+
+python3 -c '
+import importlib
+import sys
+
+modules = (
+    "rich",
+    "tiktoken",
+    "pathspec",
+    "google.genai",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "dotenv",
+    "psutil",
+    "openai",
+)
+failed = False
+for module in modules:
+    try:
+        importlib.import_module(module)
+    except Exception as exc:
+        failed = True
+        print(f"MUCLI_VERIFY_IMPORT_FAILED: {module}: {exc}", file=sys.stderr)
+if failed:
+    raise SystemExit(1)
+'
+
+mucli --help >/dev/null 2>&1 || exit 1
 echo "mucli install OK"
 """
 
