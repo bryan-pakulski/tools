@@ -90,6 +90,16 @@ class MucliAgent(AbstractInstalledAgent):
             container_dir="/tmp",
             container_filename="mucli-src.tar.gz",
         )
+        # Offline wheelhouse (pre-baked manylinux wheels, ~48MB): eliminates
+        # pip's registry round-trip — the 200s+ install cost that starved the
+        # 360s per-task gates. Falls back to network if payload is missing.
+        wheelhouse = _MUCLI_REPO_HOST / "bench" / "artifacts" / "mucli-wheelhouse.tar.gz"
+        if wheelhouse.exists():
+            session.copy_to_container(
+                paths=wheelhouse,
+                container_dir="/tmp",
+                container_filename="mucli-wheelhouse.tar.gz",
+            )
         extraction = session.container.exec_run(
             ["sh", "-c", "mkdir -p /mucli-src && tar -xzf /tmp/mucli-src.tar.gz -C /mucli-src"]
         )

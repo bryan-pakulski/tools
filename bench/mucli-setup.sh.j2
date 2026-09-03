@@ -24,14 +24,33 @@ if [ ! -f /mucli-src/mucli.py ] || [ ! -f /mucli-src/requirements.txt ]; then
     exit 1
 fi
 
-# Install the repository's complete dependency set first. These extra packages
-# are imported by mucli but are not currently declared in requirements.txt.
-pip_install -r /mucli-src/requirements.txt
-pip_install "pathspec" "python-dotenv" "psutil"
+# Fast path: pre-baked offline wheelhouse (no network, ~5s).
+# Slow path: network install with retries (only when payload missing).
+if [ -f /tmp/mucli-wheelhouse.tar.gz ]; then
+    mkdir -p /mucli-wheelhouse
+    tar -xzf /tmp/mucli-wheelhouse.tar.gz -C /mucli-wheelhouse
+    python3 -m pip install --quiet --no-input --no-index \
+        --find-links /mucli-wheelhouse/wheelhouse \
+        -r /mucli-src/requirements.txt \
+        pathspec python-dotenv psutil
+    echo "mucli deps installed from offline wheelhouse"
+else
+    echo "NO_WHEELHOUSE: falling back to network install" >&2
+    pip_install -r /mucli-src/requirements.txt
+    pip_install "pathspec" "python-dotenv" "psutil"
+fi
 
 cp -r /mucli-src/. /opt/mucli/
 cd /opt/mucli
-pip_install -e . --no-deps
+# mucli wheel is in the wheelhouse too; no network needed.
+if [ -f /mucli-wheelhouse/wheelhouse/mucli-*.whl ] 2>/dev/null || \
+   ls /mucli-wheelhouse/wheelhouse/mucli-*.whl >/dev/null 2>&1; then
+    python3 -m pip install --quiet --no-index \
+        --find-links /mucli-wheelhouse/wheelhouse \
+        /mucli-wheelhouse/wheelhouse/mucli-*.whl
+else
+    pip_install -e . --no-deps
+fi
 cat > /usr/local/bin/mucli <<'EOF'
 #!/bin/sh
 exec python3 /opt/mucli/mucli.py "$@"
