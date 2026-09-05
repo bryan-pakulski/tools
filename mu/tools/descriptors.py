@@ -133,6 +133,53 @@ def filter_tools_by_phase(tools, active_phases) -> list:
         return list(tools)
 
 
+_KNOWN_MODE_TOOL_PHASES = frozenset({"feature", "research", "security", "teacher"})
+
+
+def _mode_tool_phase_policy(mode: str) -> tuple[set[str], set[str]]:
+    """Return ``(all_mode_phases, phases_owned_by_mode)``.
+
+    The small fallback set keeps mode registries fail-closed during an unusual
+    partial-import failure.  ``AGENT_MODE_METADATA`` remains authoritative and
+    extends the set automatically when a new mode declares tool phases.
+    """
+    all_mode_phases = set(_KNOWN_MODE_TOOL_PHASES)
+    active_mode_phases: set[str] = set()
+    normalized_mode = str(mode or "default").strip().lower() or "default"
+    try:
+        from utils.config import AGENT_MODE_METADATA
+
+        for mode_name, metadata in AGENT_MODE_METADATA.items():
+            declared = {
+                str(phase).strip().lower()
+                for phase in (metadata.get("tool_phases") or [])
+                if str(phase).strip()
+            }
+            all_mode_phases.update(declared)
+            if str(mode_name).strip().lower() == normalized_mode:
+                active_mode_phases.update(declared)
+    except (ImportError, AttributeError, TypeError):
+        if normalized_mode in _KNOWN_MODE_TOOL_PHASES:
+            active_mode_phases.add(normalized_mode)
+    return all_mode_phases, active_mode_phases
+
+
+def filter_tools_for_mode(tools, mode: str) -> list:
+    """Hide every mode-owned tool except those owned by the active mode.
+
+    This boundary is unconditional: disabling optional lazy exposure must not
+    reveal Feature, Research, Security, or Teacher schemas in another mode.
+    """
+    mode_phases, active_mode_phases = _mode_tool_phase_policy(mode)
+    out = []
+    for tool_definition in tools:
+        descriptor = TOOL_DESCRIPTORS.get(tool_definition.name)
+        phase = descriptor.phase if descriptor is not None else "core"
+        if phase not in mode_phases or phase in active_mode_phases:
+            out.append(tool_definition)
+    return out
+
+
 def resolve_active_tool_phases(
     variables: dict | None,
     loaded_phases: list[str] | set[str] | tuple[str, ...] | None = None,
@@ -140,9 +187,9 @@ def resolve_active_tool_phases(
     """Return effective lazy-tool phases for one provider request.
 
     Explicit ``active_tool_phases`` and phases activated through ``load_tools``
-    remain additive.  A strategy mode's declared ``tool_phases`` are always
-    included, so selecting feature/research/security/teacher mode cannot leave
-    its engine absent from the provider schema.
+    remain additive only for phases that are not owned by an agent mode. Mode
+    phases are exclusive: the selected mode's declared phases are included and
+    every other mode's phases are removed.
     """
     values = variables or {}
     phases = {
@@ -158,17 +205,9 @@ def resolve_active_tool_phases(
     phases.add("core")
 
     mode = str(values.get("agent_mode", "default") or "default").strip().lower()
-    try:
-        from utils.config import AGENT_MODE_METADATA
-
-        metadata = AGENT_MODE_METADATA.get(mode, {})
-        phases.update(
-            str(phase).strip().lower()
-            for phase in (metadata.get("tool_phases") or [])
-            if str(phase).strip()
-        )
-    except (ImportError, AttributeError, TypeError):
-        pass
+    mode_phases, active_mode_phases = _mode_tool_phase_policy(mode)
+    phases.difference_update(mode_phases)
+    phases.update(active_mode_phases)
 
     return ["core", *sorted(phase for phase in phases if phase != "core")]
 

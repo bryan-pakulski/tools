@@ -1394,10 +1394,10 @@ def compare_results(args: Dict[str, Any], context) -> str:
 @tool(
     name="load_tools",
     description=(
-        "Activate a specialist tool phase (e.g. 'research', 'security', "
-        "'feature', 'teacher') so its tools appear in your schema. Use when "
-        "lazy_tools_enabled is on and you need a specialist tool that isn't "
-        "in the core phase. Core tools are always available."
+        "Activate an optional non-mode tool phase so its tools appear in your "
+        "schema. Tool phases owned by Feature, Research, Security, or Teacher "
+        "can only be activated by selecting that mode. Core tools are always "
+        "available."
     ),
     parameters={
         "type": "object",
@@ -1423,6 +1423,29 @@ def load_tools(args: Dict[str, Any], context) -> str:
         return "Error: phase argument is required."
     if session is None:
         return "Error: no session available."
+    from utils.config import AGENT_MODE_METADATA
+
+    active_mode = str(
+        (getattr(session, "variables", None) or {}).get("agent_mode", "default")
+        or "default"
+    ).strip().lower()
+    owning_modes = sorted(
+        mode_name
+        for mode_name, metadata in AGENT_MODE_METADATA.items()
+        if phase
+        in {
+            str(item).strip().lower()
+            for item in (metadata.get("tool_phases") or [])
+            if str(item).strip()
+        }
+    )
+    if owning_modes and active_mode not in owning_modes:
+        modes = ", ".join(owning_modes)
+        return (
+            f"Error: tool phase '{phase}' is mode-owned and remains hidden in "
+            f"'{active_mode}' mode. Switch to mode: {modes}."
+        )
+
     loaded = set(getattr(session, "_loaded_tool_phases", []) or [])
     loaded.add(phase)
     session._loaded_tool_phases = sorted(loaded)

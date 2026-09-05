@@ -59,6 +59,7 @@ from mu.tools.descriptors import (
     COLLATED_TOOLS,
     TOOLS,
     filter_tools_by_phase,
+    filter_tools_for_mode,
     resolve_active_tool_phases,
 )
 from providers.base import FileReference, ImageData, Message, MessagePart
@@ -425,9 +426,10 @@ def run_turn(session, text, *, origin="user"):
         if session.agentic:
             active_tools = [t for t in TOOLS if t.name not in session.disabled_tools]
             active_tools = filter_tools_for_session_type(active_tools, session_type)
+            active_tools = filter_tools_for_mode(active_tools, active_mode)
             # Spec #9: phased exposure — when lazy_tools_enabled, exclude
-            # specialist-phase tools not in the active phase set (+ any the
-            # model loaded via load_tools). Default off → no filtering.
+            # optional non-mode phases not in the active phase set. Mode-owned
+            # phases are filtered unconditionally above.
             if session.variables.get("lazy_tools_enabled", False):
                 active_tools = filter_tools_by_phase(active_tools, active_tool_phases)
 
@@ -468,8 +470,9 @@ def run_turn(session, text, *, origin="user"):
                     "strategy-mode registries are activated automatically."
                     if session.variables.get("lazy_tools_enabled", False)
                     else (
-                        f"all registered phases. Provider schema exposes "
-                        f"{len(active_tools)} tools because lazy tool exposure is disabled."
+                        f"core/non-mode phases plus the current mode. Provider schema "
+                        f"exposes {len(active_tools)} tools; inactive mode registries "
+                        "remain hidden even though optional lazy exposure is disabled."
                     )
                 )
             )
@@ -806,6 +809,7 @@ def run_turn(session, text, *, origin="user"):
     iteration = 0
     active_tools = [t for t in TOOLS if t.name not in session.disabled_tools]
     active_tools = filter_tools_for_session_type(active_tools, session_type)
+    active_tools = filter_tools_for_mode(active_tools, active_mode)
     provider_tools = active_tools if expose_tools else None
     # Spec #9: phased exposure (see the earlier filter site for details).
     if session.variables.get("lazy_tools_enabled", False):
@@ -2443,6 +2447,21 @@ def run_turn(session, text, *, origin="user"):
                     "thought_signature": part.thought_signature,
                     "cache_key": cache_key,
                 }
+                # Artifacts such as browser_snapshot PNGs stay durable in the
+                # artifact registry, while capable models receive the original
+                # bytes natively on the next iteration. Text-only models keep
+                # the ordinary tool result/artifact path.
+                try:
+                    from mu.session.media import tool_media_references
+
+                    media_inputs = tool_media_references(session, source_result)
+                    if media_inputs:
+                        tool_result_part["media_inputs"] = media_inputs
+                except Exception:
+                    logger.debug(
+                        "native tool media capture failed",
+                        exc_info=True,
+                    )
                 # Keep a compact, first-class visualization descriptor beside
                 # the tool result. Structured observation transforms and older
                 # transports may reshape the result body; history replay should

@@ -23,6 +23,9 @@ export interface ModelPricingInfo {
   estimated_total_per_million: number | null;
   billing: 'token' | 'estimated_token' | 'local' | 'unknown' | string;
   aliases: string[];
+  input_modalities: string[];
+  output_modalities: string[];
+  capabilities: string[];
   context_window: number | null;
   long_context_cutoff: number | null;
   long_input_per_million: number | null;

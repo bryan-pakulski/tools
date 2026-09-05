@@ -92,11 +92,21 @@ def test_stop_falls_back_to_port_when_pid_file_missing(monkeypatch, tmp_path):
     # with a mucli-looking argv0 so it passes the identity guard, and a
     # companion test asserts a foreign process is NOT signaled.
     sleeper = subprocess.Popen(
-        ["mucli-sleeper", "-c", "import time; time.sleep(30)"],
+        [
+            "mucli-sleeper",
+            "-c",
+            "import time; print('ready', flush=True); time.sleep(30)",
+        ],
         executable=sys.executable,
+        stdout=subprocess.PIPE,
     )
     monkeypatch.setattr(daemon, "pid_for_port", lambda port: sleeper.pid)
     try:
+        # Popen returns before the child finishes execve(). Waiting for an
+        # explicit ready marker ensures /proc/<pid>/cmdline contains the
+        # mucli-looking argv rather than the transient parent command line.
+        assert sleeper.stdout is not None
+        assert sleeper.stdout.readline().strip() == b"ready"
         ok, msg = daemon.stop(port=30311, timeout=5.0)
         assert ok, f"stop should succeed via port fallback, msg={msg}"
         assert "port 30311" in msg
@@ -112,6 +122,8 @@ def test_stop_falls_back_to_port_when_pid_file_missing(monkeypatch, tmp_path):
             sleeper.wait(timeout=5)
         except subprocess.TimeoutExpired:
             sleeper.kill()
+        if sleeper.stdout is not None:
+            sleeper.stdout.close()
 
 
 def test_stop_returns_false_when_nothing_running(monkeypatch, tmp_path):

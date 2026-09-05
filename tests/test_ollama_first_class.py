@@ -141,6 +141,7 @@ def test_split_think_blocks_pure_think_only():
 
 def test_image_input_part_becomes_base64_in_images_field():
     provider = OllamaProvider("llava")
+    provider._model_capabilities_cache["llava"] = ("completion", "vision")
     img = ImageData(data=b"\x89PNG\r\n\x1a\nfake", mime_type="image/png")
     msgs = [
         Message(

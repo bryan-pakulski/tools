@@ -70,7 +70,14 @@ def costs_cmd(session: Any, args: str, *, allow_prompt: bool = True) -> CommandR
             tier = ""
             if item.get("long_context_cutoff"):
                 tier = f" · high tier >{int(item['long_context_cutoff']):,} input"
-            lines.append(f"  {item['key']:<30} {rates}{tier}")
+            inputs = ",".join(item.get("input_modalities") or ["text"])
+            capabilities = ",".join(item.get("capabilities") or [])
+            capability_note = f" · inputs: {inputs}"
+            if capabilities:
+                capability_note += f" · features: {capabilities}"
+            lines.append(
+                f"  {item['key']:<30} {rates}{tier}{capability_note}"
+            )
         lines.append("")
 
     lines.extend([

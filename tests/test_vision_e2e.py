@@ -1,4 +1,4 @@
-"""Pin the /file → image_input vision pipeline end-to-end.
+"""Pin the /file → capability-gated native-media pipeline end-to-end.
 
 The bug this regression-tests: `Session.add_file` used to call
 `provider.upload_file()` and stage a `type="file"` part for every file
@@ -6,15 +6,15 @@ type. For OpenAI/Ollama, `upload_file` is a no-op stub that returns a
 local-path FileReference, which providers then render as a plain
 "[File: <name>]" text stub. Vision models never saw the bytes.
 
-After the fix, image MIMEs are detected at staging time and routed to
-`type="image_input"` with raw bytes (base64-encoded for JSON-safe
-storage), so per-provider conversion can emit them as inline images.
+Native-capable models stage a durable registry reference. The original bytes
+are resolved only while building the provider request, so session.json stays
+small and a text-only model receives only the attachment/tool fallback.
 """
 
 import base64
 
 from mu.session.session import Session, SessionManager
-from providers.base import ImageData, LLMProvider, MessagePart, ProviderResponse
+from providers.base import ImageData, LLMProvider, MediaData, ProviderResponse
 
 
 PNG_1x1 = (
@@ -25,6 +25,15 @@ PNG_1x1 = (
 
 
 class DummyProvider(LLMProvider):
+    name = "dummy"
+
+    def __init__(self, model_name="dummy"):
+        super().__init__(model_name)
+        self.name = "dummy"
+
+    def supported_input_modalities(self):
+        return ("text", "image", "document")
+
     def get_available_models(self):
         return ["dummy"]
 
@@ -45,9 +54,8 @@ def _make_session():
     return Session(DummyProvider("dummy"), False, "system instruction", sm)
 
 
-def test_add_file_routes_png_to_image_input(tmp_path):
-    """An image staged via /file becomes a JSON-safe image_input dict
-    with base64-encoded bytes — not a `type="file"` ref."""
+def test_add_file_routes_png_to_native_registry_reference(tmp_path):
+    """An image is referenced durably and resolved to bytes at send time."""
     png_path = tmp_path / "screenshot.png"
     png_path.write_bytes(PNG_1x1)
 
@@ -56,32 +64,33 @@ def test_add_file_routes_png_to_image_input(tmp_path):
 
     assert len(session.staged_files) == 1
     staged = session.staged_files[0]
-    assert staged["type"] == "image_input"
-    assert staged["image"]["mime_type"] == "image/png"
-    assert staged["image"]["source"] == str(png_path)
-    # Round-trip the bytes through base64.
-    decoded = base64.b64decode(staged["image"]["data_b64"])
-    assert decoded == PNG_1x1
+    assert staged["type"] == "media_input"
+    assert staged["media"]["mime_type"] == "image/png"
+    assert staged["media"]["attachment_id"]
+    assert "data_b64" not in staged["media"]
+
+    messages = session._build_messages_from_history(
+        [], {"role": "user", "parts": [staged]}
+    )
+    media = messages[0].parts[0].media
+    assert isinstance(media, MediaData)
+    assert media.data == PNG_1x1
 
 
-def test_add_file_non_image_still_uses_file_ref(tmp_path, monkeypatch):
-    """Non-image MIMEs must keep going through the legacy upload_file path."""
+def test_text_only_model_keeps_attachment_fallback_without_native_bytes(tmp_path):
+    """Unknown/text-only models must not receive optimistic binary payloads."""
     txt_path = tmp_path / "notes.txt"
     txt_path.write_text("hello")
 
-    session = _make_session()
-    # Swap the asserting upload_file with a benign one for this test only.
-    from providers.base import FileReference
+    class TextOnlyProvider(DummyProvider):
+        def supported_input_modalities(self):
+            return ("text",)
 
-    monkeypatch.setattr(
-        session.provider,
-        "upload_file",
-        lambda p, m: FileReference(uri=p, mime_type=m, display_name=p),
-    )
-
+    sm = SessionManager()
+    session = Session(TextOnlyProvider(), False, "system instruction", sm)
     session.add_file(str(txt_path))
-    assert len(session.staged_files) == 1
-    assert session.staged_files[0]["type"] == "file"
+    assert session.staged_files == []
+    assert session.staged_attachments[0]["type"] == "attachment"
 
 
 def test_image_input_dict_rehydrates_into_messagepart(tmp_path):
@@ -164,7 +173,7 @@ def test_send_message_attaches_staged_image(tmp_path, monkeypatch):
     user_msg = msgs[-1]
     assert user_msg.role == "user"
     types = [p.type for p in user_msg.parts]
-    assert types[0] == "image_input", f"expected image_input first, got {types}"
+    assert types[0] == "media_input", f"expected media_input first, got {types}"
     img_part = user_msg.parts[0]
-    assert isinstance(img_part.image, ImageData)
-    assert img_part.image.data == PNG_1x1
+    assert isinstance(img_part.media, MediaData)
+    assert img_part.media.data == PNG_1x1

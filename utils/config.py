@@ -347,19 +347,18 @@ VARIABLE_SCHEMA = {
     },
     "lazy_tools_enabled": {
         # Spec #9: phased tool exposure. When True, only tools whose `phase`
-        # is in `active_tool_phases` (plus any the model loaded via
-        # `load_tools`) appear in the schema — shrinking per-request
-        # schema bytes. Default True → only core-phase tools exposed;
-        # specialist phases loaded on demand via `load_tools`.
+        # is in `active_tool_phases` appear in the schema, shrinking per-request
+        # schema bytes. Mode-owned phases are always exclusive to their active
+        # mode, even when this setting is False.
         "type": bool,
         "default": True,
     },
     "active_tool_phases": {
         # Spec #9: phases always exposed when `lazy_tools_enabled` is True.
         # "core" covers the always-on read/write/memory/session/agent tools.
-        # Strategy modes add their declared AGENT_MODE_METADATA.tool_phases
-        # at request time, so this persisted list need not be rewritten when
-        # the user switches modes.
+        # Strategy modes replace any persisted mode-owned phases with their own
+        # declared AGENT_MODE_METADATA.tool_phases at request time, so switching
+        # modes cannot leak another mode's tools.
         "type": list,
         "default": ["core"],
     },

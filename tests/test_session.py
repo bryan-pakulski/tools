@@ -772,6 +772,11 @@ def test_send_message_feature_mode_injects_phased_plan_guidance(tmp_path):
     assert "core, feature" in provider.last_system_prompt
     assert "create_feature" in {tool.name for tool in provider.last_tools}
     assert "get_execution_state" in {tool.name for tool in provider.last_tools}
+    assert {
+        "web_search",
+        "create_security_report",
+        "create_course",
+    }.isdisjoint({tool.name for tool in provider.last_tools})
     assert provider.last_user_text.endswith("Implement an approvals dashboard")
 
 
@@ -815,8 +820,59 @@ def test_strategy_modes_expose_their_tool_registry_to_provider(
     session.send_message(f"Run in {mode} mode")
 
     assert representative_tool in {tool.name for tool in provider.last_tools}
+    other_mode_tools = {
+        "create_feature",
+        "web_search",
+        "create_security_report",
+        "create_course",
+    } - {representative_tool}
+    assert other_mode_tools.isdisjoint({tool.name for tool in provider.last_tools})
     assert f"core, {mode}" in provider.last_system_prompt
     assert session._active_tool_phases == ("core", mode)
+
+
+@pytest.mark.parametrize("lazy_tools_enabled", [True, False])
+def test_default_mode_never_exposes_mode_owned_tools(
+    tmp_path, lazy_tools_enabled
+):
+    class CaptureProvider(DummyProvider):
+        def __init__(self):
+            super().__init__("dummy")
+            self.last_tools = []
+
+        def generate(self, messages, system_prompt=None, thinking=False, tools=None):
+            self.last_tools = list(tools or [])
+            return ProviderResponse(
+                text="done",
+                parts=[MessagePart(type="text", text="done")],
+                input_tokens=1,
+                output_tokens=1,
+                total_tokens=2,
+            )
+
+    provider = CaptureProvider()
+    session = Session(provider, False, "system instruction", SessionManager())
+    session.folder_context.add_folder(str(tmp_path))
+    session.sync_runtime_state()
+    session.variables["agent_mode"] = "default"
+    session.variables["lazy_tools_enabled"] = lazy_tools_enabled
+    session.variables["active_tool_phases"] = [
+        "core",
+        "feature",
+        "research",
+        "security",
+        "teacher",
+    ]
+
+    session.send_message("Run in default mode")
+
+    assert {
+        "create_feature",
+        "web_search",
+        "create_security_report",
+        "create_course",
+    }.isdisjoint({tool.name for tool in provider.last_tools})
+    assert session._active_tool_phases == ("core",)
 
 
 def test_feature_mode_blocks_direct_feature_plan_access(tmp_path, monkeypatch):

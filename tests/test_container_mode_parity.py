@@ -18,6 +18,7 @@ from mu.gui.memory_snapshot import (
     ingest_context_timeline_point,
 )
 from mu.gui.routers import modes as modes_router
+from mu.gui.routers import containers as containers_router
 from mu.session.manager import SessionManager
 
 
@@ -142,10 +143,33 @@ def test_cached_worker_session_synchronizes_agent_mode():
 
     assert session.variables["agent_mode"] == "feature"
     assert session.variables["session_type"] == "container"
+    assert session.variables["lazy_tools_enabled"] is True
     assert session.provider.model_name == "new-model"
     assert session.system_instruction == "new system"
     assert session.disabled_tools == []
     assert session.ui.variables["agent_mode"] == "feature"
+
+
+def test_container_binding_persists_lazy_mode_filtering(monkeypatch, tmp_path):
+    monkeypatch.setattr(containers_router._config, "HISTORY_DIR", str(tmp_path))
+    session_dir = tmp_path / "sessions" / "container-demo"
+    session_dir.mkdir(parents=True)
+    session_path = session_dir / "session.json"
+    session_path.write_text(
+        json.dumps({"variables": {"agent_mode": "default"}}),
+        encoding="utf-8",
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(sessions={})))
+
+    containers_router._persist_session_container_binding(
+        request,
+        "container-demo",
+        {"container_name": "mucli-demo"},
+    )
+
+    saved = json.loads(session_path.read_text(encoding="utf-8"))
+    assert saved["variables"]["session_type"] == "container"
+    assert saved["variables"]["lazy_tools_enabled"] is True
 
 
 def test_worker_mode_router_is_authenticated_and_uses_worker_state(monkeypatch):

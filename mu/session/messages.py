@@ -32,9 +32,16 @@ rehydration), `tests/test_vision_e2e.py` (image_input round-trip),
 from __future__ import annotations
 
 import base64
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
-from providers.base import FileReference, ImageData, LLMProvider, Message, MessagePart
+from providers.base import (
+    FileReference,
+    ImageData,
+    LLMProvider,
+    MediaData,
+    Message,
+    MessagePart,
+)
 
 from .helpers import _shorten_tool_args
 
@@ -104,6 +111,7 @@ def build_messages_from_history(
     new_user_message_dict: dict,
     *,
     tool_result_floor: int = 0,
+    media_resolver: Optional[Callable[[dict[str, Any]], Optional[MediaData]]] = None,
 ) -> List[Message]:
     """Rehydrate dict-shaped history records into provider-typed
     `Message` objects. Pass-through for text; decodes base64 image
@@ -180,6 +188,29 @@ def build_messages_from_history(
                             ),
                         )
                     )
+            elif p_type == "media_input":
+                media_data = p.get("media", {}) or {}
+                media: Optional[MediaData] = None
+                raw = media_data.get("data_b64") or ""
+                if raw:
+                    try:
+                        decoded = base64.b64decode(raw)
+                    except Exception:
+                        decoded = b""
+                    if decoded:
+                        media = MediaData(
+                            data=decoded,
+                            mime_type=media_data.get(
+                                "mime_type", "application/octet-stream"
+                            ),
+                            source=media_data.get("source"),
+                            display_name=media_data.get("display_name")
+                            or media_data.get("name"),
+                        )
+                elif media_resolver is not None:
+                    media = media_resolver(media_data)
+                if media is not None:
+                    parts.append(MessagePart(type="media_input", media=media))
             elif p_type == "tool_call":
                 parts.append(
                     MessagePart(
@@ -191,6 +222,12 @@ def build_messages_from_history(
                 )
             elif p_type == "tool_result":
                 cache_key = p.get("cache_key")
+                media_inputs: List[MediaData] = []
+                if media_resolver is not None and (not cache_key or is_within_floor):
+                    for reference in p.get("media_inputs") or []:
+                        media = media_resolver(reference)
+                        if media is not None:
+                            media_inputs.append(media)
                 # Beyond the tool_result_floor: replace full envelope with
                 # compact ref string when a cache_key is available. The model
                 # can recall(cache_key) or use chunk retrieval tools to fetch
@@ -204,6 +241,7 @@ def build_messages_from_history(
                             tool_name=p.get("tool_name", "tool"),
                             tool_result=_compact_tool_result_ref(p),
                             thought_signature=p.get("thought_signature"),
+                            media_inputs=media_inputs,
                         )
                     )
                 else:
@@ -215,6 +253,7 @@ def build_messages_from_history(
                                 p.get("tool_result", "")
                             ),
                             thought_signature=p.get("thought_signature"),
+                            media_inputs=media_inputs,
                         )
                     )
         messages.append(Message(role=msg_dict["role"], parts=parts))
@@ -300,6 +339,15 @@ def summarize_message_parts(
             img = part.get("image", {}) or {}
             source = img.get("source") or img.get("mime_type", "image")
             summaries.append(f"image:{source}")
+        elif p_type == "media_input":
+            media = part.get("media", {}) or {}
+            source = (
+                media.get("name")
+                or media.get("display_name")
+                or media.get("source")
+                or media.get("mime_type", "media")
+            )
+            summaries.append(f"media:{source}")
 
     if not summaries:
         return f"- {role}: [no serializable content]"

@@ -19,7 +19,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from mu.container.ref import WORKER_PROTOCOL_VERSION
 from mu.session.manager import RevisionConflict
@@ -413,6 +413,7 @@ class SendRequest(BaseModel):
     agent_mode: str = "default"
     system_instruction: str = "You are a helpful assistant."
     origin: str = "user"
+    attachment_ids: list[str] = Field(default_factory=list)
 
 
 class RuntimeRequest(BaseModel):
@@ -627,7 +628,7 @@ def _sync_request_context(session: Any, request: SendRequest) -> None:
     session.variables["yolo"] = True
     session.variables["strict_mode"] = False
     session.variables["plan_mode"] = False
-    session.variables["lazy_tools_enabled"] = False
+    session.variables["lazy_tools_enabled"] = True
     session.variables["security_allow_secret_paths"] = False
     session.disabled_tools = []
     if getattr(session, "provider", None) is not None:
@@ -646,6 +647,8 @@ def _run_turn(session, request: SendRequest) -> None:
     _threads[name] = threading.current_thread().ident or 0
     try:
         with _locks[name]:
+            if request.attachment_ids:
+                session.stage_attachment_ids(request.attachment_ids)
             result = session.send_message(request.text, origin=request.origin)
             # Round-18 F29: CAS the turn save — a host GUI write between
             # our load and here must not be silently clobbered.
@@ -761,6 +764,8 @@ def send_sync(request: SendRequest, x_mucli_worker_token: str | None = Header(de
     start_index = len(session.session_manager.history)
     try:
         with _locks[name]:
+            if request.attachment_ids:
+                session.stage_attachment_ids(request.attachment_ids)
             result = session.send_message(request.text, origin=request.origin)
             # Round-18 F29: CAS the turn save — a host GUI write between
             # our load and here must not be silently clobbered.

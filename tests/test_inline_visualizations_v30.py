@@ -170,7 +170,7 @@ def test_container_protocol_requires_visualization_bridge_upgrade():
     worker = read("mu/container/worker.py")
     supervisor = read("mu/container/supervisor.py")
     endpoint = read("mu/gui/routers/containers.py")
-    assert "WORKER_PROTOCOL_VERSION = 9" in read("mu/container/ref.py")
+    assert "WORKER_PROTOCOL_VERSION = 10" in read("mu/container/ref.py")
     assert '"worker_protocol": WORKER_PROTOCOL_VERSION' in worker
     assert "did not preserve visualization metadata" in worker
     assert "actual_protocol == WORKER_PROTOCOL_VERSION" in supervisor

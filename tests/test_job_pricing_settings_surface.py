@@ -27,6 +27,8 @@ def test_model_pricing_is_first_class_in_settings():
     assert "Input / 1M" in app
     assert "Cached input / 1M" in app
     assert "Output / 1M" in app
+    assert "inputs" in app
+    assert "features" in app
     assert "token priced" in app
     assert "estimated token" in app
     assert "local / $0 API" in app
@@ -47,6 +49,8 @@ def test_model_pricing_is_first_class_in_settings():
     assert "Pricing row already exists" in shell
     assert "Input and output rates are required" in shell
     assert "Operator-added pricing row." in shell
+    assert "input_modalities" in shell
+    assert "capabilities" in shell
     assert "pricing_rows.css" in shell
 
     assert '@router.get("/pricing")' in providers

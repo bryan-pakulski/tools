@@ -58,7 +58,7 @@
             <div>
                 <span class="mc-eyebrow">Cost configuration</span>
                 <h1>Pricing registry</h1>
-                <p>One editable population table drives job cost estimates. Estimated models use separate input and output rates so measured prompt and completion tokens are costed independently.</p>
+                <p>One editable population table drives job cost estimates and native media routing. Inputs describe payloads MuCLI may send directly; unknown models remain text-only.</p>
             </div>
             <div class="mc-page-actions">
                 <span class="mc-dirty" id="mc-dirty" hidden>Unsaved changes</span>
@@ -73,6 +73,9 @@
                         <tr>
                             <th>Provider</th>
                             <th>Model</th>
+                            <th>Native inputs</th>
+                            <th>Outputs</th>
+                            <th>Capabilities</th>
                             <th>Billing</th>
                             <th>Input / 1M</th>
                             <th>Cached input / 1M</th>

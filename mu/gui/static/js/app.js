@@ -7318,6 +7318,26 @@ document.addEventListener("DOMContentLoaded", () => {
                                 <option value="unknown">unpriced</option>
                             </select>
                         </div>
+                        <div class="pricing-capability-map">
+                            <div class="pricing-capability-line">
+                                <span class="pricing-capability-label">inputs</span>
+                                <template x-for="modality in (row.input_modalities || ['text'])" :key="'in:' + modality">
+                                    <span class="pricing-capability-chip is-input" x-text="modality"></span>
+                                </template>
+                            </div>
+                            <div class="pricing-capability-line">
+                                <span class="pricing-capability-label">outputs</span>
+                                <template x-for="modality in (row.output_modalities || ['text'])" :key="'out:' + modality">
+                                    <span class="pricing-capability-chip" x-text="modality"></span>
+                                </template>
+                            </div>
+                            <div class="pricing-capability-line" x-show="(row.capabilities || []).length">
+                                <span class="pricing-capability-label">features</span>
+                                <template x-for="capability in (row.capabilities || [])" :key="'cap:' + capability">
+                                    <span class="pricing-capability-chip is-feature" x-text="String(capability).replaceAll('_', ' ')"></span>
+                                </template>
+                            </div>
+                        </div>
                         <div class="pricing-rate-grid">
                             <label class="pricing-rate-field">
                                 <span>Input / 1M</span>

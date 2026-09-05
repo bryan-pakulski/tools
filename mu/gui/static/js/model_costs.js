@@ -50,11 +50,14 @@
     function render() {
         const needle = String($('mc-search').value || '').trim().toLowerCase();
         const rows = state.models.map((item, index) => {
-            const search = `${item.provider} ${item.key} ${(item.aliases || []).join(' ')} ${item.role || ''} ${item.notes || ''}`.toLowerCase();
+            const search = `${item.provider} ${item.key} ${(item.aliases || []).join(' ')} ${(item.input_modalities || []).join(' ')} ${(item.output_modalities || []).join(' ')} ${(item.capabilities || []).join(' ')} ${item.role || ''} ${item.notes || ''}`.toLowerCase();
             const hidden = needle && !search.includes(needle) ? ' hidden' : '';
             return `<tr data-index="${index}" data-search="${esc(search)}"${hidden}>
                 <td>${input(item.provider, 'provider')}</td>
                 <td class="mc-model-cell">${input(item.key, 'key')}</td>
+                <td>${input((item.input_modalities || ['text']).join(', '), 'input_modalities')}</td>
+                <td>${input((item.output_modalities || ['text']).join(', '), 'output_modalities')}</td>
+                <td>${input((item.capabilities || []).join(', '), 'capabilities')}</td>
                 <td>${billingSelect(item.billing || 'token')}</td>
                 <td>${input(item.input_per_million, 'input_per_million', 'number', 'min="0" step="0.001"')}</td>
                 <td>${input(item.cached_input_per_million, 'cached_input_per_million', 'number', 'min="0" step="0.001"')}</td>
@@ -72,7 +75,7 @@
                 <td><button class="mc-row-remove" data-remove title="Remove model" aria-label="Remove model">×</button></td>
             </tr>`;
         }).join('');
-        $('mc-models').innerHTML = rows || '<tr><td colspan="14" class="mc-table-empty">No configured models.</td></tr>';
+        $('mc-models').innerHTML = rows || '<tr><td colspan="17" class="mc-table-empty">No configured models.</td></tr>';
         $('mc-count').textContent = `${state.models.length} model${state.models.length === 1 ? '' : 's'}`;
         wireRows();
     }
@@ -80,8 +83,11 @@
     function updateField(index, field, raw) {
         const item = state.models[index];
         if (!item) return;
-        if (field === 'aliases') {
-            item.aliases = String(raw || '').split(',').map(value => value.trim()).filter(Boolean);
+        if (['aliases', 'input_modalities', 'output_modalities', 'capabilities'].includes(field)) {
+            item[field] = String(raw || '').split(',').map(value => {
+                const clean = value.trim();
+                return field === 'aliases' ? clean : clean.toLowerCase().replaceAll(' ', '_');
+            }).filter(Boolean);
         } else if ([
             'input_per_million', 'cached_input_per_million', 'output_per_million',
             'estimated_total_per_million', 'context_window', 'long_context_cutoff',
@@ -112,6 +118,7 @@
     function addModel() {
         state.models.unshift({
             provider: 'ollama', key: '', billing: 'unknown', aliases: [],
+            input_modalities: ['text'], output_modalities: ['text'], capabilities: [],
             input_per_million: null, cached_input_per_million: null, output_per_million: null,
             estimated_total_per_million: null, context_window: null,
             long_context_cutoff: null, long_input_per_million: null,

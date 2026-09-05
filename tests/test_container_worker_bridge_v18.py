@@ -169,6 +169,48 @@ def test_supervisor_worker_error_includes_response_and_log_tail(monkeypatch):
     assert "traceback line" in str(exc.value)
 
 
+def test_supervisor_forwards_attachment_ids_to_container_worker(monkeypatch):
+    ref = make_ref("mucli-demo")
+    supervisor = ContainerSupervisor(
+        registry=SimpleNamespace(list_containers=lambda: [ref])
+    )
+    monkeypatch.setattr(supervisor, "ensure_running", lambda _ref: _ref)
+    monkeypatch.setattr(
+        supervisor, "worker_url", lambda _ref: "http://172.20.0.3:30312"
+    )
+    captured = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, *_args, **kwargs):
+            captured.update(kwargs.get("json") or {})
+            return Response()
+
+    monkeypatch.setattr("mu.container.supervisor.httpx.Client", Client)
+    supervisor.send_sync(
+        "demo",
+        "inspect this",
+        provider="ollama",
+        model="glm-5.3-flash:cloud",
+        attachment_ids=["attachment-a"],
+    )
+    assert captured["attachment_ids"] == ["attachment-a"]
+
+
 def test_tui_worker_error_does_not_crash(monkeypatch):
     errors = []
 

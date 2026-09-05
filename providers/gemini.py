@@ -10,6 +10,7 @@
 import logging
 import os
 import json
+import re
 from typing import Iterator, List, Optional
 
 from google import genai
@@ -19,6 +20,7 @@ from .base import (
     CacheHint,
     FileReference,
     LLMProvider,
+    MediaData,
     Message,
     MessagePart,
     ProviderResponse,
@@ -28,6 +30,29 @@ from .base import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _gemini_media_part(media: MediaData) -> types.Part:
+    """Build a GenerateContent Part using Gemini's native data union."""
+    mime_type = str(media.mime_type or "application/octet-stream").split(";", 1)[0].lower()
+    # The Gemini API explicitly asks callers to put text in Part.text rather
+    # than Blob.inline_data. Binary documents and all A/V media stay raw.
+    if mime_type.startswith("text/") or mime_type in {
+        "application/json",
+        "application/rtf",
+    }:
+        text = media.data.decode("utf-8", errors="replace")
+        if media.display_name:
+            text = f"[Attached file: {media.display_name}]\n{text}"
+        return types.Part(text=text)
+    return types.Part(
+        inline_data=types.Blob(data=media.data, mime_type=mime_type)
+    )
+
+
+def _function_media_name(media: MediaData, index: int) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", media.display_name or "media").strip("-")
+    return f"tool-media-{index}-{name or 'media'}"
 
 
 def _sanitize_stream_error(exc: BaseException, *, cap: int = 300) -> str:
@@ -92,6 +117,11 @@ class GeminiProvider(LLMProvider):
             )
             return []
 
+    def native_media_request_limit(self) -> int:
+        # Gemini's inline request limit is 100 MB; larger files should remain
+        # durable attachments and be accessed with attachment tools.
+        return 100 * 1024 * 1024
+
     # ------------------------------------------------------- message conversion
 
     def _convert_to_gemini_contents(
@@ -109,7 +139,13 @@ class GeminiProvider(LLMProvider):
             for part in msg.parts:
                 if part.type == "text":
                     gemini_parts.append(types.Part(text=part.text))
-                elif part.type == "file" and part.file_ref:
+                elif (
+                    part.type == "file"
+                    and part.file_ref
+                    and self.supports_input_mime(
+                        part.file_ref.mime_type, part.file_ref.display_name
+                    )
+                ):
                     gemini_parts.append(
                         types.Part(
                             file_data=types.FileData(
@@ -118,7 +154,13 @@ class GeminiProvider(LLMProvider):
                             )
                         )
                     )
-                elif part.type == "image_input" and part.image:
+                elif (
+                    part.type == "image_input"
+                    and part.image
+                    and self.supports_input_mime(
+                        part.image.mime_type, part.image.display_name or ""
+                    )
+                ):
                     gemini_parts.append(
                         types.Part(
                             inline_data=types.Blob(
@@ -127,6 +169,8 @@ class GeminiProvider(LLMProvider):
                             )
                         )
                     )
+                elif part.type == "media_input" and part.media:
+                    gemini_parts.append(_gemini_media_part(part.media))
                 elif part.type == "tool_call":
                     fc_obj = types.FunctionCall(
                         name=part.tool_name, args=part.tool_args
@@ -145,9 +189,28 @@ class GeminiProvider(LLMProvider):
                     tool_result = part.tool_result
                     if isinstance(tool_result, (dict, list)):
                         tool_result = json.dumps(tool_result, indent=2, sort_keys=True)
+                    response = {"result": str(tool_result)}
+                    response_parts = None
+                    if part.media_inputs and str(self.model_name).lower().replace("models/", "").startswith("gemini-3"):
+                        response_parts = []
+                        refs = []
+                        for index, media in enumerate(part.media_inputs):
+                            display_name = _function_media_name(media, index)
+                            response_parts.append(
+                                types.FunctionResponsePart(
+                                    inline_data=types.FunctionResponseBlob(
+                                        data=media.data,
+                                        mime_type=media.mime_type,
+                                        display_name=display_name,
+                                    )
+                                )
+                            )
+                            refs.append({"$ref": display_name})
+                        response["media"] = refs
                     fresp = types.FunctionResponse(
                         name=part.tool_name,
-                        response={"result": str(tool_result)},
+                        response=response,
+                        parts=response_parts,
                     )
                     # Thought signatures belong to MODEL-produced parts only.
                     # A function_response is a user-side replay of tool
@@ -156,6 +219,14 @@ class GeminiProvider(LLMProvider):
                     # function_call part (handled above).
                     resp_part = types.Part(function_response=fresp)
                     gemini_parts.append(resp_part)
+                    # Multimodal FunctionResponse.parts is a Gemini 3 feature.
+                    # Earlier multimodal models still accept ordinary inline
+                    # parts in the same user content turn.
+                    if part.media_inputs and response_parts is None:
+                        gemini_parts.extend(
+                            _gemini_media_part(media)
+                            for media in part.media_inputs
+                        )
 
             if not gemini_parts:
                 continue

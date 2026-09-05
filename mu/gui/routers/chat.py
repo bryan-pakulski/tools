@@ -260,17 +260,6 @@ def _resolve_attachments(session, raw_ids: Any) -> list[dict[str, Any]]:
     return values
 
 
-def _attachment_notice(attachments: list[dict[str, Any]]) -> str:
-    if not attachments:
-        return ""
-    lines = ["[Attachments selected for this message; retrieve via attachment tools:]"]
-    for item in attachments:
-        lines.append(
-            f"- id={item.get('attachment_id')} name={item.get('name')} mime={item.get('mime_type')}"
-        )
-    return "\n".join(lines)
-
-
 @router.post("/send")
 async def send_message(request: Request, payload: Dict[str, Any]):
     session_name = (payload.get("session_name") or "").strip() or None
@@ -333,11 +322,16 @@ async def send_message(request: Request, payload: Dict[str, Any]):
                 response = await asyncio.to_thread(
                     request.app.state.container_supervisor.send_sync,
                     name,
-                    text + (("\n\n" + _attachment_notice(attachments)) if attachments else ""),
+                    text,
                     provider=session.provider.name,
                     model=session.provider.model_name,
                     agent_mode=str(session.variables.get("agent_mode", "default")),
                     system_instruction=session.system_instruction,
+                    attachment_ids=[
+                        str(item.get("attachment_id") or "")
+                        for item in attachments
+                        if item.get("attachment_id")
+                    ],
                     timeout=None,
                 )
                 result = response.get("result") if isinstance(response, dict) else None

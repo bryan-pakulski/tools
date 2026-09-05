@@ -66,6 +66,8 @@ def test_job_trace_and_model_pricing_share_product_visual_language():
     assert 'Pricing registry' in pricing
     assert 'Input / 1M' in pricing
     assert 'Output / 1M' in pricing
+    assert 'Native inputs' in pricing
+    assert 'Capabilities' in pricing
     assert 'Blended est. / 1M total' not in pricing
     assert 'Quick estimator' not in pricing
 

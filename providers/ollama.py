@@ -43,6 +43,7 @@ from .base import (
     StreamEvent,
     ToolDefinition,
 )
+from utils.model_pricing import input_modality_for_mime
 
 
 # Native Ollama options that we expose to callers. Map: kwarg name → JSON
@@ -291,6 +292,7 @@ class OllamaProvider(LLMProvider):
         # Model name → trained context length (tokens), or None if unknown.
         # Populated lazily by `_fetch_context_length`.
         self._context_length_cache: Dict[str, Optional[int]] = {}
+        self._model_capabilities_cache: Dict[str, tuple[str, ...]] = {}
 
     # ----------------------------------------------------------- preflight
 
@@ -299,6 +301,56 @@ class OllamaProvider(LLMProvider):
         self._preflight_error = None
         self._cached_models = None
         self._context_length_cache: Dict[str, Optional[int]] = {}
+        self._model_capabilities_cache = {}
+
+    def _fetch_runtime_capabilities(self, model_name: str) -> tuple[str, ...]:
+        """Read Ollama's authoritative /api/show capability list."""
+        if not model_name:
+            return ()
+        if model_name in self._model_capabilities_cache:
+            return self._model_capabilities_cache[model_name]
+        try:
+            payload = json.dumps({"model": model_name}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.host}/api/show",
+                data=payload,
+                headers={"Content-Type": "application/json", **self._auth_headers()},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.request_timeout) as response:
+                value = json.loads(response.read().decode("utf-8"))
+            capabilities = tuple(
+                str(item).strip().lower()
+                for item in (value.get("capabilities") or [])
+                if str(item).strip()
+            )
+        except (
+            urllib.error.URLError,
+            urllib.error.HTTPError,
+            OSError,
+            json.JSONDecodeError,
+        ):
+            capabilities = ()
+        self._model_capabilities_cache[model_name] = capabilities
+        return capabilities
+
+    def supports_input_modality(self, modality: str) -> bool:
+        target = str(modality or "").strip().lower()
+        if super().supports_input_modality(target):
+            return True
+        # Locally discovered models may not have a pricing row. Ollama's
+        # /api/show response is authoritative for its vision capability.
+        return target == "image" and "vision" in self._fetch_runtime_capabilities(
+            self.model_name
+        )
+
+    def supports_input_mime(self, mime_type: str, filename: str = "") -> bool:
+        mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+        if input_modality_for_mime(mime, filename) != "image":
+            return False
+        return mime in {"image/jpeg", "image/png", "image/webp"} and super().supports_input_mime(
+            mime, filename
+        )
 
     def _fetch_context_length(self, model_name: str) -> Optional[int]:
         """Hit `/api/show` and return the model's trained context length, or
@@ -477,16 +529,33 @@ class OllamaProvider(LLMProvider):
             content = ""
             tool_calls: List[Dict[str, Any]] = []
             images: List[str] = []
+            returned_images: List[str] = []
             role = msg.role
 
             for part in msg.parts:
                 if part.type == "text":
                     content += (part.text or "") + "\n"
-                elif part.type == "image_input" and part.image is not None:
+                elif (
+                    part.type == "image_input"
+                    and part.image is not None
+                    and self.supports_input_mime(
+                        part.image.mime_type, part.image.display_name or ""
+                    )
+                ):
                     try:
                         encoded = base64.b64encode(part.image.data).decode("ascii")
                     except Exception:
                         encoded = ""
+                    if encoded:
+                        images.append(encoded)
+                elif (
+                    part.type == "media_input"
+                    and part.media is not None
+                    and self.supports_input_mime(
+                        part.media.mime_type, part.media.display_name or ""
+                    )
+                ):
+                    encoded = base64.b64encode(part.media.data).decode("ascii")
                     if encoded:
                         images.append(encoded)
                 elif part.type == "tool_call":
@@ -505,6 +574,14 @@ class OllamaProvider(LLMProvider):
                         content = json.dumps(part.tool_result, indent=2, sort_keys=True)
                     else:
                         content = str(part.tool_result)
+                    for media in part.media_inputs or []:
+                        if not self.supports_input_mime(
+                            media.mime_type, media.display_name or ""
+                        ):
+                            continue
+                        encoded = base64.b64encode(media.data).decode("ascii")
+                        if encoded:
+                            returned_images.append(encoded)
 
             message_dict: Dict[str, Any] = {
                 "role": role,
@@ -515,6 +592,14 @@ class OllamaProvider(LLMProvider):
             if images:
                 message_dict["images"] = images
             ollama_msgs.append(message_dict)
+            if returned_images:
+                ollama_msgs.append(
+                    {
+                        "role": "user",
+                        "content": "Native image(s) returned by the preceding tool call(s).",
+                        "images": returned_images,
+                    }
+                )
         return ollama_msgs
 
     def _prepare_chat_messages(

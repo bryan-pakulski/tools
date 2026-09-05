@@ -36,21 +36,28 @@ class FileReference:
 
 
 @dataclass
-class ImageData:
-    """Inline image input for vision-capable models."""
+class MediaData:
+    """Provider-agnostic inline media resolved from a durable registry ID."""
 
     data: bytes
-    mime_type: str  # e.g. "image/png", "image/jpeg"
+    mime_type: str
     source: Optional[str] = None  # original file path or URL, for display
+    display_name: Optional[str] = None
+
+
+@dataclass
+class ImageData(MediaData):
+    """Backward-compatible image-specific media payload."""
 
 
 @dataclass
 class MessagePart:
-    type: str  # 'text', 'file', 'tool_call', 'tool_result', 'image_inline', 'image_input'
+    type: str  # text, file, tool_call/result, image_input, or media_input
     text: Optional[str] = None
     file_ref: Optional[FileReference] = None
     inline_data: Optional[bytes] = None
     image: Optional[ImageData] = None
+    media: Optional[MediaData] = None
 
     # For agentic tool calls (Model -> User)
     tool_name: Optional[str] = None
@@ -60,6 +67,7 @@ class MessagePart:
 
     # For agentic tool results (User -> Model)
     tool_result: Optional[Any] = None
+    media_inputs: List[MediaData] = field(default_factory=list)
 
 
 @dataclass
@@ -141,6 +149,33 @@ class LLMProvider(ABC):
     def __init__(self, model_name: str = ""):
         self.name = ""
         self.model_name = model_name
+
+    def model_capabilities(self) -> Dict[str, Any]:
+        """Return live registry metadata for this provider/model.
+
+        Imports are local to keep the provider contract independent from the
+        optional pricing UI during module initialization.
+        """
+        from utils.model_pricing import resolve_model_capabilities
+
+        return resolve_model_capabilities(self.name, self.model_name)
+
+    def supported_input_modalities(self) -> tuple[str, ...]:
+        value = self.model_capabilities().get("input_modalities") or ["text"]
+        return tuple(str(item).lower() for item in value)
+
+    def supports_input_modality(self, modality: str) -> bool:
+        return str(modality or "").strip().lower() in self.supported_input_modalities()
+
+    def supports_input_mime(self, mime_type: str, filename: str = "") -> bool:
+        from utils.model_pricing import input_modality_for_mime
+
+        modality = input_modality_for_mime(mime_type, filename)
+        return self.supports_input_modality(modality)
+
+    def native_media_request_limit(self) -> int:
+        """Maximum aggregate inline media bytes MuCLI will place in a request."""
+        return 20 * 1024 * 1024
 
     @abstractmethod
     def get_available_models(self) -> List[str]:
@@ -402,6 +437,7 @@ __all__ = [
     "CacheHint",
     "FileReference",
     "ImageData",
+    "MediaData",
     "LLMProvider",
     "Message",
     "MessagePart",

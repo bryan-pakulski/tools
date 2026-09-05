@@ -2,18 +2,16 @@
 # Run: bash bench/run_pack.sh [--smoke]
 # Time gates come from each task's max_agent_timeout_sec (TB enforces natively).
 
-dataset: terminal-bench-core==0.1.1
-
-tasks:
-  - id: hello-world            # baseline loop, 360s gate
-  - id: processing-pipeline    # bash deps + multi-step diagnosis
-  - id: fix-git                # git state recovery
-  - id: git-multibranch        # long-turn planning, ssh/nginx/git
-  - id: nginx-request-logging  # service configuration
-  - id: cron-broken-network    # scheduler/network diagnosis
-  - id: sqlite-db-truncate     # data recovery, careful shell
-  - id: train-fasttext         # long-horizon tool chaining
-  - id: fix-permissions        # shell fluency, no code edit
-  - id: build-tcc-qemu         # multi-step build/debug
-
-agent: bench.tb_mucli_agent.MucliAgent
+name: terminal-bench-core
+version: 0.1.1
+task_ids:
+  - hello-world            # baseline loop, 360s gate
+  - processing-pipeline    # bash deps + multi-step diagnosis
+  - fix-git                # git state recovery
+  - git-multibranch        # long-turn planning, ssh/nginx/git
+  - nginx-request-logging  # service configuration
+  - cron-broken-network    # scheduler/network diagnosis
+  - sqlite-db-truncate     # data recovery, careful shell
+  - train-fasttext         # long-horizon tool chaining
+  - fix-permissions        # shell fluency, no code edit
+  - build-tcc-qemu         # multi-step build/debug

@@ -14,12 +14,14 @@ from .base import (
     FileReference,
     ImageData,
     LLMProvider,
+    MediaData,
     Message,
     MessagePart,
     ProviderResponse,
     StreamEvent,
     ToolDefinition,
 )
+from utils.model_pricing import input_modality_for_mime
 
 
 _REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
@@ -49,6 +51,49 @@ def _is_reasoning_model(name: str) -> bool:
     return any(n.startswith(p) for p in _REASONING_MODEL_PREFIXES)
 
 
+_OPENAI_IMAGE_MIMES = {
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+_OPENAI_AUDIO_FORMATS = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+}
+
+
+def _media_content_part(media: MediaData) -> Optional[Dict[str, Any]]:
+    """Serialize native media using Chat Completions content-part shapes."""
+    mime_type = str(media.mime_type or "application/octet-stream").split(";", 1)[0].lower()
+    encoded = base64.b64encode(media.data).decode("ascii")
+    modality = input_modality_for_mime(mime_type, media.display_name or "")
+    if modality == "image" and mime_type in _OPENAI_IMAGE_MIMES:
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+        }
+    if modality == "audio" and mime_type in _OPENAI_AUDIO_FORMATS:
+        return {
+            "type": "input_audio",
+            "input_audio": {
+                "data": encoded,
+                "format": _OPENAI_AUDIO_FORMATS[mime_type],
+            },
+        }
+    if modality == "document":
+        return {
+            "type": "file",
+            "file": {
+                "filename": media.display_name or "attachment",
+                "file_data": f"data:{mime_type};base64,{encoded}",
+            },
+        }
+    return None
+
+
 class OpenAIProvider(LLMProvider):
     """Provider for OpenAI ChatGPT models."""
 
@@ -75,6 +120,22 @@ class OpenAIProvider(LLMProvider):
         except Exception:
             return ["gpt-3.5-turbo", "gpt-4", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
 
+    def supports_input_mime(self, mime_type: str, filename: str = "") -> bool:
+        if not super().supports_input_mime(mime_type, filename):
+            return False
+        mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+        modality = input_modality_for_mime(mime, filename)
+        if modality == "image":
+            return mime in _OPENAI_IMAGE_MIMES
+        if modality == "audio":
+            return mime in _OPENAI_AUDIO_FORMATS
+        # Chat Completions currently has no video content-part shape.
+        return modality != "video"
+
+    def native_media_request_limit(self) -> int:
+        # OpenAI documents a 50 MB combined request limit for file inputs.
+        return 50 * 1024 * 1024
+
     # ------------------------------------------------------- message conversion
 
     def _convert_messages(self, messages: List[Message]) -> List[Dict[str, Any]]:
@@ -91,6 +152,7 @@ class OpenAIProvider(LLMProvider):
             if msg.role == "tool":
                 # Emit one OpenAI tool message per tool_result part. OpenAI
                 # requires a tool_call_id to match the originating call.
+                returned_media: List[MediaData] = []
                 for part in msg.parts:
                     if part.type != "tool_result":
                         continue
@@ -104,6 +166,25 @@ class OpenAIProvider(LLMProvider):
                             "content": str(payload),
                         }
                     )
+                    returned_media.extend(part.media_inputs or [])
+                media_parts = [
+                    value
+                    for value in (_media_content_part(media) for media in returned_media)
+                    if value is not None
+                ]
+                if media_parts:
+                    out.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Native media returned by the preceding tool call(s):",
+                                },
+                                *media_parts,
+                            ],
+                        }
+                    )
                 continue
 
             role = "user" if msg.role == "user" else "assistant" if msg.role == "assistant" else msg.role
@@ -113,7 +194,13 @@ class OpenAIProvider(LLMProvider):
             for part in msg.parts:
                 if part.type == "text" and part.text:
                     text_chunks.append({"type": "text", "text": part.text})
-                elif part.type == "image_input" and part.image:
+                elif (
+                    part.type == "image_input"
+                    and part.image
+                    and self.supports_input_mime(
+                        part.image.mime_type, part.image.display_name or ""
+                    )
+                ):
                     b64 = base64.b64encode(part.image.data).decode("ascii")
                     text_chunks.append(
                         {
@@ -121,10 +208,22 @@ class OpenAIProvider(LLMProvider):
                             "image_url": {"url": f"data:{part.image.mime_type};base64,{b64}"},
                         }
                     )
+                elif part.type == "media_input" and part.media:
+                    media_part = _media_content_part(part.media)
+                    if media_part is not None:
+                        text_chunks.append(media_part)
                 elif part.type == "file" and part.file_ref:
-                    text_chunks.append(
-                        {"type": "text", "text": f"[File: {part.file_ref.display_name}]"}
-                    )
+                    if str(part.file_ref.uri or "").startswith("file-"):
+                        text_chunks.append(
+                            {
+                                "type": "file",
+                                "file": {"file_id": part.file_ref.uri},
+                            }
+                        )
+                    else:
+                        text_chunks.append(
+                            {"type": "text", "text": f"[File: {part.file_ref.display_name}]"}
+                        )
                 elif part.type == "tool_call" and role == "assistant":
                     args = part.tool_args or {}
                     tool_calls.append(

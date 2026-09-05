@@ -105,6 +105,13 @@
         return value;
     }
 
+    function capabilityList(raw, fallback = []) {
+        const values = String(raw ?? '').split(',').map(value => (
+            value.trim().toLowerCase().replaceAll(' ', '_')
+        )).filter(Boolean);
+        return values.length ? [...new Set(values)] : [...fallback];
+    }
+
     function installPricingRowMethods(pricing) {
         if (!pricing || pricing.__rowCreationInstalled) return;
         pricing.__rowCreationInstalled = true;
@@ -142,6 +149,9 @@
                 key,
                 billing,
                 aliases: [],
+                input_modalities: capabilityList(raw.input_modalities, ['text']),
+                output_modalities: capabilityList(raw.output_modalities, ['text']),
+                capabilities: capabilityList(raw.capabilities),
                 input_per_million: inputRate,
                 cached_input_per_million: cachedRate,
                 output_per_million: outputRate,
@@ -210,6 +220,18 @@
                         <option value="local">local / $0 API</option>
                         <option value="unknown">unpriced</option>
                     </select>
+                </label>
+                <label class="pricing-add-field">
+                    <span>Native inputs</span>
+                    <input name="input_modalities" type="text" value="text" placeholder="text, image, audio">
+                </label>
+                <label class="pricing-add-field">
+                    <span>Outputs</span>
+                    <input name="output_modalities" type="text" value="text" placeholder="text">
+                </label>
+                <label class="pricing-add-field">
+                    <span>Capabilities</span>
+                    <input name="capabilities" type="text" placeholder="reasoning, tool_calling">
                 </label>
             </div>
             <div class="pricing-add-row-rates">
@@ -294,6 +316,9 @@
                     input_per_million: creator.elements.input_per_million.value,
                     cached_input_per_million: creator.elements.cached_input_per_million.value,
                     output_per_million: creator.elements.output_per_million.value,
+                    input_modalities: creator.elements.input_modalities.value,
+                    output_modalities: creator.elements.output_modalities.value,
+                    capabilities: creator.elements.capabilities.value,
                 });
                 closeCreator();
             } catch (error) {

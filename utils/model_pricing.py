@@ -35,6 +35,12 @@ class ModelPricing:
     # estimated-token rows should prefer separate input/output rates.
     estimated_total_per_million: Optional[float] = None
     aliases: tuple[str, ...] = ()
+    # Provider/API-level modalities, not just capabilities claimed by the
+    # underlying weights. Runtime attachment routing consumes this field, so
+    # an Ollama model is only marked for media shapes that /api/chat accepts.
+    input_modalities: tuple[str, ...] = ("text",)
+    output_modalities: tuple[str, ...] = ("text",)
+    capabilities: tuple[str, ...] = ()
     context_window: Optional[int] = None
     long_context_cutoff: Optional[int] = None
     long_input_per_million: Optional[float] = None
@@ -47,6 +53,9 @@ class ModelPricing:
     def public_dict(self) -> Dict[str, Any]:
         value = asdict(self)
         value["aliases"] = list(self.aliases)
+        value["input_modalities"] = list(self.input_modalities)
+        value["output_modalities"] = list(self.output_modalities)
+        value["capabilities"] = list(self.capabilities)
         return value
 
 
@@ -57,6 +66,9 @@ class ModelCatalogEntry:
     provider: str
     key: str
     aliases: tuple[str, ...] = ()
+    input_modalities: tuple[str, ...] = ("text",)
+    output_modalities: tuple[str, ...] = ("text",)
+    capabilities: tuple[str, ...] = ()
     context_window: Optional[int] = None
     role: str = ""
     local_size: str = ""
@@ -67,6 +79,9 @@ class ModelCatalogEntry:
     def public_dict(self) -> Dict[str, Any]:
         value = asdict(self)
         value["aliases"] = list(self.aliases)
+        value["input_modalities"] = list(self.input_modalities)
+        value["output_modalities"] = list(self.output_modalities)
+        value["capabilities"] = list(self.capabilities)
         return value
 
 
@@ -117,11 +132,32 @@ def _normalise_model_row(value: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(aliases, list):
         raise ValueError(f"aliases must be an array for {provider}/{key}")
 
+    def string_list(name: str, default: list[str]) -> list[str]:
+        raw = row.get(name, default)
+        if isinstance(raw, str):
+            raw = [part.strip() for part in raw.split(",") if part.strip()]
+        if not isinstance(raw, list):
+            raise ValueError(f"{name} must be an array for {provider}/{key}")
+        normalized: list[str] = []
+        for item in raw:
+            label = str(item or "").strip().lower().replace(" ", "_")
+            if label and label not in normalized:
+                normalized.append(label)
+        if name in {"input_modalities", "output_modalities"} and not normalized:
+            raise ValueError(f"{name} cannot be empty for {provider}/{key}")
+        return normalized
+
     return {
         "provider": provider,
         "key": key,
         "billing": billing,
         "aliases": [str(item).strip() for item in aliases if str(item).strip()],
+        # Missing metadata intentionally degrades to text-only. This makes
+        # custom/unknown models safe by default instead of optimistically
+        # sending binary payloads to APIs that may reject them.
+        "input_modalities": string_list("input_modalities", ["text"]),
+        "output_modalities": string_list("output_modalities", ["text"]),
+        "capabilities": string_list("capabilities", []),
         "input_per_million": nullable_float("input_per_million"),
         "cached_input_per_million": nullable_float("cached_input_per_million"),
         "output_per_million": nullable_float("output_per_million"),
@@ -170,11 +206,52 @@ def _default_registry() -> Dict[str, Any]:
     return validate_pricing_config(_read_json(DEFAULT_CONFIG_PATH))
 
 
+def _inherit_packaged_capabilities(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Backfill new capability fields in pre-feature operator overrides.
+
+    Pricing overrides intentionally replace packaged rates. Capability fields
+    were added later, so treating an absent field as an explicit text-only
+    choice would silently disable vision for every existing installation.
+    Explicit fields in the override always win.
+    """
+    packaged = _read_json(DEFAULT_CONFIG_PATH).get("models") or []
+    by_name: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for row in packaged:
+        if not isinstance(row, dict):
+            continue
+        provider = str(row.get("provider") or "").strip().lower()
+        names = [row.get("key"), *(row.get("aliases") or [])]
+        for name in names:
+            normalized = str(name or "").strip().lower().replace("models/", "")
+            if provider and normalized:
+                by_name[(provider, normalized)] = row
+
+    merged = dict(value)
+    merged_rows = []
+    for raw in value.get("models") or []:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        provider = str(row.get("provider") or "").strip().lower()
+        key = str(row.get("key") or "").strip().lower().replace("models/", "")
+        default = by_name.get((provider, key))
+        if default:
+            for field in ("input_modalities", "output_modalities", "capabilities"):
+                if field not in row and field in default:
+                    row[field] = default[field]
+        merged_rows.append(row)
+    merged["models"] = merged_rows
+    return merged
+
+
 def _registry() -> tuple[Dict[str, Any], Path, bool]:
     override = pricing_config_path()
     path = override if override.exists() else DEFAULT_CONFIG_PATH
     try:
-        return validate_pricing_config(_read_json(path)), path, path == override
+        raw = _read_json(path)
+        if path == override:
+            raw = _inherit_packaged_capabilities(raw)
+        return validate_pricing_config(raw), path, path == override
     except Exception:
         if path != DEFAULT_CONFIG_PATH:
             # A bad operator override must not make all cost accounting unusable.
@@ -193,6 +270,9 @@ def _item(value: Dict[str, Any]) -> ModelPricing:
         billing=value.get("billing", "token"),
         estimated_total_per_million=value.get("estimated_total_per_million"),
         aliases=tuple(value.get("aliases") or []),
+        input_modalities=tuple(value.get("input_modalities") or ["text"]),
+        output_modalities=tuple(value.get("output_modalities") or ["text"]),
+        capabilities=tuple(value.get("capabilities") or []),
         context_window=value.get("context_window"),
         long_context_cutoff=value.get("long_context_cutoff"),
         long_input_per_million=value.get("long_input_per_million"),
@@ -221,6 +301,9 @@ OLLAMA_CATALOG: tuple[ModelCatalogEntry, ...] = tuple(
         provider="ollama",
         key=value["key"],
         aliases=tuple(value.get("aliases") or []),
+        input_modalities=tuple(value.get("input_modalities") or ["text"]),
+        output_modalities=tuple(value.get("output_modalities") or ["text"]),
+        capabilities=tuple(value.get("capabilities") or []),
         context_window=value.get("context_window"),
         role=value.get("role", ""),
         notes=value.get("notes", ""),
@@ -232,7 +315,10 @@ OLLAMA_CATALOG: tuple[ModelCatalogEntry, ...] = tuple(
 
 
 def save_pricing_config(value: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = validate_pricing_config(value)
+    # Older GUI/mobile clients do not know the capability columns yet. Treat
+    # their omitted fields as a schema migration, while preserving any fields
+    # an updated operator explicitly supplied.
+    normalized = validate_pricing_config(_inherit_packaged_capabilities(value))
     target = pricing_config_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(prefix="model-pricing-", suffix=".json", dir=str(target.parent))
@@ -299,6 +385,67 @@ def resolve_token_pricing(provider: str, model_name: str) -> Optional[ModelPrici
     return item
 
 
+def resolve_model_capabilities(provider: str, model_name: str) -> Dict[str, Any]:
+    """Return conservative, runtime-usable capability metadata.
+
+    Unknown models are text-only until an operator adds an explicit registry
+    row. This result is deliberately separate from pricing resolution because
+    local and unpriced models still need a safe input-modality decision.
+    """
+    item = _resolve(provider, model_name)
+    if item is None:
+        return {
+            "provider": _normalise(provider) or infer_provider(model_name),
+            "model": str(model_name or ""),
+            "matched": False,
+            "input_modalities": ["text"],
+            "output_modalities": ["text"],
+            "capabilities": [],
+        }
+    return {
+        "provider": item.provider,
+        "model": str(model_name or item.key),
+        "key": item.key,
+        "matched": True,
+        "input_modalities": list(item.input_modalities),
+        "output_modalities": list(item.output_modalities),
+        "capabilities": list(item.capabilities),
+    }
+
+
+def input_modality_for_mime(mime_type: str, filename: str = "") -> str:
+    """Map an upload MIME type to the registry's input-modality vocabulary."""
+    mime = str(mime_type or "application/octet-stream").split(";", 1)[0].strip().lower()
+    name = str(filename or "").lower()
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("audio/"):
+        return "audio"
+    if mime.startswith("video/"):
+        return "video"
+    document_mimes = {
+        "application/pdf",
+        "application/json",
+        "application/rtf",
+        "application/msword",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.oasis.opendocument.presentation",
+        "application/vnd.oasis.opendocument.spreadsheet",
+        "application/vnd.oasis.opendocument.text",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+    document_suffixes = (
+        ".csv", ".doc", ".docx", ".json", ".md", ".pdf", ".ppt",
+        ".pptx", ".rtf", ".txt", ".xls", ".xlsx",
+    )
+    if mime.startswith("text/") or mime in document_mimes or name.endswith(document_suffixes):
+        return "document"
+    return "file"
+
+
 def resolve_ollama_catalog(model_name: str) -> Optional[ModelCatalogEntry]:
     item = _resolve("ollama", model_name)
     if item is None:
@@ -307,6 +454,9 @@ def resolve_ollama_catalog(model_name: str) -> Optional[ModelCatalogEntry]:
         provider="ollama",
         key=item.key,
         aliases=item.aliases,
+        input_modalities=item.input_modalities,
+        output_modalities=item.output_modalities,
+        capabilities=item.capabilities,
         context_window=item.context_window,
         role=item.role,
         notes=item.notes,
@@ -624,8 +774,10 @@ __all__ = [
     "pricing_catalog",
     "pricing_config_path",
     "reset_pricing_config",
+    "resolve_model_capabilities",
     "resolve_ollama_catalog",
     "resolve_token_pricing",
     "save_pricing_config",
+    "input_modality_for_mime",
     "validate_pricing_config",
 ]

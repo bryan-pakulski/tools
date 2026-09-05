@@ -8,7 +8,8 @@ so the tools still work in session-less unit tests).
 import json
 import os
 import subprocess
-from typing import Any, Dict
+import time
+from typing import Any, Dict, Optional
 
 from mu.tools import tool
 from mu.tools._bounds import (
@@ -62,6 +63,46 @@ def _bg_registry(context):
 # ---------------------------------------------------------------- bash (synchronous)
 
 
+def _store_full_bash_output(
+    session, command: str, full_output: str
+) -> Optional[str]:
+    """Best-effort write-through of un-truncated bash output to the durable
+    ResultStore so a later ``recall(key)`` / ``result_*`` op can recover what
+    the inline context dropped. Returns the cache key, or None when there is
+    no store / the write failed."""
+    if session is None:
+        return None
+    store = getattr(session, "tool_result_cache", None)
+    if store is None:
+        return None
+    try:
+        return store.store(
+            call_id=f"bash-full-{int(time.time() * 1000)}",
+            tool_name="bash",
+            result=full_output,
+            force=True,
+        )
+    except Exception:  # noqa: BLE001 — recovery path must never break bash
+        return None
+
+
+def _truncate_with_recovery(
+    session, command: str, output: str, max_output_chars: int
+) -> str:
+    """Truncate ``output`` for inline display, but persist the FULL text
+    first so the truncation is recoverable (stored_ref + recall hint)."""
+    full_key = _store_full_bash_output(session, command, output)
+    truncated = output[:max_output_chars]
+    if full_key:
+        return (
+            f"{truncated}\n\n...[TRUNCATED]... "
+            f"[full {len(output)}-char output stored — recall('{full_key}') "
+            f"or result_head/result_tail/result_search with cache_key "
+            f"'{full_key}']"
+        )
+    return f"{truncated}\n\n...[TRUNCATED]..."
+
+
 def bash_command(
     command: str,
     folder_context,
@@ -70,13 +111,22 @@ def bash_command(
     timeout_seconds: int = 120,
     max_output_chars: int = 12000,
     session_type: str = "workspace",
+    session=None,
 ) -> str:
     """Execute a raw shell command in the active runtime.
 
     Container sessions use the Docker filesystem itself as the boundary; an
     attached workspace is not required and ``cwd`` may be any non-secret path
     inside the container.
+
+    Output longer than ``max_output_chars`` is truncated for the model, but
+    the FULL output is written through to the durable result store first, so
+    the truncation is recoverable via ``recall(key)`` / result_* ops instead
+    of being lost.
     """
+    # Aliases used by the truncation helpers below (kept as locals so the
+    # helper calls read cleanly).
+    context_for_preservation = session
     command = str(command or "").strip()
     if not command:
         return "Error: command is required."
@@ -109,8 +159,19 @@ def bash_command(
         )
     except subprocess.TimeoutExpired as exc:
         partial = f"{exc.stdout or ''}\n{exc.stderr or ''}".strip()
+        # Persist the full partial stream before any clipping so a timed-out
+        # command's output is also recoverable, not just oversized output.
         if len(partial) > max_output_chars:
+            partial_key = _store_full_bash_output(
+                context_for_preservation, command, partial
+            )
             partial = partial[:max_output_chars]
+            if partial_key:
+                partial = (
+                    f"{partial}\n...[truncated]... [full timed-out output "
+                    f"stored — recall('{partial_key}') or result_* ops with "
+                    f"cache_key '{partial_key}']"
+                )
         # Scrub the timeout path too (codex round-8 F5): a command that
         # prints a secret then blocks must not leak it via partial output.
         return _scrub_and_annotate(
@@ -134,7 +195,9 @@ def bash_command(
     output = "\n\n".join(chunks)
 
     if len(output) > max_output_chars:
-        output = output[:max_output_chars] + "\n\n...[TRUNCATED]..."
+        output = _truncate_with_recovery(
+            context_for_preservation, command, output, max_output_chars
+        )
     return _scrub_and_annotate(output)
 
 
@@ -190,6 +253,7 @@ def _bash_tool(args: Dict[str, Any], context) -> str:
         timeout_seconds=args.get("timeout_seconds", 120),
         max_output_chars=args.get("max_output_chars", 12000),
         session_type=session_type_from_context(context),
+        session=getattr(context, "session", None),
     )
 
 

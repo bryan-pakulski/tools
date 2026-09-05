@@ -287,7 +287,7 @@ def _persist_session_container_binding(
                 "yolo": True,
                 "strict_mode": False,
                 "plan_mode": False,
-                "lazy_tools_enabled": False,
+                "lazy_tools_enabled": True,
                 "security_allow_secret_paths": False,
             }
         )

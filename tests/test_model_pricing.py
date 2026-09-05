@@ -13,6 +13,7 @@ from utils.model_pricing import (
     pricing_catalog,
     pricing_config_path,
     reset_pricing_config,
+    resolve_model_capabilities,
     resolve_token_pricing,
     save_pricing_config,
 )
@@ -127,6 +128,51 @@ def test_public_catalog_is_versioned_unified_and_exposes_config_paths():
     assert glm["output_per_million"] == pytest.approx(4.4)
     assert glm["estimated_total_per_million"] is None
 
+    glm_53 = next(
+        item for item in catalog["models"] if item["key"] == "glm-5.3-flash:cloud"
+    )
+    assert glm_53["input_modalities"] == ["text", "image"]
+    assert glm_53["output_modalities"] == ["text"]
+    assert "vision" in glm_53["capabilities"]
+    assert glm_53["input_per_million"] == pytest.approx(0.15)
+    assert glm_53["cached_input_per_million"] == pytest.approx(0.03)
+    assert glm_53["output_per_million"] == pytest.approx(0.50)
+
+
+def test_capability_resolution_is_conservative_for_unknown_models():
+    gemini = resolve_model_capabilities("gemini", "gemini-3.6-flash")
+    assert gemini["input_modalities"] == [
+        "text", "image", "audio", "video", "document"
+    ]
+
+    unknown = resolve_model_capabilities("openai", "future-unknown-model")
+    assert unknown["matched"] is False
+    assert unknown["input_modalities"] == ["text"]
+    assert unknown["capabilities"] == []
+
+
+def test_legacy_override_payload_inherits_packaged_capabilities(tmp_path, monkeypatch):
+    monkeypatch.setenv("MUCLI_HOME", str(tmp_path / "legacy-capability-home"))
+    rows = [dict(item) for item in pricing_catalog()["models"]]
+    glm = next(item for item in rows if item["key"] == "glm-5.3-flash:cloud")
+    glm.pop("input_modalities")
+    glm.pop("output_modalities")
+    glm.pop("capabilities")
+
+    saved = save_pricing_config(
+        {
+            "version": "legacy-client",
+            "currency": "USD",
+            "unit": "per_million_tokens",
+            "models": rows,
+        }
+    )
+    migrated = next(
+        item for item in saved["models"] if item["key"] == "glm-5.3-flash:cloud"
+    )
+    assert migrated["input_modalities"] == ["text", "image"]
+    assert "vision" in migrated["capabilities"]
+
 
 def test_operator_override_is_live_and_can_be_reset(tmp_path, monkeypatch):
     monkeypatch.setenv("MUCLI_HOME", str(tmp_path / "mucli-home"))
@@ -213,16 +259,22 @@ def test_cost_registry_is_editable_in_gui_and_exposed_to_all_control_planes():
     assert 'Pricing registry' in html
     assert 'Input / 1M' in html
     assert 'Output / 1M' in html
+    assert 'Native inputs' in html
+    assert 'Capabilities' in html
     assert 'Blended est. / 1M total' not in html
     assert 'Quick estimator' not in html
     assert "fetch('/api/providers/pricing', {" in script
     assert "method: 'PUT'" in script
     assert "/api/providers/pricing/reset" in script
     assert 'Estimated input/output' in script
+    assert 'input_modalities' in script
+    assert 'output_modalities' in script
+    assert 'capabilities' in script
     assert 'product-header' in html
     assert '.mc-table' in css
     assert 'estimated_token' in config
     assert '"glm-5.2:cloud"' in config
+    assert '"glm-5.3-flash:cloud"' in config
     assert "value.textContent = 'Unpriced'" in work_semantics
     assert "value.textContent = '$0.00 API'" in work_semantics
     assert 'components.input_usd' in work_semantics

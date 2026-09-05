@@ -3,10 +3,23 @@ set -euo pipefail
 
 # mucli TB agent install {{ version }}: dependencies + source into /opt/mucli.
 mkdir -p /opt/mucli
-apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git python3-pip
+
+# Several TB images already contain a newer Python under /usr/local. Avoid an
+# unnecessary apt transaction (and avoid replacing the intended interpreter)
+# unless Python or pip is genuinely absent.
+if ! command -v python3 >/dev/null 2>&1 || \
+   ! python3 -m pip --version >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "MUCLI_PYTHON_MISSING: python3/pip unavailable and apt-get absent" >&2
+        exit 1
+    fi
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        --no-install-recommends python3 python3-pip
+fi
 
 export PIP_BREAK_SYSTEM_PACKAGES=1
+export PIP_DISABLE_PIP_VERSION_CHECK=1
 pip_install() {
     local attempt
     for attempt in 1 2; do
@@ -24,46 +37,67 @@ if [ ! -f /mucli-src/mucli.py ] || [ ! -f /mucli-src/requirements.txt ]; then
     exit 1
 fi
 
-# Fast path: pre-baked offline wheelhouse (no network, ~5s).
+# Fast path: pre-baked multi-Python wheelhouse (no network).
 # Slow path: network install with retries (only when payload missing).
 if [ -f /tmp/mucli-wheelhouse.tar.gz ]; then
     mkdir -p /mucli-wheelhouse
     tar -xzf /tmp/mucli-wheelhouse.tar.gz -C /mucli-wheelhouse
-    python3 -m pip install --quiet --no-input --no-index \
+    if [ ! -f /mucli-wheelhouse/wheelhouse/manifest.json ]; then
+        echo "MUCLI_WHEELHOUSE_INCOMPATIBLE: rebuild with bench/build_wheelhouse.sh" >&2
+        exit 1
+    fi
+    python3 - /mucli-wheelhouse/wheelhouse/manifest.json <<'PY'
+import json
+import sys
+
+minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+with open(sys.argv[1], encoding="utf-8") as handle:
+    manifest = json.load(handle)
+versions = str(manifest.get("python_versions", "")).split()
+if manifest.get("format") != 2 or minor not in versions:
+    print(
+        f"MUCLI_WHEELHOUSE_PYTHON_UNSUPPORTED: Python {minor}; "
+        "rebuild with bench/build_wheelhouse.sh",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+    # Task images may contain apt-owned Python packages without pip RECORD
+    # files. Overlay the isolated benchmark dependencies under /usr/local
+    # instead of trying to uninstall distro-managed files.
+    python3 -m pip install --quiet --no-input --ignore-installed --no-index \
         --find-links /mucli-wheelhouse/wheelhouse \
-        -r /mucli-src/requirements.txt \
+        -r /mucli-wheelhouse/wheelhouse/requirements-bench.txt \
         pathspec python-dotenv psutil
     echo "mucli deps installed from offline wheelhouse"
 else
     echo "NO_WHEELHOUSE: falling back to network install" >&2
-    pip_install -r /mucli-src/requirements.txt
+    awk '
+        /^[[:space:]]*($|#)/ { next }
+        tolower($0) ~ /^(kokoro|faster-whisper|soundfile|playwright|pytest|black)/ { next }
+        { print }
+    ' /mucli-src/requirements.txt > /tmp/mucli-requirements-bench.txt
+    pip_install -r /tmp/mucli-requirements-bench.txt
     pip_install "pathspec" "python-dotenv" "psutil"
 fi
 
 cp -r /mucli-src/. /opt/mucli/
 cd /opt/mucli
-# mucli wheel is in the wheelhouse too; no network needed.
-if [ -f /mucli-wheelhouse/wheelhouse/mucli-*.whl ] 2>/dev/null || \
-   ls /mucli-wheelhouse/wheelhouse/mucli-*.whl >/dev/null 2>&1; then
-    python3 -m pip install --quiet --no-index \
-        --find-links /mucli-wheelhouse/wheelhouse \
-        /mucli-wheelhouse/wheelhouse/mucli-*.whl
-else
-    pip_install -e . --no-deps
-fi
+# The launcher executes the copied source directly. An editable install is
+# unnecessary and could trigger build-isolation network access.
 cat > /usr/local/bin/mucli <<'EOF'
 #!/bin/sh
 exec python3 /opt/mucli/mucli.py "$@"
 EOF
 chmod +x /usr/local/bin/mucli
 
-cat > /usr/local/bin/mucli-bench-wrapper <<'EOF'
-#!/bin/bash
-# Non-interactive one-shot run: send the instruction, wait for completion.
-cd "$MUCLI_WORKING_DIR"
-mucli --session "tb-$$" --headless "$MUCLI_TASK_INSTRUCTION"
-EOF
-chmod +x /usr/local/bin/mucli-bench-wrapper
+mkdir -p "${MUCLI_HOME:-/logs/mucli}"
+cp /opt/mucli/.mucli-benchmark-source.json \
+    "${MUCLI_HOME:-/logs/mucli}/source.json"
+if [ -f /mucli-wheelhouse/wheelhouse/manifest.json ]; then
+    cp /mucli-wheelhouse/wheelhouse/manifest.json \
+        "${MUCLI_HOME:-/logs/mucli}/wheelhouse.json"
+fi
 
 python3 -c '
 import importlib
@@ -93,4 +127,4 @@ if failed:
 '
 
 mucli --help >/dev/null 2>&1 || exit 1
-echo "mucli install OK"
+echo "mucli install OK ($(python3 --version 2>&1))"
